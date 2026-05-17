@@ -115,7 +115,25 @@ and add the env var inside it:
 </service>
 ```
 
-### 3. Restart the service (or reboot)
+### 3. Update the AAP system attribute XMLs in `/etc`
+
+`blmjciaapa.so` reads its one-time configuration from
+`/etc/aap_system_attributes.xml` and `/etc/aap_system_attributes_UCP.xml`
+at startup. The patched copies live in [resources/](resources/) — back
+up the originals and overwrite:
+
+```sh
+cp /etc/aap_system_attributes.xml      /etc/aap_system_attributes.xml.orig
+cp /etc/aap_system_attributes_UCP.xml  /etc/aap_system_attributes_UCP.xml.orig
+cp /mnt/sdb1/aap_system_attributes.xml     /etc/aap_system_attributes.xml
+cp /mnt/sdb1/aap_system_attributes_UCP.xml /etc/aap_system_attributes_UCP.xml
+sync
+```
+
+(Adjust the source path to wherever you staged the files from
+[resources/](resources/) — SD card mount, `scp`, etc.)
+
+### 4. Restart the service (or reboot)
 
 Either restart just `jciAAPA`:
 
@@ -128,8 +146,9 @@ smctl -r -n jciAAPA
 ### Uninstall / disable
 
 Remove (or comment out) the `<environ_var>` line you added in
-`/jci/sm/sm.conf`, then restart `jciAAPA` or reboot. The `.so` itself
-can be deleted from `/data_persist/oem-aa-mod/` afterwards.
+`/jci/sm/sm.conf`, restore the original `/etc/aap_system_attributes*.xml`
+files from the `.orig` backups, then restart `jciAAPA` or reboot. The
+`.so` itself can be deleted from `/data_persist/oem-aa-mod/` afterwards.
 
 ## Toolchain notes
 
