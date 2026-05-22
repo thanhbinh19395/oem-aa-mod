@@ -84,7 +84,8 @@ Refer the Configuration Parameters in the Appendix section of API documentation 
                 <subscribe>FALSE</subscribe>
             </media_playback>
             <navigation>
-                <subscribe>FALSE</subscribe>
+                <subscribe>TRUE</subscribe>
+                <cluster_type>ENUM</cluster_type>
             </navigation>
             <notification>
                 <subscribe>FALSE</subscribe>

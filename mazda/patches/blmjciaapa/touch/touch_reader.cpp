@@ -15,7 +15,7 @@
 // libjcituireader.so) only delivers one finger per callback — its
 // TUI_TouchInput_s has no array — so it can't carry multi-touch.
 
-#include "patch.h"
+#include "../patch.h"
 
 #include <atomic>
 #include <errno.h>

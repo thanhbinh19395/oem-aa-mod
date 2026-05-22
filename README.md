@@ -6,6 +6,14 @@ infotainment system. Each shim targets one specific OEM `.so` (e.g.
 `<environ_var>` mechanism. Cross-compiled on WSL/Linux with the
 `m3-toolchain` and deployed to the head unit via SD card.
 
+> **Disclaimer.** This is an unofficial, community-developed
+> modification. It is not affiliated with, endorsed by, supported by,
+> or in any way associated with Mazda Motor Corporation or any of its
+> subsidiaries. "Mazda" and related names are used only descriptively
+> to identify the hardware these modifications run on. Use at your
+> own risk; installing it may void your vehicle warranty and there is
+> no warranty of any kind from the authors (see [LICENSE](LICENSE)).
+
 Why multiple binaries: each preload library is scoped to one OEM
 library it patches and one PID it lives in, so failures stay isolated
 and each shim only carries the symbols and code its target host
@@ -156,3 +164,11 @@ files from the `.orig` backups, then restart `jciAAPA` or reboot. The
 - Arch flags: `-march=armv7-a -mtune=cortex-a9 -mfpu=neon`
 - Always built with `--sysroot=mazda/m3-toolchain/arm-cortexa9_neon-linux-gnueabi/sysroot` so headers/libs come from the CMU's glibc, not the host.
 - `-static-libstdc++` to avoid a runtime libstdc++ mismatch on the device.
+
+## License & attribution
+
+This project is licensed under the GNU Affero General Public License
+v3.0 — see [LICENSE](LICENSE). Portions are derived from the
+[Trevelopment/headunit](https://github.com/Trevelopment/headunit)
+project, also under AGPL-3.0. See [NOTICE.md](NOTICE.md) for the
+attribution and a copyleft summary.

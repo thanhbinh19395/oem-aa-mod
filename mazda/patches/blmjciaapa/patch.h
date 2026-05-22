@@ -148,6 +148,22 @@ void touch_stop(void);
 // SYN_REPORT with the freshly-built current state.
 void touch_on_frame(const MtState &cur);
 
+// Defined in nav.cpp. Called from the aap_create_session PLT shim
+// (lifecycle.cpp) BEFORE chaining to the real SDK entry point, to
+// substitute the (NULL on OEM) navigation callback slot in cb_list
+// with one that dumps received 0x500 / 0x501 / 0x502 events to the
+// LOGD sink. Safe to call with cb_list==NULL (becomes a no-op).
+void nav_install_cb(void *cb_list);
+
+// Defined in hud_send.cpp. HUD output lifecycle, called from the
+// same PLT shims as touch_start/stop. hud_send_start opens the OEM
+// HMI + Service D-Bus connections, spawns a dispatcher thread and
+// a sender thread, and starts forwarding the per-event updates
+// nav.cpp pushes via hud_send.h. hud_send_stop tears the threads
+// down and releases the D-Bus connections. Both are idempotent.
+void hud_send_start(void);
+void hud_send_stop(void);
+
 // Defined in main.cpp. Idempotent. Called from the first
 // aap_create_session shim invocation to perform the deferred self-gate
 // (probe blmjciaapa.so for the GetServiceInterfaces anchor and set

@@ -28,19 +28,63 @@ SYSROOT     := $(M3TOOLCHAIN)/$(TRIPLE)/sysroot
 # OEM libraries we patch. Order doesn't matter.
 PATCHES := blmjciaapa
 
+# pkg-config wrapper pointed at the device's sysroot so it resolves
+# against the cross-compiled .pc files (not the host's). Same pattern
+# as the upstream headunit project's Makefile — inlined here so we
+# don't need a separate shell-script wrapper file in the repo.
+#
+# Add libraries the patches need to PKGS and both -cflags and -libs
+# expand them with proper transitive deps + sysroot-prepended paths.
+PKG_CONFIG := PKG_CONFIG_LIBDIR=$(SYSROOT)/usr/lib/pkgconfig \
+              PKG_CONFIG_SYSROOT_DIR=$(SYSROOT) \
+              pkg-config
+PKGS       := dbus-c++-1 dbus-1
+PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS))
+PKG_LIBS   := $(shell $(PKG_CONFIG) --libs   $(PKGS))
+
 # Flags shared by all patches and both configurations.
 # -fPIC is required for code that goes into a shared object.
 # -static-libstdc++ keeps the .so off the device's older libstdc++ at
 # load time (same rationale as the original single-binary build).
+# -Idbus exposes the vendored CMU D-Bus proxies (generated_cmu.h) from
+# the community headunit project (mirrored under mazda/dbus/). All
+# patches can `#include "generated_cmu.h"` to talk to OEM D-Bus
+# interfaces without re-deriving the C++ proxy classes by hand.
+# $(PKG_CFLAGS) brings in dbus-c++-1 + libdbus-1 include dirs from
+# the sysroot's pkg-config metadata; matching $(PKG_LIBS) in LDFLAGS
+# below carries the right -L / -l invocations.
 COMMON_CXXFLAGS := -std=c++11 \
                    --sysroot=$(SYSROOT) \
                    -march=armv7-a -mtune=cortex-a9 -mfpu=neon \
                    -fPIC \
                    -fvisibility=hidden \
-                   -static-libstdc++
-COMMON_LDFLAGS  := --sysroot=$(SYSROOT) -shared -static-libstdc++ \
+                   -D_GLIBCXX_USE_CXX11_ABI=0 \
+                   -Idbus \
+                   $(PKG_CFLAGS)
+# -D_GLIBCXX_USE_CXX11_ABI=0 selects the pre-C++11 (COW) std::string
+# and std::list ABI. The device ships libstdc++.so.6.0.14 (GCC 4.6
+# era) which only knows that ABI; libdbus-c++-1.so is linked against
+# it. Our toolchain is GCC 4.9.1 with libstdc++.so.6.0.20 which
+# defaults to the new SSO std::string ABI. Without this flag, any
+# std::string crossing the libdbus-c++ boundary (e.g. our
+# guidancePointData._1 assignment in hud_send.cpp) gets interpreted
+# with two different layouts and corrupts the heap — manifested as
+# a SEGV in std::has_facet when the corrupted bytes happened to land
+# in a libstdc++ locale _Impl. See git log for the crash analysis.
+#
+# Likewise -static-libstdc++ used to be on both lines. It was added
+# defensively ("the device's libstdc++ is older than ours") but in
+# practice it gave us two libstdc++ runtimes in the same process —
+# ours (statically baked) vs the device's (loaded via libdbus-c++-1).
+# Both had their own global C locale, both shared the heap, and the
+# ABI mismatch above corrupted state across the boundary. Dropping
+# it leaves us with one runtime (the device's 6.0.14), which is
+# also what libdbus-c++-1 uses, so all C++ stdlib state is shared
+# correctly. We pick up libstdc++.so.6 as a DT_NEEDED instead.
+COMMON_LDFLAGS  := --sysroot=$(SYSROOT) -shared \
                    -Wl,--no-undefined \
-                   -lpthread -ldl
+                   -lpthread -ldl \
+                   $(PKG_LIBS)
 
 # Debug: no optimization, full debug info, no LTO so symbols/inlining are sane.
 DEBUG_CXXFLAGS   := $(COMMON_CXXFLAGS) -O0 -g3 -DDEBUG
@@ -84,19 +128,25 @@ $(RELEASE_DIR)/%.o: patches/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) -MD $(RELEASE_CXXFLAGS) -c $< -o $@
 
-# Per-patch link rules generated via $(eval). Sources are discovered with
-# $(wildcard) at parse time, so adding a new .cpp under an existing
-# patches/<name>/ is a no-op for the Makefile, but adding a new patch
-# directory means appending its name to $(PATCHES) above.
+# Per-patch link rules generated via $(eval). Sources are discovered
+# recursively (via `find`) at parse time, so subdivision of a patch
+# into subfolders — e.g. patches/blmjciaapa/{touch,hud}/*.cpp — is a
+# no-op for the Makefile. Adding a new .cpp anywhere under an
+# existing patches/<name>/ tree just works. Adding a new patch
+# directory still means appending its name to $(PATCHES) above.
 define gen_patch_rules
-$(DEBUG_DIR)/libpatch-$(1).so: $(patsubst patches/$(1)/%.cpp,$(DEBUG_DIR)/$(1)/%.o,$(wildcard patches/$(1)/*.cpp))
+SRCS_$(1)         := $$(shell find patches/$(1) -name '*.cpp' -type f)
+DEBUG_OBJS_$(1)   := $$(patsubst patches/$(1)/%.cpp,$(DEBUG_DIR)/$(1)/%.o,$$(SRCS_$(1)))
+RELEASE_OBJS_$(1) := $$(patsubst patches/$(1)/%.cpp,$(RELEASE_DIR)/$(1)/%.o,$$(SRCS_$(1)))
+
+$(DEBUG_DIR)/libpatch-$(1).so: $$(DEBUG_OBJS_$(1))
 	$$(CXX) $$^ $$(DEBUG_LDFLAGS) -Wl,-soname,libpatch-$(1).so -o $$@
 
-$(RELEASE_DIR)/libpatch-$(1).so: $(patsubst patches/$(1)/%.cpp,$(RELEASE_DIR)/$(1)/%.o,$(wildcard patches/$(1)/*.cpp))
+$(RELEASE_DIR)/libpatch-$(1).so: $$(RELEASE_OBJS_$(1))
 	$$(CXX) $$^ $$(RELEASE_LDFLAGS) -Wl,-soname,libpatch-$(1).so -o $$@
 
--include $(patsubst patches/$(1)/%.cpp,$(DEBUG_DIR)/$(1)/%.d,$(wildcard patches/$(1)/*.cpp))
--include $(patsubst patches/$(1)/%.cpp,$(RELEASE_DIR)/$(1)/%.d,$(wildcard patches/$(1)/*.cpp))
+-include $$(DEBUG_OBJS_$(1):.o=.d)
+-include $$(RELEASE_OBJS_$(1):.o=.d)
 endef
 
 $(foreach p,$(PATCHES),$(eval $(call gen_patch_rules,$(p))))

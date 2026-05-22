@@ -7,9 +7,10 @@
 // blmjciaapa.so is dlopen'd, the dynamic linker binds OEM PLT lookups
 // of these names to OUR exported symbols.
 //
-// We use them as a pure lifecycle bracket for the touch reader:
-// session up  -> start the evdev reader thread, cache the handle
-// session down -> stop the reader, clear the cache, chain through
+// We use them as a pure lifecycle bracket for every per-session
+// shim thread (currently: the touch reader and the HUD sender):
+// session up   -> install nav cb, start the touch reader + HUD sender
+// session down -> stop the HUD sender + touch reader, chain through
 //
 // These are the only cleanly preload-shadowable lifecycle anchors.
 // Resolving HMIEventHandler::Init/UnInit via dlsym(RTLD_NEXT) does NOT work
@@ -33,7 +34,7 @@ pfn_aap_destroy_session g_real_destroy = nullptr;
 
 pthread_mutex_t g_session_mu = PTHREAD_MUTEX_INITIALIZER;
 void           *g_session    = nullptr;   // last successfully-created handle
-bool            g_touch_up   = false;     // reader thread alive
+bool            g_session_up = false;     // per-session shim threads (touch + HUD) alive
 
 // Resolve a single symbol against the real libaap_interface.so.
 //
@@ -222,11 +223,20 @@ int aap_create_session(const char *cfg, void *unknown_r1,
         return 0x103;
     }
 
-    // TODO (nav-side, deferred):
-    //   substitute the event-callback slot in cb_list here, before
-    //   chaining. The slot index is not yet identified. Until then
-    //   the cb_list is forwarded verbatim — nav forwarding is a no-op
-    //   but touch path is fully functional.
+    // Nav-side hijack: substitute cb_list[10] (E_AAP_EVENT_NAV_DATA_CB)
+    // with our dump callback before the SDK copies the table into the
+    // session handle. The OEM leaves slot 10 NULL, so without this
+    // every 0x500 / 0x501 / 0x502 event the phone sends gets dropped
+    // by libaap_interface.so's dispatcher (case 0xc, branches on
+    // handle+0x48 == NULL). Gated on g_enabled so a misdeployed
+    // library still transparently passes through.
+    //
+    // Modifying the caller's stack buffer in place is safe: inside
+    // aap_create_session the SDK does memcpy(handle+0x20, cb_list, 76)
+    // before returning.
+    if (g_enabled) {
+        nav_install_cb(cb_list);
+    }
 
     LOGD("aap_create_session: calling real impl at %p",
          (void *)g_real_create);
@@ -246,11 +256,19 @@ int aap_create_session(const char *cfg, void *unknown_r1,
     // the FIRST successful create, so we only start once per process.
     pthread_mutex_lock(&g_session_mu);
     g_session = *out_handle;
-    if (!g_touch_up) {
+    if (!g_session_up) {
         LOGD("aap_create_session: spawning touch reader");
         touch_start();
-        g_touch_up = true;
+        g_session_up = true;
         LOGD("touch reader started");
+
+        // HUD sender: opens the OEM HMI + Service D-Bus connections
+        // and brings up dispatcher + sender threads. Same
+        // "once per process" gate as touch_start — the sender
+        // thread itself handles HUD-not-installed and routing
+        // start/stop transitions internally.
+        LOGD("aap_create_session: spawning HUD sender");
+        hud_send_start();
     }
     pthread_mutex_unlock(&g_session_mu);
 
@@ -266,11 +284,18 @@ int aap_destroy_session(void *handle)
 
     if (g_enabled) {
         pthread_mutex_lock(&g_session_mu);
-        if (g_touch_up) {
+        if (g_session_up) {
             LOGD("aap_destroy_session: stopping touch reader");
             touch_stop();
-            g_touch_up = false;
+            g_session_up = false;
             LOGD("touch reader stopped");
+
+            // Tear the HUD sender down on the same edge that
+            // stops the touch reader. hud_send_stop is
+            // idempotent so the gate on g_session_up keeps it
+            // matched 1:1 with the start above.
+            LOGD("aap_destroy_session: stopping HUD sender");
+            hud_send_stop();
         }
         g_session = nullptr;
         pthread_mutex_unlock(&g_session_mu);

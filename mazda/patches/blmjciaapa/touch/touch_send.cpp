@@ -11,8 +11,8 @@
 // HMIEventHandler::InputTouchScreen. SBN handling and contact-id
 // dedup are deliberately skipped.
 
-#include "offsets.h"
-#include "patch.h"
+#include "../offsets.h"
+#include "../patch.h"
 
 #include <pthread.h>
 #include <string.h>
@@ -65,11 +65,10 @@ void resolve_touch_symbols_once(void)
 //
 // AAP_TouchEvent expects display pixels (0..799 X, 0..479 Y).
 // Whether /dev/input/filtered-touchscreen0 already reports pixels or
-// reports raw 0..~4099 device units is an open empirical question
-// (Open question 4 in androidauto-touch-hookup.md §6). We adapt at
-// runtime by inspecting the first non-trivial frame: if any value
-// exceeds the display's pixel range, switch into "raw / 4099 * size"
-// scaling for the rest of the process lifetime.
+// reports raw 0..~4099 device units is an open empirical question.
+// We adapt at runtime by inspecting the first non-trivial frame:
+// if any value exceeds the display's pixel range, switch into
+// "raw / 4099 * size" scaling for the rest of the process lifetime.
 // ---------------------------------------------------------------
 
 constexpr uint32_t kDisplayWidth  = 800;
