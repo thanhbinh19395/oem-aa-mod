@@ -35,12 +35,17 @@ PATCHES := blmjciaapa
 #
 # Add libraries the patches need to PKGS and both -cflags and -libs
 # expand them with proper transitive deps + sysroot-prepended paths.
+#
+# (Empty for now: the HUD sender talks to the OEM D-Bus stack
+# (libjcidbus / libjcivbsnaviclient) via dlsym(RTLD_DEFAULT) at
+# runtime — those libs are already mapped in the jciAAPA process — so
+# we add no link-time D-Bus dependency and no longer use dbus-c++.)
 PKG_CONFIG := PKG_CONFIG_LIBDIR=$(SYSROOT)/usr/lib/pkgconfig \
               PKG_CONFIG_SYSROOT_DIR=$(SYSROOT) \
               pkg-config
-PKGS       := dbus-c++-1 dbus-1
-PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS))
-PKG_LIBS   := $(shell $(PKG_CONFIG) --libs   $(PKGS))
+PKGS       :=
+PKG_CFLAGS := $(if $(PKGS),$(shell $(PKG_CONFIG) --cflags $(PKGS)))
+PKG_LIBS   := $(if $(PKGS),$(shell $(PKG_CONFIG) --libs   $(PKGS)))
 
 # Flags shared by all patches and both configurations.
 # -fPIC is required for code that goes into a shared object.
@@ -59,7 +64,6 @@ COMMON_CXXFLAGS := -std=c++11 \
                    -fPIC \
                    -fvisibility=hidden \
                    -D_GLIBCXX_USE_CXX11_ABI=0 \
-                   -Idbus \
                    $(PKG_CFLAGS)
 # -D_GLIBCXX_USE_CXX11_ABI=0 selects the pre-C++11 (COW) std::string
 # and std::list ABI. The device ships libstdc++.so.6.0.14 (GCC 4.6

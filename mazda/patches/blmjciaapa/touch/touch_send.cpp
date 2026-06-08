@@ -1,64 +1,25 @@
 // Action state machine + send path for the touch shim.
 //
-// Receives evdev MtState snapshots from touch_reader.cpp on every
+// Receives evdev MtState snapshots from touch.cpp on every
 // SYN_REPORT. Diffs against the previous snapshot to figure out
 // which Android-MotionEvent-style events the phone should see, then
 // builds an AAP_TouchEvent and hands it to RaceAap::SendTouchInput
-// (resolved through the anchor-and-offset machinery in offsets.h).
+// (resolved through the anchor-and-offset machinery in oem/blmjciaapa.h).
 //
 // The OEM VideoManager::IsAAVideoInFocus gate is enforced before any
 // send — this is the only behaviour we cherry-pick from
 // HMIEventHandler::InputTouchScreen. SBN handling and contact-id
 // dedup are deliberately skipped.
 
-#include "../offsets.h"
-#include "../patch.h"
+#define LOG_TAG "TOUCH"
+#include "../oem/blmjciaapa.h"
+#include "../log.h"
+#include "touch_send.h"
 
 #include <pthread.h>
 #include <string.h>
 
 namespace {
-
-// ---------------------------------------------------------------
-// Cached OEM function pointers — lazily resolved on first frame.
-//
-// We don't resolve in the constructor because the AapProc singleton
-// may not be fully constructed yet at that point. The OEM has
-// definitely finished constructing it by the time RaceAap::Init
-// successfully returns from aap_create_session, which is when our
-// touch_start() fires; by the time the first touch frame arrives,
-// the singleton is safe to query.
-// ---------------------------------------------------------------
-
-typedef void *(*pfn_get_singleton)(void);
-typedef void *(*pfn_get_member)(void *self);
-typedef int   (*pfn_is_focus)(void *vm);
-typedef int   (*pfn_send_touch)(void *race, AAP_TouchEvent *evt);
-
-pfn_get_singleton p_GetInstance      = nullptr;
-pfn_get_member    p_GetVideoManager  = nullptr;
-pfn_get_member    p_GetRaceAap       = nullptr;
-pfn_is_focus      p_IsAAVideoInFocus = nullptr;
-pfn_send_touch    p_SendTouchInput   = nullptr;
-
-bool g_symbols_resolved = false;
-
-void resolve_touch_symbols_once(void)
-{
-    if (g_symbols_resolved) return;
-    using namespace blm_offsets_FW_74_00_324A;
-
-    p_GetInstance      = resolve_blm<void *(void)>     (Singleton_AapProc_GetInstance);
-    p_GetVideoManager  = resolve_blm<void *(void *)>   (AapProc_GetVideoManager);
-    p_GetRaceAap       = resolve_blm<void *(void *)>   (AapProc_GetRaceAap);
-    p_IsAAVideoInFocus = resolve_blm<int  (void *)>    (VideoManager_IsAAVideoInFocus);
-    p_SendTouchInput   = resolve_blm<int  (void *, AAP_TouchEvent *)>(RaceAap_SendTouchInput);
-
-    g_symbols_resolved = true;
-    LOGD("touch send: OEM symbols resolved "
-              "(GetInstance=%p SendTouchInput=%p)",
-              (void *)p_GetInstance, (void *)p_SendTouchInput);
-}
 
 // ---------------------------------------------------------------
 // Coordinate scaling.
@@ -128,19 +89,19 @@ struct SnapEntry {
 void send_event(const SnapEntry *entries, int n,
                 AAPTouchAction action, int action_index)
 {
-    if (!g_enabled) return;
-    if (!p_SendTouchInput) return;
     if (n <= 0 || n > kMaxFingers) return;
 
     // Respect the OEM video-focus gate — don't push touches into a
-    // phone that isn't currently the foreground video sink.
-    void *aap = p_GetInstance ? p_GetInstance() : nullptr;
+    // phone that isn't currently the foreground video sink. The OEM
+    // accessors self-resolve; a nullptr means blmjciaapa.so/the
+    // AapProc singleton isn't available yet, so we just skip.
+    void *aap = Singleton_AapProc_GetInstance();
     if (!aap) {
         LOGV("send_event: AapProc instance not available, skipping");
         return;
     }
 
-    if (!p_IsAAVideoInFocus(p_GetVideoManager(aap))) {
+    if (!VideoManager_IsAAVideoInFocus(AapProc_GetVideoManager(aap))) {
         // Common when AAP is connected but the user is on the native
         // HMI / CarPlay; suppress quietly.
         LOGV("send_event: video not in focus, suppressing action=%u n=%d",
@@ -170,12 +131,12 @@ void send_event(const SnapEntry *entries, int n,
              i, entries[i].slot, evt.pointer_id[i], evt.x[i], evt.y[i]);
     }
 
-    void *race = p_GetRaceAap(aap);
+    void *race = AapProc_GetRaceAap(aap);
     if (!race) {
         LOGV("send_event: RaceAap not available, skipping");
         return;
     }
-    int rc = p_SendTouchInput(race, &evt);
+    int rc = RaceAap_SendTouchInput(race, &evt);
     LOGV("send_event: SendTouchInput -> %d", rc);
     if (rc != 0) {
         // 0x108 = AAP_SESSION_NOT_CONNECTED — expected briefly after
@@ -235,7 +196,6 @@ int insert_sorted(SnapEntry *arr, int n, int slot, const Finger &fg)
 
 void touch_on_frame(const MtState &cur)
 {
-    resolve_touch_symbols_once();
     decide_scaling(cur);
 
     if (!g_prev_init) {

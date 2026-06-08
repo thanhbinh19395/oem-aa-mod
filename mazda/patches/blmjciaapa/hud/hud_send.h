@@ -5,17 +5,15 @@
 // See NOTICE.md at the repo root for the full attribution.
 //
 // Producer-side interface for the HUD sender.
-// HUD output module — push interface used by nav.cpp.
+// HUD output module — push interface used by hud.cpp.
 //
 // Three small non-blocking functions the AAP nav callback in
-// `nav.cpp` calls once per phone-side event. Each updates a
+// `hud.cpp` calls once per phone-side event. Each updates a
 // seqlock-protected snapshot inside `hud_send.cpp` and wakes the
 // dedicated sender thread that owns the OEM D-Bus connections.
 //
-// Lifecycle (start/stop) is declared in patch.h alongside the
-// touch reader's start/stop — same lifecycle bracket fires both
-// from the aap_create_session / aap_destroy_session PLT shims in
-// lifecycle.cpp.
+// Lifecycle (start/stop) is declared here as the sender-facing
+// half of the HUD subsystem; hud_pre_aap_create_session lives in hud.h.
 //
 // Implementation reference: `mazda/hud/{hud.h,hud.cpp}` in the
 // upstream headunit project (see the SPDX header at the top of
@@ -28,6 +26,14 @@
 #define LIBPATCH_BLMJCIAAPA_HUD_SEND_H
 
 #include <stdint.h>
+
+// Defined in hud_send.cpp. HUD output lifecycle. hud_send_start opens
+// the OEM HMI + Service D-Bus connections, spawns a dispatcher
+// thread and a sender thread, and starts forwarding per-event
+// updates from hud.cpp. hud_send_stop tears the threads down and
+// releases the D-Bus connections. Both are idempotent.
+void hud_send_start(void);
+void hud_send_stop(void);
 
 // 0x500 NAVMessagesStatus. `status` per hu.proto: 1=START, 2=STOP.
 // Anything else is treated as STOP (defensive).

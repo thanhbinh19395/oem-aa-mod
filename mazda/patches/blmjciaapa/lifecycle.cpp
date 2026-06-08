@@ -17,7 +17,10 @@
 // — those symbols are LOCAL in blmjciaapa.so's static symtab, and
 // intra-library OEM callers don't go through the PLT anyway.
 
-#include "patch.h"
+#include "log.h"
+#include "hud/hud.h"
+#include "oem/blmjciaapa.h"
+#include "touch/touch.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -35,6 +38,28 @@ pfn_aap_destroy_session g_real_destroy = nullptr;
 pthread_mutex_t g_session_mu = PTHREAD_MUTEX_INITIALIZER;
 void           *g_session    = nullptr;   // last successfully-created handle
 bool            g_session_up = false;     // per-session shim threads (touch + HUD) alive
+bool            g_enabled    = false;     // true after blmjciaapa.so is confirmed mapped
+bool            g_self_gate_done = false;
+
+void oem_self_gate(void)
+{
+    if (g_self_gate_done) return;
+    g_self_gate_done = true;
+
+    // RTLD_NOLOAD: don't actually load if absent. Returns NULL if
+    // blmjciaapa.so isn't already mapped, i.e. we're in the wrong PID.
+    void *h = dlopen("/jci/aapa/blmjciaapa.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) {
+        // Expected when LD_PRELOAD'd into the wrong launcher PID;
+        // shim degrades to inert passthrough.
+        LOGW("self-gate: blmjciaapa.so not mapped — disabling shim");
+        g_enabled = false;
+        return;
+    }
+
+    g_enabled = true;
+    LOGD("self-gate: enabled, blmjciaapa.so handle=%p", h);
+}
 
 // Resolve a single symbol against the real libaap_interface.so.
 //
@@ -208,9 +233,9 @@ int aap_create_session(const char *cfg, void *unknown_r1,
          "(real_create=%p real_destroy=%p)",
          (void *)g_real_create, (void *)g_real_destroy);
 
-    // First invocation: try to set g_enabled by probing for the OEM
-    // anchor. We have to do this here (not in the constructor) because
-    // blmjciaapa.so isn't dlopen'd at constructor time.
+    // First invocation: try to set g_enabled by confirming the OEM
+    // BLM is mapped. We have to do this here (not in the constructor)
+    // because blmjciaapa.so isn't dlopen'd at constructor time.
     oem_self_gate();
     LOGD("aap_create_session: self-gate done (g_enabled=%d)",
          g_enabled ? 1 : 0);
@@ -235,7 +260,7 @@ int aap_create_session(const char *cfg, void *unknown_r1,
     // aap_create_session the SDK does memcpy(handle+0x20, cb_list, 76)
     // before returning.
     if (g_enabled) {
-        nav_install_cb(cb_list);
+        hud_pre_aap_create_session(cb_list);
     }
 
     LOGD("aap_create_session: calling real impl at %p",
@@ -258,17 +283,20 @@ int aap_create_session(const char *cfg, void *unknown_r1,
     g_session = *out_handle;
     if (!g_session_up) {
         LOGD("aap_create_session: spawning touch reader");
-        touch_start();
-        g_session_up = true;
+        touch_post_aap_create_session();
         LOGD("touch reader started");
 
-        // HUD sender: opens the OEM HMI + Service D-Bus connections
-        // and brings up dispatcher + sender threads. Same
-        // "once per process" gate as touch_start — the sender
-        // thread itself handles HUD-not-installed and routing
-        // start/stop transitions internally.
+        // HUD post-create hook: opens the OEM HMI + Service D-Bus
+        // connections and brings up dispatcher + sender threads.
+        // Same "once per process" gate as
+        // touch_post_aap_create_session — the sender thread itself
+        // handles HUD-not-installed and routing start/stop
+        // transitions internally.
         LOGD("aap_create_session: spawning HUD sender");
-        hud_send_start();
+        hud_post_aap_create_session();
+        LOGD("HUD post-create hook completed");
+
+        g_session_up = true;
     }
     pthread_mutex_unlock(&g_session_mu);
 
@@ -286,16 +314,18 @@ int aap_destroy_session(void *handle)
         pthread_mutex_lock(&g_session_mu);
         if (g_session_up) {
             LOGD("aap_destroy_session: stopping touch reader");
-            touch_stop();
-            g_session_up = false;
+            touch_pre_aap_destroy_session();
             LOGD("touch reader stopped");
 
             // Tear the HUD sender down on the same edge that
-            // stops the touch reader. hud_send_stop is
-            // idempotent so the gate on g_session_up keeps it
-            // matched 1:1 with the start above.
+            // stops the touch reader. The hook is idempotent so
+            // the gate on g_session_up keeps it matched 1:1 with
+            // the start above.
             LOGD("aap_destroy_session: stopping HUD sender");
-            hud_send_stop();
+            hud_pre_aap_destroy_session();
+            LOGD("HUD pre-destroy hook completed");
+
+            g_session_up = false;
         }
         g_session = nullptr;
         pthread_mutex_unlock(&g_session_mu);

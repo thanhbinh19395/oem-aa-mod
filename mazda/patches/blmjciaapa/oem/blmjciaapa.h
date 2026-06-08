@@ -1,0 +1,71 @@
+// OEM symbols inside blmjciaapa.so (anchor-and-offset bindings).
+//
+// This header reads like a normal vendor header: just the touch
+// wire-format types and prototypes of the OEM functions/methods we
+// call. There is NO init step and NO resolver to invoke — each
+// prototype is backed by a self-resolving thunk in blmjciaapa.cpp.
+//
+// The shipped blmjciaapa.so (FW 74.00.324A NA) exports exactly one
+// symbol in its dynamic symbol table: GetServiceInterfaces. Every
+// function below is LOCAL in the static symbol table and not
+// reachable via dlsym, so each thunk resolves its target by:
+//
+//   base = (uintptr_t)dlsym(blmjciaapa.so, "GetServiceInterfaces")
+//          - <anchor file offset>
+//   addr = base + <target file offset>
+//
+// on first call, caches it, and forwards. If blmjciaapa.so isn't
+// mapped (we're not in the {L_jciAAPA} PID) the thunk returns a
+// benign failure value (nullptr / 0 / -1). All offsets were harvested
+// with the cross-toolchain nm against the shipped
+// /jci/aapa/blmjciaapa.so; re-run the harvest after any OEM firmware
+// update before trusting them.
+
+#ifndef LIBPATCH_BLMJCIAAPA_BLMJCIAAPA_H
+#define LIBPATCH_BLMJCIAAPA_BLMJCIAAPA_H
+
+#include <stdint.h>
+
+// Maximum multi-touch fingers, fixed by AAP_TouchEvent's array sizes
+// and the AAP service's `< 10` validation on the receiving end.
+constexpr int kMaxFingers = 10;
+
+// Wire-format AAP_TouchEvent (0x88 / 136 bytes). Decoded by tracing
+// AAPInputSource::onTouchEvent and InputSource::populateTouchEvent.
+struct AAP_TouchEvent {
+    uint32_t device_type;            // +0x00, 1 = touchscreen
+    uint32_t finger_count;           // +0x04, 1..10
+    uint32_t x[kMaxFingers];         // +0x08, display pixels
+    uint32_t y[kMaxFingers];         // +0x30, display pixels
+    uint32_t pointer_id[kMaxFingers];// +0x58, evdev tracking IDs
+    uint32_t action;                 // +0x80, 1..5
+    uint32_t action_index;           // +0x84, compacted slot index
+};
+static_assert(sizeof(AAP_TouchEvent) == 0x88, "AAP_TouchEvent must be 0x88 bytes");
+
+// Wire-format `action` values, mapped to Android MotionEvent
+// semantics by the AAP service.
+enum AAPTouchAction : uint32_t {
+    kAAPTouchActionDown        = 1,  // first finger landed (n: 0 -> 1)
+    kAAPTouchActionUp          = 2,  // last finger lifted (n: 1 -> 0)
+    kAAPTouchActionMove        = 3,  // any finger moved
+    kAAPTouchActionPointerDown = 4,  // additional finger landed (n: k -> k+1, k>=1)
+    kAAPTouchActionPointerUp   = 5,  // one of several lifted (n: k -> k-1, k>=2)
+};
+
+// OEM functions/methods inside blmjciaapa.so. The OEM declares the
+// methods as non-static C++ members; ARM EABI passes the implicit
+// `this` in r0 like a normal first argument, so they are modelled as
+// free functions taking `void *self`.
+//   Singleton<AapProc>::GetInstance()      -> AapProc *
+//   AapProc::GetVideoManager()             -> VideoManager *
+//   AapProc::GetRaceAap()                  -> RaceAap *
+//   VideoManager::IsAAVideoInFocus()       -> int (bool)
+//   RaceAap::SendTouchInput(AAP_TouchEvent*) -> int (0 = ok)
+void *Singleton_AapProc_GetInstance(void);
+void *AapProc_GetVideoManager(void *self);
+void *AapProc_GetRaceAap(void *self);
+int   VideoManager_IsAAVideoInFocus(void *self);
+int   RaceAap_SendTouchInput(void *self, AAP_TouchEvent *evt);
+
+#endif  // LIBPATCH_BLMJCIAAPA_BLMJCIAAPA_H

@@ -4,7 +4,9 @@
 // licensed under GNU AGPL v3.
 // See NOTICE.md at the repo root for the full attribution.
 
-#include "../patch.h"
+#define LOG_TAG "HUD"
+#include "../log.h"
+#include "hud.h"
 #include "hud_send.h"
 
 #include <stdint.h>
@@ -352,10 +354,10 @@ void our_nav_cb(void *user_ctx, void *hdr36)
 //
 // We leave cb_list[18] (the user-context slot) untouched — the OEM
 // never sets it, and we have no per-session state to thread through.
-void nav_install_cb(void *cb_list)
+void hud_pre_aap_create_session(void *cb_list)
 {
     if (!cb_list) {
-        LOGW("nav_install_cb: NULL cb_list, skipping "
+        LOGW("hud_pre_aap_create_session: NULL cb_list, skipping "
              "(real aap_create_session will reject it anyway)");
         return;
     }
@@ -364,7 +366,7 @@ void nav_install_cb(void *cb_list)
     void  *prev  = slots[kCbListNavSlot];
     slots[kCbListNavSlot] = reinterpret_cast<void *>(&our_nav_cb);
 
-    LOGD("nav_install_cb: cb_list=%p slot[%d] %p -> %p (our_nav_cb)",
+    LOGD("hud_pre_aap_create_session: cb_list=%p slot[%d] %p -> %p (our_nav_cb)",
          cb_list, kCbListNavSlot, prev,
          reinterpret_cast<void *>(&our_nav_cb));
 
@@ -375,4 +377,14 @@ void nav_install_cb(void *cb_list)
     // libaap_interface.so / blmjciaapa.so before adjusting.
     static_assert(kCbListUserSlot < kCbListWordSlots,
                   "user-context slot out of cb_list bounds");
+}
+
+void hud_post_aap_create_session(void)
+{
+    hud_send_start();
+}
+
+void hud_pre_aap_destroy_session(void)
+{
+    hud_send_stop();
 }

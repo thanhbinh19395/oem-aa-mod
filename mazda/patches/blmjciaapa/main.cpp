@@ -2,25 +2,6 @@
 // linker has mapped this library, before main() / before
 // sm_svclauncher dlopen's blmjciaapa.so).
 //
-// Responsibilities:
-//   1. Self-gate: confirm we are loaded into the {L_jciAAPA} PID by
-//      probing for the GetServiceInterfaces symbol from blmjciaapa.so.
-//      If absent we no-op — the PLT shadows in lifecycle.cpp will
-//      still chain through to the real aap_create_session, so a
-//      misdeployed library degrades to a transparent passthrough
-//      instead of crashing the host process.
-//   2. Set g_enabled accordingly.
-//
-// We do NOT spawn the reader thread here. That happens from the
-// aap_create_session PLT shim (lifecycle.cpp) once an AAP session is
-// successfully established — bounding our failure window to
-// AAP-active time and ensuring the AapProc singleton is constructed
-// before we ever try to call into it.
-
-// Patch entry point. Runs once at LD_PRELOAD time (after the dynamic
-// linker has mapped this library, before main() / before
-// sm_svclauncher dlopen's blmjciaapa.so).
-//
 // IMPORTANT ordering: at constructor time blmjciaapa.so has NOT yet
 // been dlopen'd, so we cannot probe for OEM symbols here. sm_svclauncher
 // uses dlopen(name, RTLD_NOW) — *without* RTLD_GLOBAL — so even after
@@ -30,19 +11,18 @@
 // We therefore defer the self-gate to the first invocation of our
 // aap_create_session PLT shim (lifecycle.cpp), which fires from
 // RaceAap::Init *after* blmjciaapa.so is fully loaded. The gate uses
-// dlopen("/jci/aapa/blmjciaapa.so", RTLD_NOW | RTLD_NOLOAD) to obtain
-// a handle without re-loading and dlsym(handle, "GetServiceInterfaces")
-// to resolve the anchor. The handle reference is held forever (one
-// extra refcount on a library that's already permanently mapped).
+// dlopen("/jci/aapa/blmjciaapa.so", RTLD_NOW | RTLD_NOLOAD) to confirm
+// the BLM is mapped without re-loading it. The handle reference is held
+// forever (one extra refcount on a library that's already permanently
+// mapped). GetServiceInterfaces resolution happens later in
+// oem/blmjciaapa.cpp.
 //
 // The constructor just logs that we were loaded. If we ever land in
 // a process that never calls aap_create_session, the library stays
 // inert.
 
-#include "patch.h"
-#include "offsets.h"
+#include "log.h"
 
-#include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -51,9 +31,6 @@
 #include <sys/types.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
-
-bool  g_enabled = false;
-void *g_oem_anchor_GetServiceInterfaces = nullptr;
 
 namespace {
 
@@ -273,34 +250,3 @@ void on_load()
 
 } // namespace
 
-// Called from lifecycle.cpp on the first aap_create_session invocation.
-// Idempotent. Sets g_enabled + g_oem_anchor_GetServiceInterfaces.
-void oem_self_gate(void)
-{
-    if (g_oem_anchor_GetServiceInterfaces) return;   // already done
-
-    // RTLD_NOLOAD: don't actually load if absent. Returns NULL if
-    // blmjciaapa.so isn't already mapped, i.e. we're in the wrong PID.
-    void *h = dlopen("/jci/aapa/blmjciaapa.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!h) {
-        // Expected when LD_PRELOAD'd into the wrong launcher PID;
-        // shim degrades to inert passthrough.
-        LOGW("self-gate: blmjciaapa.so not mapped — disabling shim");
-        g_enabled = false;
-        return;
-    }
-
-    void *anchor = dlsym(h, "GetServiceInterfaces");
-    if (!anchor) {
-        LOGE("self-gate: GetServiceInterfaces not found in handle — disabling");
-        // We deliberately do NOT dlclose(h) — we want the address to
-        // remain stable for the rest of the process. Holding the
-        // extra refcount is harmless on a permanently-mapped lib.
-        g_enabled = false;
-        return;
-    }
-
-    g_oem_anchor_GetServiceInterfaces = anchor;
-    g_enabled = true;
-    LOGD("self-gate: enabled, anchor=%p", anchor);
-}
