@@ -18,7 +18,9 @@
 // intra-library OEM callers don't go through the PLT anyway.
 
 #include "log.h"
+#include "lifecycle.h"
 #include "hud/hud.h"
+#include "monitor/navi_monitor.h"
 #include "oem/blmjciaapa.h"
 #include "touch/touch.h"
 
@@ -296,6 +298,15 @@ int aap_create_session(const char *cfg, void *unknown_r1,
         hud_post_aap_create_session();
         LOGD("HUD post-create hook completed");
 
+#if defined(DEBUG) && BLMJCIAAPA_ENABLE_NAVI_MONITOR
+        // Debug-only: eavesdrop on com.jci.vbs.navi(.tmc) traffic and
+        // forward dbus-monitor output to the patch log. Compiled out
+        // of release builds entirely (both call site and module body).
+        LOGD("aap_create_session: starting navi dbus-monitor");
+        navi_monitor_post_aap_create_session();
+        LOGD("navi dbus-monitor start hook completed");
+#endif
+
         g_session_up = true;
     }
     pthread_mutex_unlock(&g_session_mu);
@@ -324,6 +335,12 @@ int aap_destroy_session(void *handle)
             LOGD("aap_destroy_session: stopping HUD sender");
             hud_pre_aap_destroy_session();
             LOGD("HUD pre-destroy hook completed");
+
+#if defined(DEBUG) && BLMJCIAAPA_ENABLE_NAVI_MONITOR
+            LOGD("aap_destroy_session: stopping navi dbus-monitor");
+            navi_monitor_pre_aap_destroy_session();
+            LOGD("navi dbus-monitor stop hook completed");
+#endif
 
             g_session_up = false;
         }
