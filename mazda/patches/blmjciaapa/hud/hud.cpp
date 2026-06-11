@@ -82,6 +82,37 @@ enum NavTurnEventEnum : uint32_t {
     NAV_TURN_EVENT_DESTINATION              = 19,
 };
 
+// The value at +0x10 is NOT the raw proto turn_event — the producer
+// re-bases it first. Before forwarding, the producer compacts the
+// sparse proto enum (which skips 15 and 18) into a dense 0..17 enum,
+// i.e. it deletes the two gaps. Its mapping is, equivalently:
+//
+//     proto 0..14            -> unchanged   (0..14)
+//     proto 16 FERRY_BOAT    -> 15
+//     proto 17 FERRY_TRAIN   -> 16
+//     proto 19 DESTINATION   -> 17
+//     anything else          -> garbage (producer logs a warning and
+//                               forwards an uninitialised local)
+//
+// So the byte we receive for the destination maneuver is 17, which —
+// if read as a proto value — collides with FERRY_TRAIN and resolves
+// to a blank glyph. Undo the compaction here so the rest of the HUD
+// path (NavTurnEventEnum, nav_turn_event_name, kTurnIcons) can keep
+// indexing by the genuine proto values it was built and validated
+// against. Only the top three events move; 0..14 are identity.
+uint32_t decode_turn_event(uint32_t compacted)
+{
+    switch (compacted) {
+    case 15: return NAV_TURN_EVENT_FERRY_BOAT;   // 15 -> 16
+    case 16: return NAV_TURN_EVENT_FERRY_TRAIN;  // 16 -> 17
+    case 17: return NAV_TURN_EVENT_DESTINATION;  // 17 -> 19
+    default: return compacted;                   // 0..14 pass through;
+                                                 // 18/19/… never appear
+                                                 // (producer can't emit
+                                                 // them) but stay benign.
+    }
+}
+
 // NAVDistanceMessage.DISPLAY_DISTANCE_UNIT — proto enum, hu.proto:
 //   METERS       = 1  // meters    * 1000 (display < 1000 m)
 //   KILOMETERS10 = 2  // km        * 1000 (display > 10 km)
@@ -111,7 +142,10 @@ enum NavDistanceUnitEnum : uint32_t {
 //                                         proto calls this `event_name`)
 //   +0x08  uint32   road_name_len
 //   +0x0C  uint32   turn_side            (NAVTurnMessage.TURN_SIDE)
-//   +0x10  uint32   turn_event           (NAVTurnMessage.TURN_EVENT, 0..19 sparse)
+//   +0x10  uint32   turn_event           (producer-COMPACTED TURN_EVENT,
+//                                         dense 0..17 — NOT the raw proto
+//                                         value; decode_turn_event() maps it
+//                                         back to the sparse proto enum)
 //   +0x14  void *   image                (PNG bytes when IMAGE mode;
 //                                         NULL in IMAGE_CODES_ONLY mode)
 //   +0x18  uint32   image_len            (0 in IMAGE_CODES_ONLY mode)
@@ -122,7 +156,7 @@ struct NextTurnHdr {
     const char *road_name;
     uint32_t    road_name_len;
     uint32_t    turn_side;
-    uint32_t    turn_event;
+    uint32_t    turn_event;   // producer-compacted; run through decode_turn_event()
     const void *image;
     uint32_t    image_len;
     int32_t     turn_angle;
@@ -229,7 +263,7 @@ void dump_status(const StatusHdr *h)
          nav_status_name(h->status));
 }
 
-void dump_next_turn(const NextTurnHdr *h)
+void dump_next_turn(const NextTurnHdr *h, uint32_t turn_event)
 {
     // road_name is a heap pointer the SDK frees the moment we
     // return; for the log we copy at most a sane cap into a stack
@@ -250,15 +284,20 @@ void dump_next_turn(const NextTurnHdr *h)
         road[n] = '\0';
     }
 
+    // h->turn_event is the producer's compacted value; `turn_event`
+    // (passed in) has already been mapped back to the proto enum, so
+    // the name lookup matches the proto table. Log both so the field
+    // semantics stay traceable: raw= what arrived, = proto value.
     LOGD("nav 0x501 NAVTurnMessage: road=\"%s\" road_len=%u "
-         "turn_side=%u(%s) turn_event=%u(%s) "
+         "turn_side=%u(%s) turn_event=%u(%s) raw_event=%u "
          "turn_angle=%d turn_number=%d image=%p image_len=%u",
          road,
          static_cast<unsigned>(h->road_name_len),
          static_cast<unsigned>(h->turn_side),
          nav_turn_side_name(h->turn_side),
+         static_cast<unsigned>(turn_event),
+         nav_turn_event_name(turn_event),
          static_cast<unsigned>(h->turn_event),
-         nav_turn_event_name(h->turn_event),
          static_cast<int>(h->turn_angle),
          static_cast<int>(h->turn_number),
          h->image,
@@ -307,8 +346,9 @@ void our_nav_cb(void *user_ctx, void *hdr36)
     }
     case kTagNextTurn: {
         const NextTurnHdr *t = static_cast<const NextTurnHdr *>(hdr36);
-        dump_next_turn(t);
-        hud_on_next_turn(t->road_name, t->turn_side, t->turn_event,
+        const uint32_t turn_event = decode_turn_event(t->turn_event);
+        dump_next_turn(t, turn_event);
+        hud_on_next_turn(t->road_name, t->turn_side, turn_event,
                          t->turn_angle, t->turn_number);
         break;
     }
