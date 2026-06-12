@@ -289,8 +289,14 @@ void send_one(const NaviSnapshot &cur,
         return;
     }
 
+    // The OEM's NAVI_SendHUDGuidaceDataToVBS bumps syncBitCount (and
+    // re-latches the Msg2 street page) on a new *maneuver instance* —
+    // i.e. when the maneuver icon changes OR the street name changes —
+    // not on distance/speed ticks. Mirror that: a new road name or a
+    // new resolved turn-icon both start a new instance.
     bool event_changed = (std::strncmp(cur.road_name, prev.road_name,
-                                       sizeof(cur.road_name)) != 0);
+                                       sizeof(cur.road_name)) != 0) ||
+                         (compute_turn_icon(cur) != compute_turn_icon(prev));
     bool distance_changed = event_changed ||
                             cur.distance_dec  != prev.distance_dec  ||
                             cur.distance_unit != prev.distance_unit ||
