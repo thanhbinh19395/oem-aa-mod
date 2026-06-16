@@ -141,21 +141,18 @@ void emit_guidance(uint32_t dir_icon, int32_t maneuver_dist,
     dbus_message_unref(msg);
 }
 
-// snap vs prev -> emit when guidance changed. svcjcinavi owns the
-// sync bit / street-strip pairing, so we only decide WHEN to push.
-void send_one(const NaviSnapshot &cur, const NaviSnapshot &prev)
+// snap -> emit. svcjcinavi owns the sync bit / street-strip pairing,
+// so we only decide WHEN to push. We push on EVERY fresh snapshot, with
+// no content change-detection: we are not the HUD frame writer
+// (svcjcinavi is), and it can silently ignore an individual frame —
+// e.g. one that arrives right as the HUD is being enabled. Both AAP and
+// the OEM nav engine re-send guidance at roughly 1 Hz, so re-asserting
+// our guidance on every update keeps the HUD from sitting blank for a
+// long stretch (until the next genuine value change) when an early
+// frame was dropped.
+void send_one(const NaviSnapshot &cur)
 {
     uint32_t icon = compute_turn_icon(cur.turn_event, cur.turn_side, cur.turn_angle);
-
-    bool changed = (std::strncmp(cur.road_name, prev.road_name,
-                                 sizeof(cur.road_name)) != 0) ||
-                   icon              != compute_turn_icon(prev.turn_event, prev.turn_side, prev.turn_angle) ||
-                   cur.distance_dec  != prev.distance_dec       ||
-                   cur.distance_unit != prev.distance_unit;
-    if (!changed) {
-        LOGV("svcnavi_send: snapshot unchanged vs previous — no signal");
-        return;
-    }
 
     emit_guidance(icon,
                   cur.distance_dec,
@@ -236,8 +233,7 @@ void *sender_main(void *)
     g_active.store(true, std::memory_order_release);
     LOGD("svcnavi sender: HUD plumbing ready");
 
-    NaviSnapshot prev = {};
-    uint32_t     last_processed = 0;
+    uint32_t last_processed = 0;
 
     while (!g_stop.load(std::memory_order_relaxed)) {
         NaviSnapshot snap;
@@ -252,8 +248,7 @@ void *sender_main(void *)
         }
 
         if (s2 != last_processed) {
-            send_one(snap, prev);
-            prev = snap;
+            send_one(snap);
             last_processed = s2;
         }
 
