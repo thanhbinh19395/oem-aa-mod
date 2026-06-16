@@ -22,28 +22,8 @@
 
 #include <stdint.h>
 
-#include "libjcidbus.h"   // connection lifecycle + kJci*Bus selectors
-
-// 12-byte com.jci.vbs.navi HUD frame, signature (uqyqyy). Field
-// offsets verified against VBS_NAVI_HUD_Display_s_t_pack:
-// u32@0, u16@4, u8@6, u16@8, u8@10, u8@11 (sizeof == 12 with the
-// natural pad byte at offset 7).
-struct VbsNaviHudDisplay {
-    uint32_t nextManeuverInfo;
-    uint16_t distanceValue;
-    uint8_t  distanceUnit;
-    uint16_t displaySpeedLimit;
-    uint8_t  displaySpeedUnit;
-    uint8_t  text_ID3;
-};
-
-// 8-byte com.jci.vbs.navi.tmc street-name struct, signature (sy):
-// char*@0, u8@4. The library transcodes UTF-8 -> UCS-2 and pages
-// it internally; we just hand it a NUL-terminated C string.
-struct VbsNaviHudMsg2 {
-    const char *guidancePointName;
-    uint8_t     syncBit;
-};
+#include "libjcidbus.h"            // connection lifecycle + kJci*Bus selectors
+#include "common/oem/vbs_navi_hud.h"   // VbsNaviHudDisplay, VbsNaviHudMsg2, kAapSpeedSentinel
 
 // --- HUD setters ----------------------------------------------
 // Setters: (conn, &struct, unused, completion_cb, user) -> int

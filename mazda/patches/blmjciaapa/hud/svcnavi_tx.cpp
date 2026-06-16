@@ -28,6 +28,7 @@
 #include "svcnavi_tx.h"
 #include "hud_nav.h"
 #include "../oem/libdbus.h"
+#include "common/oem/vbs_navi_hud.h"   // kAapSpeedSentinel (shared with svcjcinavi)
 
 #include <condition_variable>
 #include <cstdlib>
@@ -52,13 +53,10 @@ constexpr const char *kSignalPath   = "/com/NNG/Api/Server";
 constexpr const char *kSignalIface  = "com.NNG.Api.Server.Guidance";
 constexpr const char *kSignalMember = "GuidanceChangedForHUD";
 
-// Reserved speedLimit value marking a frame as AAP-originated. The
-// signal arg is int32 on the wire (the demarshaller is
-// signal_nngapiserver_int32_..._string_...), so 0xFFFF is safely
-// out of band for a real km/h or mph limit. A future svcjcinavi-side
-// splice hook keys on this to tell our frames from the OEM nav
-// engine's; a stock svcjcinavi just renders it verbatim.
-constexpr int32_t kAapSpeedSentinel = 0xFFFF;
+// Reserved speedLimit value marking a frame as AAP-originated lives in
+// common/oem/vbs_navi_hud.h (kAapSpeedSentinel) so the svcjcinavi merge
+// patch keys on the exact same value. On the GuidanceChangedForHUD
+// wire the speedLimit arg is int32; 0xFFFF round-trips unchanged.
 
 // The HUD turn-icon enum, kTurnIcons table, roundabout_icon(),
 // map_distance_unit(), and compute_turn_icon() are shared with the

@@ -26,7 +26,7 @@ CXX         := $(M3TOOLCHAIN)/bin/$(TRIPLE)-g++
 SYSROOT     := $(M3TOOLCHAIN)/$(TRIPLE)/sysroot
 
 # OEM libraries we patch. Order doesn't matter.
-PATCHES := blmjciaapa
+PATCHES := blmjciaapa svcjcinavi
 
 # pkg-config wrapper pointed at the device's sysroot so it resolves
 # against the cross-compiled .pc files (not the host's). Same pattern
@@ -64,6 +64,7 @@ COMMON_CXXFLAGS := -std=c++11 \
                    -fPIC \
                    -fvisibility=hidden \
                    -D_GLIBCXX_USE_CXX11_ABI=0 \
+                   -Ipatches \
                    $(PKG_CFLAGS)
 # -D_GLIBCXX_USE_CXX11_ABI=0 selects the pre-C++11 (COW) std::string
 # and std::list ABI. The device ships libstdc++.so.6.0.14 (GCC 4.6

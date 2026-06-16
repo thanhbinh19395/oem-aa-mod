@@ -23,6 +23,7 @@
 #include "monitor/navi_monitor.h"
 #include "oem/blmjciaapa.h"
 #include "touch/touch.h"
+#include "common/preload.h"   // PRELOAD_EXPORT + resolve_real_symbol
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -63,31 +64,18 @@ void oem_self_gate(void)
     LOGD("self-gate: enabled, blmjciaapa.so handle=%p", h);
 }
 
-// Resolve a single symbol against the real libaap_interface.so.
-//
-// dlsym(RTLD_NEXT, ...) is the textbook way to do this, BUT it only
-// searches the global scope past our own image. sm_svclauncher
-// dlopens blmjciaapa.so without RTLD_GLOBAL, and libaap_interface.so
-// is pulled in as a DT_NEEDED dependency of blmjciaapa.so — meaning
-// it lands in blmjciaapa.so's *local* scope only. RTLD_NEXT therefore
-// returns NULL here, even though the library is mapped into the
-// process. (Same trap as documented for HMIEventHandler::Init in the
-// file-header comment above.)
-//
-// Workaround: get a handle to libaap_interface.so via dlopen with
-// RTLD_NOLOAD — that consults the loader's global list of mapped
-// objects regardless of scope, so it finds the already-loaded
-// instance and bumps its refcount by one. dlsym on that handle then
-// returns the real address.
-//
-// We still try RTLD_NEXT first so that in any environment where the
-// library *does* happen to be globally visible (e.g. a future host
-// process that LD_PRELOADs both libs, or a test harness) we don't
-// take an unnecessary refcount.
+// Real libaap_interface.so symbols are resolved via the shared
+// resolve_real_symbol() helper (common/preload.h): it tries
+// dlsym(RTLD_NEXT) first, then NOLOAD-dlopens the defining library
+// and dlsyms that handle (libaap_interface.so lands in blmjciaapa.so's
+// *local* scope — RTLD_NEXT alone misses it), with a self-loop guard
+// that refuses to return our own exported shim. g_libaap_handle is the
+// caller-owned NOLOAD handle cache so repeat resolutions don't leak
+// refcounts.
 void *g_libaap_handle = nullptr;
 
-// Forward declarations of our own exported PLT shadows so we can
-// take their addresses to detect self-loops in resolve_oem_symbol.
+// Forward declarations of our own exported PLT shadows so we can pass
+// their addresses as the self-loop guard to resolve_real_symbol.
 // Defined further down in this file with PRELOAD_EXPORT.
 extern "C" int aap_create_session(const char *, void *, void *, void **);
 extern "C" int aap_destroy_session(void *);
@@ -124,104 +112,27 @@ extern "C" int aap_destroy_session(void *);
 // from caller to callee so the OEM's NULL stays NULL and the
 // real `out_handle` (= this+4) gets the session pointer it expects.
 
-// Returns true if `addr` is one of our exported PLT shadows. If
-// dlsym ever returns this, calling it would recurse straight back
-// into us (because LD_PRELOAD'd libs sit at the front of every
-// scope, including the one a regular dlopen-handle dlsym searches),
-// stack-overflow, SIGSEGV.
-bool addr_is_own_shim(void *addr)
-{
-    return addr == reinterpret_cast<void *>(&aap_create_session) ||
-           addr == reinterpret_cast<void *>(&aap_destroy_session);
-}
-
-void *resolve_oem_symbol(const char *name)
-{
-    // 1) RTLD_NEXT path. Only walks the *global* scope past our
-    // image. libaap_interface.so isn't globally scoped in this
-    // process, so this is expected to return NULL — but if it does
-    // return a real address, that's the cleanest answer (no extra
-    // refcount on libaap_interface.so).
-    void *p = dlsym(RTLD_NEXT, name);
-    LOGD("resolve_oem_symbol(%s): dlsym(RTLD_NEXT) -> %p", name, p);
-    if (p && !addr_is_own_shim(p)) {
-        return p;
-    }
-    if (p) {
-        LOGW("resolve_oem_symbol(%s): dlsym(RTLD_NEXT) returned OUR "
-             "shim %p — LD_PRELOAD interposition trap, falling through",
-             name, p);
-    }
-
-    // 2) NOLOAD-dlopen path. Get a handle to the already-mapped
-    // libaap_interface.so regardless of its scope.
-    if (!g_libaap_handle) {
-        // Try the unversioned soname first (lets the dynamic linker's
-        // search path / DT_RUNPATH find the right copy), then fall
-        // back to the absolute path documented at the top of this file.
-        g_libaap_handle = dlopen("libaap_interface.so",
-                                 RTLD_NOW | RTLD_NOLOAD);
-        if (!g_libaap_handle) {
-            g_libaap_handle = dlopen("/usr/lib/libaap_interface.so",
-                                     RTLD_NOW | RTLD_NOLOAD);
-        }
-        if (!g_libaap_handle) {
-            LOGE("resolve_oem_symbol: dlopen(libaap_interface.so, "
-                 "RTLD_NOLOAD) failed: %s", dlerror());
-            return nullptr;
-        }
-        LOGD("resolve_oem_symbol: libaap_interface.so handle=%p "
-             "(via dlopen NOLOAD fallback)", g_libaap_handle);
-    }
-
-    p = dlsym(g_libaap_handle, name);
-    LOGD("resolve_oem_symbol(%s): dlsym(handle=%p) -> %p "
-         "(our shims: create=%p destroy=%p)",
-         name, g_libaap_handle, p,
-         reinterpret_cast<void *>(&aap_create_session),
-         reinterpret_cast<void *>(&aap_destroy_session));
-    if (!p) {
-        LOGE("resolve_oem_symbol: dlsym(%s) on libaap_interface.so "
-             "handle failed: %s", name, dlerror());
-        return nullptr;
-    }
-
-    // 3) Self-loop guard. If glibc's per-handle dlsym still walks
-    // through preloaded objects (it does on Linux: LD_PRELOAD libs
-    // are inserted at the front of every link-map's search scope,
-    // including ones used by handle-based dlsym), we get OUR address
-    // back here. Calling it would recurse forever and stack-overflow
-    // into a SIGSEGV — which is exactly what was happening before
-    // this guard was added.
-    if (addr_is_own_shim(p)) {
-        LOGC("resolve_oem_symbol(%s): dlsym(handle) returned OUR shim "
-             "%p — LD_PRELOAD interposition trap; refusing to recurse. "
-             "The real libaap_interface.so impl is unreachable through "
-             "the loader's per-handle search path; need ELF-symtab "
-             "fallback to bypass it.", name, p);
-        return nullptr;
-    }
-    return p;
-}
-
 void resolve_real_once(void)
 {
     if (!g_real_create) {
         g_real_create = reinterpret_cast<pfn_aap_create_session>(
-            resolve_oem_symbol("aap_create_session"));
+            resolve_real_symbol("aap_create_session",
+                                "libaap_interface.so",
+                                "/usr/lib/libaap_interface.so",
+                                reinterpret_cast<void *>(&aap_create_session),
+                                &g_libaap_handle));
     }
     if (!g_real_destroy) {
         g_real_destroy = reinterpret_cast<pfn_aap_destroy_session>(
-            resolve_oem_symbol("aap_destroy_session"));
+            resolve_real_symbol("aap_destroy_session",
+                                "libaap_interface.so",
+                                "/usr/lib/libaap_interface.so",
+                                reinterpret_cast<void *>(&aap_destroy_session),
+                                &g_libaap_handle));
     }
 }
 
 } // namespace
-
-// NOTE: -fvisibility=hidden is in the build flags, so each shim symbol
-// must be explicitly exported with default visibility for the loader
-// to bind OEM PLT lookups to it.
-#define PRELOAD_EXPORT __attribute__((visibility("default")))
 
 extern "C" PRELOAD_EXPORT
 int aap_create_session(const char *cfg, void *unknown_r1,
