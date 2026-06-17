@@ -82,7 +82,7 @@ jobs:
           set -euo pipefail
           VERSION="$(git rev-parse --short HEAD)"
           mkdir -p dist
-          # Same packaging as release.yml: one tar.gz per config, .so
+          # Same packaging as release.yml: one zip per config, .so
           # keeps its canonical name in both, resources/ bundled in both.
           # Normal (release) archive has no suffix; debug gets -debug.
           for cfg in release debug; do
@@ -100,14 +100,15 @@ jobs:
               file "$so" | grep -q 'ELF 32-bit.*ARM' || {
                 echo "::error::$so is not an ARM shared object"; exit 1; }
             done
-            tar -czf "dist/${name}.tar.gz" -C staging "$name"
+            # Wrapper dir inside the archive avoids a zip-bomb on extract.
+            ( cd staging && zip -r "../dist/${name}.zip" "$name" )
           done
-          ( cd dist && sha256sum ./*.tar.gz > SHA256SUMS )
+          ( cd dist && sha256sum ./*.zip > SHA256SUMS )
           echo "--- dist ---"
           ls -la dist
-          for archive in dist/*.tar.gz; do
+          for archive in dist/*.zip; do
             echo "--- $archive contents ---"
-            tar -tzf "$archive"
+            unzip -l "$archive"
           done
 
       - name: Upload archives
@@ -115,7 +116,7 @@ jobs:
         with:
           name: oem-aa-mod-archives
           path: |
-            dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS
           retention-days: 14
           if-no-files-found: error

@@ -112,15 +112,15 @@ jobs:
               file "$so" | grep -q 'ELF 32-bit.*ARM' || {
                 echo "::error::$so is not an ARM shared object"; exit 1; }
             done
-            # Wrapper dir inside the tarball avoids a tar-bomb on extract.
-            tar -czf "dist/${name}.tar.gz" -C staging "$name"
+            # Wrapper dir inside the archive avoids a zip-bomb on extract.
+            ( cd staging && zip -r "../dist/${name}.zip" "$name" )
           done
-          ( cd dist && sha256sum ./*.tar.gz > SHA256SUMS )
+          ( cd dist && sha256sum ./*.zip > SHA256SUMS )
           echo "--- dist ---"
           ls -la dist
-          for archive in dist/*.tar.gz; do
+          for archive in dist/*.zip; do
             echo "--- $archive contents ---"
-            tar -tzf "$archive"
+            unzip -l "$archive"
           done
 
       - name: Publish GitHub release
@@ -137,6 +137,6 @@ jobs:
             echo "::error::Release $TAG already exists — refusing to overwrite. Delete it manually to re-release."
             exit 1
           fi
-          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+          gh release create "$TAG" dist/*.zip dist/SHA256SUMS \
             --title "$TAG" \
             --generate-notes
