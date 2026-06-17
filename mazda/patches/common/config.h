@@ -36,8 +36,7 @@
 #ifndef LIBPATCH_COMMON_CONFIG_H
 #define LIBPATCH_COMMON_CONFIG_H
 
-#include "common/log.h"
-
+#include "log.h"
 #include <dlfcn.h>
 #include <limits.h>    // PATH_MAX
 #include <stddef.h>
