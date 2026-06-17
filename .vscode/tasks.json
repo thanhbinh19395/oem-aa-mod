@@ -45,16 +45,6 @@
             "type": "shell",
             "command": "make -j$(nproc) -C mazda blmjciaapa-debug",
             "problemMatcher": "$gcc"
-        },
-        {
-            "label": "Install",
-            "group": "build",
-            "dependsOn": [
-                "Build Debug"
-            ],
-            "type": "shell",
-            "command": "sudo mount -t drvfs f: /mnt/f && cp ./mazda/build/debug/libpatch-*.so /mnt/f/ && sudo umount /mnt/f",
-            "problemMatcher": []
         }
     ]
 }
