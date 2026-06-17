@@ -23,6 +23,7 @@
 // patches in common/preload_guard.h.
 
 #include "log.h"
+#include "common/config.h"
 #include "common/preload_guard.h"
 
 #include <unistd.h>
@@ -50,6 +51,25 @@ void on_load()
     preload_install_fatal_handler();
     LOGD("fatal-signal handler installed (SEGV/BUS/ABRT/FPE/ILL) pid=%d",
          (int)getpid());
+
+    // Read libpatch.conf (sibling of this .so) once, now, so the
+    // touch/HUD gates and HUD transport choice are settled before the
+    // first aap_create_session. Missing file/keys fall back to defaults.
+    // &on_load is an address in this .so, used to locate our directory.
+    //
+    // Belt-and-suspenders: this runs in a library constructor, so any
+    // exception that escaped here would propagate into the dynamic
+    // loader (which is not exception-aware) and std::terminate the whole
+    // launcher process. The load path is all C-style/non-throwing today,
+    // but wrap it so a future parser change can never turn a bad config
+    // into a failed boot — on any error we keep the compiled-in defaults.
+    try {
+        libpatch_config::load(reinterpret_cast<const void *>(&on_load));
+    } catch (...) {
+        LOGE("config: load threw — keeping defaults (must never escape "
+             "the library constructor)");
+    }
+
     LOGD("self-gate deferred to first aap_create_session call pid=%d",
          (int)getpid());
 }

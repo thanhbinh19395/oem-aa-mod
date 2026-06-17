@@ -28,7 +28,7 @@
 #include "svcnavi_tx.h"
 #include "hud_nav.h"
 #include "../oem/libdbus.h"
-#include "common/oem/vbs_navi_hud.h"   // kAapSpeedSentinel (shared with svcjcinavi)
+#include "../../common/oem/vbs_navi_hud.h"   // kAapSpeedSentinel (shared with svcjcinavi)
 
 #include <condition_variable>
 #include <cstdlib>

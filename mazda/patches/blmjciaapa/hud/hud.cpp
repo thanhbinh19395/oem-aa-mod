@@ -7,60 +7,71 @@
 #define LOG_TAG "HUD"
 #include "../log.h"
 #include "hud.h"
+#include "common/config.h"   // libpatch_config::hud_transport()
 
 // HUD transport selection. Two transports send our guidance to the
 // HUD by different routes:
 //   * vbs     (vbs_tx.{h,cpp})       — writes the HUD frame directly to
 //                                      com.jci.vbs.navi (libjcimod_navigation
 //                                      inside the jciVBS process). Works with
-//                                      no navigation SD card. This is the
-//                                      default.
+//                                      no navigation SD card.
 //   * svcnavi (svcnavi_tx.{h,cpp})   — emits GuidanceChangedForHUD to
 //                                      svcjcinavi, which forwards as the single
 //                                      HUD-frame writer. Needs the nav SD card.
-// Selected by the HUD_TRANSPORT macro (Makefile: HUD_TRANSPORT=vbs|svcnavi).
-// Defaults to vbs when unset.
-#define HUD_TRANSPORT_VBS     0
-#define HUD_TRANSPORT_SVCNAVI 1
-#ifndef HUD_TRANSPORT
-#define HUD_TRANSPORT HUD_TRANSPORT_SVCNAVI
-#endif
-
-#if HUD_TRANSPORT == HUD_TRANSPORT_SVCNAVI
+// Both backends are compiled in; the active one is chosen at RUNTIME
+// from libpatch.conf (hud_transport=svcnavi|vbs), defaulting to svcnavi.
+// See config.{h,cpp}.
 #include "svcnavi_tx.h"
-#else
 #include "vbs_tx.h"
-#endif
 
 #include <stdint.h>
 #include <string.h>
 
 namespace {
 
-// Transport forwarders — resolve to the selected backend (svcnavi or
-// vbs) at compile time so the call sites below stay transport-
-// agnostic. Both backends expose the same five-function interface.
-#if HUD_TRANSPORT == HUD_TRANSPORT_SVCNAVI
-inline void hud_tx_start()  { svcnavi_tx_start(); }
-inline void hud_tx_stop()   { svcnavi_tx_stop(); }
-inline void hud_tx_status(uint32_t status) { svcnavi_tx_status(status); }
+// Transport forwarders — bind once to the configured backend, then stay
+// transport-agnostic at the call sites. Both backends expose the same
+// five free functions with identical signatures, so an ops table of
+// plain function pointers selects between them with no per-call branch.
+struct HudTransportOps {
+    void (*start)();
+    void (*stop)();
+    void (*status)(uint32_t status);
+    void (*next_turn)(const char *road, uint32_t side, uint32_t event,
+                      int32_t angle, int32_t number);
+    void (*distance)(int32_t dist_m, int32_t time_s,
+                     int32_t disp_dist, uint32_t disp_unit);
+};
+
+const HudTransportOps kSvcnaviOps = {
+    &svcnavi_tx_start, &svcnavi_tx_stop, &svcnavi_tx_status,
+    &svcnavi_tx_next_turn, &svcnavi_tx_distance,
+};
+const HudTransportOps kVbsOps = {
+    &vbs_tx_start, &vbs_tx_stop, &vbs_tx_status,
+    &vbs_tx_next_turn, &vbs_tx_distance,
+};
+
+// The active backend. Bound once in hud_tx_start() (the first transport
+// call of every session) from the config value, then used directly by
+// the per-event forwarders that only ever fire after start. Defaults to
+// svcnavi so a stray call before binding still has a valid target.
+const HudTransportOps *g_tx = &kSvcnaviOps;
+
+inline void hud_tx_start()
+{
+    g_tx = (libpatch_config::hud_transport() == libpatch_config::HUD_TRANSPORT_VBS)
+               ? &kVbsOps : &kSvcnaviOps;
+    g_tx->start();
+}
+inline void hud_tx_stop()   { g_tx->stop(); }
+inline void hud_tx_status(uint32_t status) { g_tx->status(status); }
 inline void hud_tx_next_turn(const char *road, uint32_t side, uint32_t event,
                              int32_t angle, int32_t number)
-{ svcnavi_tx_next_turn(road, side, event, angle, number); }
+{ g_tx->next_turn(road, side, event, angle, number); }
 inline void hud_tx_distance(int32_t dist_m, int32_t time_s,
                             int32_t disp_dist, uint32_t disp_unit)
-{ svcnavi_tx_distance(dist_m, time_s, disp_dist, disp_unit); }
-#else
-inline void hud_tx_start()  { vbs_tx_start(); }
-inline void hud_tx_stop()   { vbs_tx_stop(); }
-inline void hud_tx_status(uint32_t status) { vbs_tx_status(status); }
-inline void hud_tx_next_turn(const char *road, uint32_t side, uint32_t event,
-                             int32_t angle, int32_t number)
-{ vbs_tx_next_turn(road, side, event, angle, number); }
-inline void hud_tx_distance(int32_t dist_m, int32_t time_s,
-                            int32_t disp_dist, uint32_t disp_unit)
-{ vbs_tx_distance(dist_m, time_s, disp_dist, disp_unit); }
-#endif
+{ g_tx->distance(dist_m, time_s, disp_dist, disp_unit); }
 
 // cb_list shape: 19 word slots, total 76 bytes. The SDK memcpy's
 // all 76 bytes into the session handle at handle+0x20 inside

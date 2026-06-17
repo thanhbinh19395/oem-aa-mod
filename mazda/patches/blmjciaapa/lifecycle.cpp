@@ -19,6 +19,7 @@
 
 #include "log.h"
 #include "lifecycle.h"
+#include "common/config.h"
 #include "hud/hud.h"
 #include "monitor/navi_monitor.h"
 #include "oem/blmjciaapa.h"
@@ -171,8 +172,10 @@ int aap_create_session(const char *cfg, void *unknown_r1,
     //
     // Modifying the caller's stack buffer in place is safe: inside
     // aap_create_session the SDK does memcpy(handle+0x20, cb_list, 76)
-    // before returning.
-    if (g_enabled) {
+    // before returning. Gated on the HUD config flag too: with HUD off
+    // we leave slot 10 NULL so nav events are dropped by the SDK as on
+    // a stock library (no point capturing data we won't forward).
+    if (g_enabled && libpatch_config::hud_enabled()) {
         hud_pre_aap_create_session(cb_list);
     }
 
@@ -195,9 +198,13 @@ int aap_create_session(const char *cfg, void *unknown_r1,
     pthread_mutex_lock(&g_session_mu);
     g_session = *out_handle;
     if (!g_session_up) {
-        LOGD("aap_create_session: spawning touch reader");
-        touch_post_aap_create_session();
-        LOGD("touch reader started");
+        if (libpatch_config::touch_enabled()) {
+            LOGD("aap_create_session: spawning touch reader");
+            touch_post_aap_create_session();
+            LOGD("touch reader started");
+        } else {
+            LOGD("aap_create_session: touch disabled by config — skipping reader");
+        }
 
         // HUD post-create hook: opens the OEM HMI + Service D-Bus
         // connections and brings up dispatcher + sender threads.
@@ -205,9 +212,13 @@ int aap_create_session(const char *cfg, void *unknown_r1,
         // touch_post_aap_create_session — the sender thread itself
         // handles HUD-not-installed and routing start/stop
         // transitions internally.
-        LOGD("aap_create_session: spawning HUD sender");
-        hud_post_aap_create_session();
-        LOGD("HUD post-create hook completed");
+        if (libpatch_config::hud_enabled()) {
+            LOGD("aap_create_session: spawning HUD sender");
+            hud_post_aap_create_session();
+            LOGD("HUD post-create hook completed");
+        } else {
+            LOGD("aap_create_session: HUD disabled by config — skipping sender");
+        }
 
 #if defined(DEBUG) && BLMJCIAAPA_ENABLE_NAVI_MONITOR
         // Debug-only: eavesdrop on com.jci.vbs.navi(.tmc) traffic and
@@ -235,17 +246,22 @@ int aap_destroy_session(void *handle)
     if (g_enabled) {
         pthread_mutex_lock(&g_session_mu);
         if (g_session_up) {
-            LOGD("aap_destroy_session: stopping touch reader");
-            touch_pre_aap_destroy_session();
-            LOGD("touch reader stopped");
+            if (libpatch_config::touch_enabled()) {
+                LOGD("aap_destroy_session: stopping touch reader");
+                touch_pre_aap_destroy_session();
+                LOGD("touch reader stopped");
+            }
 
             // Tear the HUD sender down on the same edge that
             // stops the touch reader. The hook is idempotent so
             // the gate on g_session_up keeps it matched 1:1 with
-            // the start above.
-            LOGD("aap_destroy_session: stopping HUD sender");
-            hud_pre_aap_destroy_session();
-            LOGD("HUD pre-destroy hook completed");
+            // the start above. config flags are immutable after
+            // load, so start/stop stay symmetric.
+            if (libpatch_config::hud_enabled()) {
+                LOGD("aap_destroy_session: stopping HUD sender");
+                hud_pre_aap_destroy_session();
+                LOGD("HUD pre-destroy hook completed");
+            }
 
 #if defined(DEBUG) && BLMJCIAAPA_ENABLE_NAVI_MONITOR
             LOGD("aap_destroy_session: stopping navi dbus-monitor");

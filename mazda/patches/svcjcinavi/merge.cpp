@@ -72,8 +72,8 @@
 
 #define LOG_TAG "MERGE"
 #include "log.h"
-#include "common/preload.h"
-#include "common/oem/vbs_navi_hud.h"
+#include "../common/preload.h"
+#include "../common/oem/vbs_navi_hud.h"
 
 #include <dlfcn.h>
 #include <time.h>

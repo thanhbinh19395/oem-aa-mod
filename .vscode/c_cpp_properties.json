@@ -13,11 +13,6 @@
             "cppStandard": "c++11",
             "intelliSenseMode": "linux-gcc-arm",
             "includePath": [
-                "${workspaceFolder}/hu",
-                "${workspaceFolder}/common",
-                "${workspaceFolder}/hu/generated.arm",
-                "${workspaceFolder}/mazda/protobuf-2.6.1-arm/include",
-                "${workspaceFolder}/mazda/libunwind-1.2-rc1/include",
                 "${workspaceFolder}/mazda/m3-toolchain/arm-cortexa9_neon-linux-gnueabi/sysroot/usr/include",
                 "${workspaceFolder}/mazda/m3-toolchain/arm-cortexa9_neon-linux-gnueabi/sysroot/usr/include/gstreamer-0.10",
                 "${workspaceFolder}/mazda/m3-toolchain/arm-cortexa9_neon-linux-gnueabi/sysroot/usr/include/glib-2.0",
