@@ -51,9 +51,11 @@
 //     the maneuver frame (same critical section, same generation), so
 //     the strip's origin is whatever the maneuver frame just before it
 //     was. We mirror the maneuver handling: on an AAP-origin generation
-//     we CAPTURE the street into our own buffer (it is AAP's street; a
-//     null pointer, AAP's "no street", is stored as the empty string)
-//     and pass it; on an OEM-origin generation while AAP owns the
+//     we CAPTURE the street into our own buffer (read from the OEM's
+//     un-blanked current_StreetName, so a market that blanks the
+//     outbound strip — e.g. EU — still yields the real street; a null/
+//     empty street is stored as the empty string) and re-point the strip
+//     at our copy; on an OEM-origin generation while AAP owns the
 //     display we REPLACE the (blank NNG) street with the captured AAP
 //     street and pass it, so the street is re-asserted identically at
 //     both
@@ -72,12 +74,14 @@
 
 #define LOG_TAG "MERGE"
 #include "log.h"
+#include "../common/config.h"
 #include "../common/preload.h"
 #include "../common/oem/vbs_navi_hud.h"
 
 #include <dlfcn.h>
 #include <time.h>
 #include <string.h>
+#include <stdint.h>
 
 // Forward declarations of our own exported PLT shadows, so ensure_gate()
 // (below) can take their addresses for the resolve_real_symbol self-loop
@@ -99,6 +103,27 @@ constexpr const char *kSvcjcinaviSo = "/jci/navi/svcjcinavi.so";
 constexpr const char *kVbsClientSoname  = "libjcivbsnaviclient.so";
 constexpr const char *kVbsClientAbspath = "/jci/lib/libjcivbsnaviclient.so";
 
+// --- OEM internal reached by anchor + fixed offset ----------------
+//
+// svcjcinavi blanks the OUTBOUND street strip in some markets: for HUD
+// types 1/2 in certain region/language combinations (notably EU) it
+// repoints the strip to a single space instead of the real street. The
+// street it actually received still lives in the OEM's own
+// current_StreetName buffer — only the outbound pointer is blanked. We
+// read that buffer so the AAP street survives the blanking.
+//
+// current_StreetName is NOT a dynamic symbol (dlsym can't see it), but
+// svcjcinavi.so ships with its full .symtab, so we compute its address
+// from the one dynamically-exported anchor (GetServiceInterfaces) plus a
+// fixed file offset, exactly like the blmjciaapa anchor-and-offset
+// thunks. File offsets are FW 74.00.324A, harvested with nm; the
+// svcjcinavi.so binary is byte-identical across this version's NA and EU
+// builds (verified by sha256), so one set of offsets serves both
+// markets. Re-harvest with `nm -a` after any OEM update.
+constexpr const char *kAnchorSym            = "GetServiceInterfaces";
+constexpr uintptr_t   kOffAnchor            = 0x00019008;  // GetServiceInterfaces (exported)
+constexpr uintptr_t   kOffCurrentStreetName = 0x000aab98;  // current_StreetName (255 B)
+
 // AAP guidance is event-driven (the svcnavi transport emits only on
 // change), so we do NOT key activity off a feed cadence. Ownership is
 // set explicitly: a real AAP frame arms it, an empty AAP frame (the
@@ -118,6 +143,12 @@ bool   g_enabled   = false;
 void  *g_vbs_handle = nullptr;
 SetFn  g_real_set   = nullptr;
 Msg2Fn g_real_msg2  = nullptr;
+
+// The OEM's un-blanked street buffer (current_StreetName), resolved once
+// via the anchor in ensure_gate(). nullptr if we are not in the
+// svcjcinavi PID or the anchor failed to resolve, in which case the
+// Msg2 hook falls back to the (possibly blanked) strip pointer.
+const char *g_cur_street = nullptr;
 
 // Merge state — all accessed only from svcjcinavi's single sender
 // thread (thUpdateGuidanceChangeToHUD), so plain variables are safe.
@@ -160,11 +191,43 @@ void ensure_gate()
     }
     g_gate_done = true;
 
+    // Read libpatch.conf (sibling of this .so) once. force_street_name
+    // gates the current_StreetName un-blank resolution below; everything
+    // else in this function is unconditional.
+    libpatch_config::load(reinterpret_cast<const void *>(&ensure_gate));
+
     void *h = dlopen(kSvcjcinaviSo, RTLD_NOW | RTLD_NOLOAD);
     g_enabled = (h != nullptr);
     if (g_enabled) {
-        // We only need the boolean "is it mapped"; drop the extra
-        // refcount RTLD_NOLOAD took so we don't leak it.
+        // Resolve the OEM's un-blanked street buffer (current_StreetName)
+        // ONLY when force_street_name is set. Left null, the Msg2 hook
+        // captures from the strip pointer (native OEM behaviour: markets
+        // that blank the street keep blanking it). Load bias =
+        // runtime(anchor) - file_offset(anchor); the library stays mapped
+        // for the PID's lifetime, so the dlclose below only drops our
+        // extra NOLOAD refcount — the computed address stays valid.
+        if (libpatch_config::force_street_name()) {
+            void *anchor = dlsym(h, kAnchorSym);
+            if (anchor != nullptr) {
+                uintptr_t base =
+                    reinterpret_cast<uintptr_t>(anchor) - kOffAnchor;
+                g_cur_street = reinterpret_cast<const char *>(
+                    base + kOffCurrentStreetName);
+                LOGD("force_street_name: resolved current_StreetName=%p "
+                     "(base=%p)",
+                     reinterpret_cast<const void *>(g_cur_street),
+                     reinterpret_cast<void *>(base));
+            } else {
+                LOGW("force_street_name: anchor %s unresolved — falling "
+                     "back to the (possibly blanked) Msg2 strip",
+                     kAnchorSym);
+            }
+        } else {
+            LOGD("force_street_name=false — leaving OEM street handling "
+                 "intact (strip)");
+        }
+        // We only need the boolean "is it mapped" plus the anchor; drop
+        // the extra refcount RTLD_NOLOAD took so we don't leak it.
         dlclose(h);
         LOGD("self-gate: enabled (svcjcinavi.so mapped)");
     } else {
@@ -299,16 +362,30 @@ int VBS_NAVI_TMC_SetHUD_Display_Msg2(void *conn, VbsNaviHudMsg2 *msg2,
     // matching the maneuver frame's text_ID3, and that pairing is how
     // the HUD knows the maneuver and street belong together.
     if (g_street_action == STREET_CAPTURE) {
-        // Record AAP's street; a null pointer (AAP's "no street") is
-        // stored as the empty string so REPLACE blanks the OEM strip.
-        if (msg2->guidancePointName != nullptr) {
-            strncpy(g_aap_street, msg2->guidancePointName,
-                    sizeof(g_aap_street) - 1);
+        // Record AAP's street. Prefer the OEM's un-blanked
+        // current_StreetName (g_cur_street): in markets that blank the
+        // outbound strip (e.g. EU, HUD type 1/2) the strip pointer here
+        // is already a single space, but current_StreetName still holds
+        // the real street svcjcinavi received. This hook runs on the
+        // sender thread while it holds the guidance mutex that also
+        // guards current_StreetName, so the read is consistent with the
+        // frame being sent. Fall back to the strip pointer if the anchor
+        // didn't resolve. A null/empty street is stored as "".
+        const char *src =
+            g_cur_street ? g_cur_street : msg2->guidancePointName;
+        if (src != nullptr) {
+            strncpy(g_aap_street, src, sizeof(g_aap_street) - 1);
             g_aap_street[sizeof(g_aap_street) - 1] = '\0';
         } else {
             g_aap_street[0] = '\0';
         }
-        LOGV("Msg2 capture: AAP street \"%s\"", g_aap_street);
+        // Re-point this AAP-origin strip at our captured copy so the AAP
+        // frame itself shows the real street rather than the market
+        // blank — identical to the OEM-cadence REPLACE below, so the two
+        // cadences stay flicker-free.
+        msg2->guidancePointName = g_aap_street;
+        LOGV("Msg2 capture: AAP street \"%s\"%s", g_aap_street,
+             g_cur_street ? " (current_StreetName)" : " (strip)");
     } else if (g_street_action == STREET_REPLACE) {
         msg2->guidancePointName = g_aap_street;
         LOGV("Msg2 replace: OEM strip -> AAP street \"%s\"", g_aap_street);

@@ -67,6 +67,13 @@ load into different services — `libpatch-blmjciaapa.so` is preloaded for
 `jciAAPA` and `libpatch-svcjcinavi.so` for `jcinavi`, each via its own
 `<service>` block in `sm.conf` (step 2 below).
 
+> **EU firmware:** the OEM nav service blanks the HUD street line in this
+> market, so the street name will be missing even with everything else
+> working. To show it, deploy `libpatch.conf` and set
+> **`force_street_name = true`** — see
+> [Configuration](#configuration-libpatchconf) for details. NA units
+> show the street with the defaults and need no change.
+
 SD cards mount under `/mnt/sd<x><n>` (e.g. `/mnt/sda1`, `/mnt/sdb1`, …)
 depending on which USB/SD slot the kernel enumerates first on your
 unit. Check `mount | grep /mnt/sd` if unsure.
@@ -161,6 +168,7 @@ case-insensitive.
 | `touch` | `true` / `false` | `true` | Enable the Android Auto touch-input passthrough. |
 | `hud` | `true` / `false` | `true` | Enable HUD guidance forwarding (turn arrow + distance to the head-up display). |
 | `hud_transport` | `svcnavi` / `vbs` | `svcnavi` | Which path HUD guidance takes (only relevant when `hud = true`). |
+| `force_street_name` | `true` / `false` | `false` | Force the Android Auto street name onto the HUD street line even where the OEM blanks it (see the EU note below). |
 
 Booleans are lenient — `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`
 are all accepted.
@@ -176,6 +184,22 @@ are all accepted.
 - **`vbs`** — write the HUD frame directly to `com.jci.vbs.navi`. Works
   with no navigation SD card, but it is one of two writers, so it can
   conflict with OEM nav guidance.
+
+- **`force_street_name`** controls whether the Android Auto street name is
+shown on the HUD's secondary line:
+
+  - On **NA** firmware the street name already appears with the defaults,
+    so this option can be left `false`.
+  - On **EU** firmware the OEM navigation service blanks the HUD street
+    line for the head-up display types used in that market — the turn
+    arrow and distance still show, but the street stays empty. Set
+    **`force_street_name = true`** to make the merge shim re-assert the
+    real Android Auto street onto that line. This is the specific setting needed for street-name display on EU units; it has no effect on the maneuver arrow or distance.
+
+The option only applies with `hud_transport = svcnavi` (the
+`libpatch-svcjcinavi.so` merge shim must be installed and patched into
+`jcinavi`, as in step 2). It is harmless on firmware that does not blank
+the street, so it is safe to enable everywhere if preferred.
 
 After editing `libpatch.conf`, restart the affected service(s) —
 `jciAAPA`, and `jcinavi` if you patched it — or reboot for the change to

@@ -19,6 +19,8 @@
 //   touch         = true|false        enable the AA touch-input shim   (default true)
 //   hud           = true|false        enable HUD guidance forwarding   (default true)
 //   hud_transport = svcnavi|vbs       which HUD backend to use          (default svcnavi)
+//   force_street_name = true|false    rewrite the HUD street strip with the AAP
+//                                     street even where the OEM blanks it (default false)
 //
 // Booleans are lenient (true/1/yes/on, false/0/no/off). hud_transport
 // also accepts "svcjcinavi" as an alias for "svcnavi".
@@ -193,10 +195,11 @@ inline bool parse_bool(const char *val, bool deflt)
 // === Schema + state ===========================================
 
 struct Settings {
-    bool         touch         = true;
-    bool         hud           = true;
-    HudTransport hud_transport = HUD_TRANSPORT_SVCNAVI;
-    bool         loaded        = false;
+    bool         touch             = true;
+    bool         hud               = true;
+    HudTransport hud_transport     = HUD_TRANSPORT_SVCNAVI;
+    bool         force_street_name = false;
+    bool         loaded            = false;
 };
 
 // The single parsed-config instance for this library. Function-local
@@ -232,6 +235,8 @@ inline void apply_kv(const char *key, const char *val, void *ud)
             LOGW("config: unknown hud_transport=\"%s\" — keeping %s",
                  val, transport_name(s.hud_transport));
         }
+    } else if (strcasecmp(key, "force_street_name") == 0) {
+        s.force_street_name = parse_bool(val, s.force_street_name);
     } else {
         // Common schema: a key this library doesn't act on is not an
         // error, just informational.
@@ -242,11 +247,12 @@ inline void apply_kv(const char *key, const char *val, void *ud)
 inline void log_effective(const char *prefix)
 {
     const Settings &s = settings();
-    LOGD("config: %s touch=%s hud=%s hud_transport=%s",
+    LOGD("config: %s touch=%s hud=%s hud_transport=%s force_street_name=%s",
          prefix,
          s.touch ? "true" : "false",
          s.hud   ? "true" : "false",
-         transport_name(s.hud_transport));
+         transport_name(s.hud_transport),
+         s.force_street_name ? "true" : "false");
 }
 
 // === Public API ===============================================
@@ -285,6 +291,7 @@ inline void load(const void *sym_in_self)
 inline bool         touch_enabled()  { return settings().touch; }
 inline bool         hud_enabled()    { return settings().hud; }
 inline HudTransport hud_transport()  { return settings().hud_transport; }
+inline bool         force_street_name() { return settings().force_street_name; }
 
 } // namespace libpatch_config
 
