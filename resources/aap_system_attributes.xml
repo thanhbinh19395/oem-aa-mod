@@ -12,8 +12,8 @@ Refer the Configuration Parameters in the Appendix section of API documentation 
         <make>Visteon</make>
         <model>Connectivity Master Unit</model>
         <root_cert_file>/etc/androidauto/ca.pem</root_cert_file>
-        <client_cert_file>/etc/androidauto/Mazda-2018-02-21-signed-CMU_2018.pem</client_cert_file>
-        <private_key_file>/etc/androidauto/Mazda-2018-02-21-CMU_2018.key</private_key_file>
+        <client_cert_file>/etc/androidauto/wcp/Mazda-2020-06-05-CMU_DR_7_8_9_2020.pem</client_cert_file>
+        <private_key_file>/etc/androidauto/wcp/Mazda-2020-06-05-CMU_DR_7_8_9_2020.key</private_key_file>
         <display>
             <width>800</width>
             <height>480</height>
@@ -80,9 +80,9 @@ Refer the Configuration Parameters in the Appendix section of API documentation 
             <phone>
                 <subscribe>TRUE</subscribe>
             </phone>
-            <media>
+            <media_playback>
                 <subscribe>FALSE</subscribe>
-            </media>
+            </media_playback>
             <navigation>
                 <subscribe>TRUE</subscribe>
                 <cluster_type>ENUM</cluster_type>
