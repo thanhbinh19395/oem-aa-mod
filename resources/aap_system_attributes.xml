@@ -12,20 +12,20 @@ Refer the Configuration Parameters in the Appendix section of API documentation 
         <make>Visteon</make>
         <model>Connectivity Master Unit</model>
         <root_cert_file>/etc/androidauto/ca.pem</root_cert_file>
-        <client_cert_file>/etc/androidauto/Mazda-2018-02-21-signed-CMU_2018.pem</client_cert_file>
-        <private_key_file>/etc/androidauto/Mazda-2018-02-21-CMU_2018.key</private_key_file>
+        <client_cert_file>/etc/androidauto/wcp/Mazda-2020-06-05-CMU_DR_7_8_9_2020.pem</client_cert_file>
+        <private_key_file>/etc/androidauto/wcp/Mazda-2020-06-05-CMU_DR_7_8_9_2020.key</private_key_file>
         <display>
             <width>800</width>
             <height>480</height>
         </display>
         <input_devices>
-            <touch_screen>
+             <touch_screen>
                 <use_internally>true</use_internally>
                 <path>/dev/input/filtered-touchscreen0</path>
                 <type>AAP_TOUCH_SCREEN_TYPE_CAPACITIVE</type>
                 <as_secondary_input>false</as_secondary_input>
             </touch_screen>
-            <key_codes>
+           <key_codes>
                 <value>AAP_KEYCODE_SEARCH</value>
                 <value>AAP_KEYCODE_MEDIA_PLAY</value>
                 <value>AAP_KEYCODE_MEDIA_PREVIOUS</value>
@@ -49,11 +49,11 @@ Refer the Configuration Parameters in the Appendix section of API documentation 
             <resolution>
                 <value>800x480</value>
                 <density>141</density>
-                <real_density>141</real_density>
+                 <real_density>141</real_density>
                 <par>10670</par>
                 <fps>60</fps>
                 <decoder_additional_depth>3</decoder_additional_depth>
-            </resolution>
+           </resolution>
             <codec_profile>
                 <value>H.264_BP_L3.1</value>
             </codec_profile>
