@@ -6,6 +6,10 @@ name: CI
 # produces matches a real release.
 # Tag pushes are intentionally NOT built here — release.yml owns those.
 on:
+  # Manual on-demand build: lets a maintainer compile the .so files and
+  # download them from the run's artifacts without pushing to main,
+  # opening a PR, or cutting a release tag.
+  workflow_dispatch:
   # Only main on push; PR branches are covered by pull_request below.
   # (Triggering push on all branches would double-run every push to a
   # branch that has an open PR — once for push, once for the PR.)
