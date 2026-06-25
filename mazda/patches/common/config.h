@@ -21,6 +21,8 @@
 //   hud_transport = svcnavi|vbs       which HUD backend to use          (default svcnavi)
 //   force_street_name = true|false    rewrite the HUD street strip with the AAP
 //                                     street even where the OEM blanks it (default false)
+//   hud_fold_latin = true|false       fold HUD-unrenderable precomposed Latin
+//                                     street-name letters to their base forms (default true)
 //
 // Booleans are lenient (true/1/yes/on, false/0/no/off). hud_transport
 // also accepts "svcjcinavi" as an alias for "svcnavi".
@@ -199,6 +201,7 @@ struct Settings {
     bool         hud               = true;
     HudTransport hud_transport     = HUD_TRANSPORT_SVCNAVI;
     bool         force_street_name = false;
+    bool         hud_fold_latin    = false;
     bool         loaded            = false;
 };
 
@@ -237,6 +240,8 @@ inline void apply_kv(const char *key, const char *val, void *ud)
         }
     } else if (strcasecmp(key, "force_street_name") == 0) {
         s.force_street_name = parse_bool(val, s.force_street_name);
+    } else if (strcasecmp(key, "hud_fold_latin") == 0) {
+        s.hud_fold_latin = parse_bool(val, s.hud_fold_latin);
     } else {
         // Common schema: a key this library doesn't act on is not an
         // error, just informational.
@@ -247,12 +252,14 @@ inline void apply_kv(const char *key, const char *val, void *ud)
 inline void log_effective(const char *prefix)
 {
     const Settings &s = settings();
-    LOGD("config: %s touch=%s hud=%s hud_transport=%s force_street_name=%s",
+    LOGD("config: %s touch=%s hud=%s hud_transport=%s force_street_name=%s "
+         "hud_fold_latin=%s",
          prefix,
          s.touch ? "true" : "false",
          s.hud   ? "true" : "false",
          transport_name(s.hud_transport),
-         s.force_street_name ? "true" : "false");
+         s.force_street_name ? "true" : "false",
+         s.hud_fold_latin ? "true" : "false");
 }
 
 // === Public API ===============================================
@@ -292,6 +299,7 @@ inline bool         touch_enabled()  { return settings().touch; }
 inline bool         hud_enabled()    { return settings().hud; }
 inline HudTransport hud_transport()  { return settings().hud_transport; }
 inline bool         force_street_name() { return settings().force_street_name; }
+inline bool         hud_fold_latin() { return settings().hud_fold_latin; }
 
 } // namespace libpatch_config
 

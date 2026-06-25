@@ -23,6 +23,7 @@
 // See config.{h,cpp}.
 #include "svcnavi_tx.h"
 #include "vbs_tx.h"
+#include "translit.h"   // hud_translit::fold() — precomposed-Latin street-name fold
 
 #include <stdint.h>
 #include <string.h>
@@ -68,7 +69,24 @@ inline void hud_tx_stop()   { g_tx->stop(); }
 inline void hud_tx_status(uint32_t status) { g_tx->status(status); }
 inline void hud_tx_next_turn(const char *road, uint32_t side, uint32_t event,
                              int32_t angle, int32_t number)
-{ g_tx->next_turn(road, side, event, angle, number); }
+{
+    // Fold HUD-unrenderable precomposed Latin letters (Latin Extended
+    // Additional, U+1E00..U+1EFF) down to their base forms so accented
+    // street names show legibly instead of gapping (gated by
+    // hud_fold_latin, default on). Copy the SDK-owned (const) road name
+    // into a local buffer first, then fold in place — the fold only ever
+    // shrinks, so 256 bounds it (the transports truncate to their own
+    // buffer anyway).
+    if (road != nullptr && libpatch_config::hud_fold_latin()) {
+        char buf[256];
+        strncpy(buf, road, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        hud_translit::fold(buf);
+        g_tx->next_turn(buf, side, event, angle, number);
+        return;
+    }
+    g_tx->next_turn(road, side, event, angle, number);
+}
 inline void hud_tx_distance(int32_t dist_m, int32_t time_s,
                             int32_t disp_dist, uint32_t disp_unit)
 { g_tx->distance(dist_m, time_s, disp_dist, disp_unit); }

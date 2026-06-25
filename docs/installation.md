@@ -169,6 +169,7 @@ case-insensitive.
 | `hud` | `true` / `false` | `true` | Enable HUD guidance forwarding (turn arrow + distance to the head-up display). |
 | `hud_transport` | `svcnavi` / `vbs` | `svcnavi` | Which path HUD guidance takes (only relevant when `hud = true`). |
 | `force_street_name` | `true` / `false` | `false` | Force the Android Auto street name onto the HUD street line even where the OEM blanks it (see the EU note below). |
+| `hud_fold_latin` | `true` / `false` | `true` | Fold HUD-unrenderable precomposed Latin letters in street names to their base forms (see the note below). |
 
 Booleans are lenient — `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`
 are all accepted.
@@ -200,6 +201,22 @@ The option only applies with `hud_transport = svcnavi` (the
 `libpatch-svcjcinavi.so` merge shim must be installed and patched into
 `jcinavi`, as in step 2). It is harmless on firmware that does not blank
 the street, so it is safe to enable everywhere if preferred.
+
+- **`hud_fold_latin`** handles a HUD-font limitation: the head-up display's
+  ECU font only has glyphs for Unicode below roughly U+0800, so any
+  3-byte-UTF-8 character renders as a blank space. For **precomposed
+  Latin letters** — the Latin Extended Additional block (`U+1E00`–`U+1EFF`),
+  where each character is a base letter plus diacritics — we can fold to
+  the renderable base instead of losing them. With this enabled (the
+  default) each such letter is folded to its base, keeping a renderable
+  accent where the letter is defined by one (`ă â ê ô ơ ư`) and dropping
+  only the marks the font can't draw: `ễ`→`ê`, `ớ`→`ơ`, `ậ`→`â`,
+  `ḍ`→`d`, `ṛ`→`r`, `ẁ`→`w`. So a name the font shows as `Nguy n Phư c`
+  reads `Nguyên Phươc`. It affects only the HUD street strip; all other
+  text — ASCII, the already-renderable `ă â ê ô ơ ư đ`, and non-Latin
+  ≥U+0800 scripts (CJK, Thai, …, which have no Latin base and stay blank)
+  — is passed through unchanged, so it is harmless everywhere. Set
+  `false` to send names verbatim. Applies to both HUD transports.
 
 After editing `libpatch.conf`, restart the affected service(s) —
 `jciAAPA`, and `jcinavi` if you patched it — or reboot for the change to
