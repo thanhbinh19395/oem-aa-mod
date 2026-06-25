@@ -80,9 +80,9 @@ Refer the Configuration Parameters in the Appendix section of API documentation 
             <phone>
                 <subscribe>TRUE</subscribe>
             </phone>
-            <media>
+            <media_playback>
                 <subscribe>FALSE</subscribe>
-            </media>
+            </media_playback>
             <navigation>
                 <subscribe>TRUE</subscribe>
                 <cluster_type>ENUM</cluster_type>
