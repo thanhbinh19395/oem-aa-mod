@@ -29,6 +29,7 @@
 #include "hud_nav.h"
 #include "../oem/libdbus.h"
 #include "../../common/oem/vbs_navi_hud.h"   // kAapSpeedSentinel (shared with svcjcinavi)
+#include "common/config.h"                   // libpatch_config::hud_lanes()
 
 #include <condition_variable>
 #include <cstdlib>
@@ -74,6 +75,13 @@ struct NaviSnapshot {
     int32_t  distance_dec;   // value * 10
     uint8_t  distance_unit;  // mapped to Mazda enum
     int32_t  time_until;
+    // GAL 1.6 path: the glyph is precomputed (Mazda code) rather than derived
+    // from turn_event/side/angle, and lanes are carried through. The 1.5 path
+    // leaves use_precomp false (zeroed), so it keeps using compute_turn_icon().
+    bool        use_precomp;
+    uint32_t    precomp_icon;
+    uint8_t     n_lanes;
+    AaLane lanes[HUD_NAV16_MAX_LANES];
 };
 
 NaviSnapshot            g_snapshot = {};
@@ -101,7 +109,8 @@ bool append_i32(DBusMessageIter *iter, int32_t value)
 // way the NNG engine emits it (libjcidbus's signal_send would reject
 // a signal we don't serve).
 void emit_guidance(uint32_t dir_icon, int32_t maneuver_dist,
-                   int32_t dist_unit, const char *street)
+                   int32_t dist_unit, const char *street,
+                   const AaLane *lanes, uint8_t n_lanes)
 {
     void *msg = dbus_message_new_signal(kSignalPath, kSignalIface, kSignalMember);
     if (msg == nullptr) {
@@ -120,8 +129,15 @@ void emit_guidance(uint32_t dir_icon, int32_t maneuver_dist,
     ok = ok && (dbus_message_iter_append_basic(&it, DBUS_TYPE_STRING, &s) != 0);
     ok = ok && append_i32(&it, kAapSpeedSentinel); // speedLimit
     ok = ok && append_i32(&it, 0);                 // speedUnit
+    // lane0..7. Each is the HUD lane-glyph byte svcjcinavi forwards to
+    // SetRecommLaneReq: marked(22)/unmarked(1), 0 = no lane. We pass 0 (not
+    // 0xFF) for empty slots because svcjcinavi's handler validates each lane arg
+    // to 0..0x46 and would reject 0xFF. The 1.5 path passes lanes=null/n=0 -> all
+    // zero, unchanged. (Exact per-shape glyph code TBD on-car.)
+    uint8_t lb[8];
+    aa_nav16_lane_bytes(lanes, n_lanes, lb, /*hidden=*/0);
     for (int i = 0; i < 8 && ok; ++i) {
-        ok = append_i32(&it, 0);                   // lane0..7
+        ok = append_i32(&it, static_cast<int32_t>(lb[i]));
     }
     if (!ok) {
         LOGE("svcnavi sender: marshalling GuidanceChangedForHUD failed (OOM)");
@@ -152,12 +168,20 @@ void emit_guidance(uint32_t dir_icon, int32_t maneuver_dist,
 // frame was dropped.
 void send_one(const NaviSnapshot &cur)
 {
-    uint32_t icon = compute_turn_icon(cur.turn_event, cur.turn_side, cur.turn_angle);
+    uint32_t icon = cur.use_precomp
+                        ? cur.precomp_icon
+                        : compute_turn_icon(cur.turn_event, cur.turn_side, cur.turn_angle);
 
+    // Lane forwarding shares the hud_lanes kill-switch with the vbs
+    // transport; off -> all-zero lane slots ("no lane"), byte-identical
+    // to the 1.5 path.
+    const bool send_lanes = libpatch_config::hud_lanes() && cur.use_precomp;
     emit_guidance(icon,
                   cur.distance_dec,
                   cur.distance_unit,
-                  cur.road_name);
+                  cur.road_name,
+                  send_lanes ? cur.lanes : nullptr,
+                  send_lanes ? cur.n_lanes : 0);
 }
 
 // Bring up the service-bus connection on the sender thread. Returns
@@ -211,8 +235,8 @@ void sender_teardown()
 
     // Emit a zeroed guidance frame so svcjcinavi blanks the HUD
     // instead of holding our last maneuver. dirIcon 0, dist 0, empty
-    // street; sentinel speed still marks it as ours.
-    emit_guidance(0, 0, 0, "");
+    // street, no lanes; sentinel speed still marks it as ours.
+    emit_guidance(0, 0, 0, "", nullptr, 0);
     LOGD("svcnavi sender: sent blanking GuidanceChangedForHUD");
 
     // Private connections must be closed before the final unref.
@@ -364,6 +388,7 @@ void svcnavi_tx_next_turn(const char *road_name,
     g_snapshot.turn_event  = turn_event;
     g_snapshot.turn_angle  = turn_angle;
     g_snapshot.turn_number = turn_number;
+    g_snapshot.use_precomp = false;   // 1.5 path: derive the glyph from turn_event
     seqlock_end();
 }
 
@@ -381,5 +406,39 @@ void svcnavi_tx_distance(int32_t  /*distance_meters*/,
     g_snapshot.distance_dec  = display_distance / 100;  // *1000 -> *10
     g_snapshot.distance_unit = map_distance_unit(display_distance_unit);
     g_snapshot.time_until    = time_until_seconds;
+    seqlock_end();
+}
+
+void svcnavi_tx_v16(uint32_t glyph, const char *road,
+                    int32_t dist_dec, uint8_t dist_unit,
+                    const AaLane *lanes, uint8_t n_lanes)
+{
+    if (!g_active.load(std::memory_order_relaxed)) {
+        note_inactive_drop("v16 guidance");
+        return;
+    }
+
+    uint8_t nl = (n_lanes > HUD_NAV16_MAX_LANES) ? HUD_NAV16_MAX_LANES : n_lanes;
+
+    seqlock_begin();
+    if (road) {
+        std::strncpy(g_snapshot.road_name, road, sizeof(g_snapshot.road_name) - 1);
+        g_snapshot.road_name[sizeof(g_snapshot.road_name) - 1] = '\0';
+    } else {
+        g_snapshot.road_name[0] = '\0';
+    }
+    g_snapshot.use_precomp   = true;
+    g_snapshot.precomp_icon  = glyph;
+    g_snapshot.distance_dec  = dist_dec;
+    g_snapshot.distance_unit = dist_unit;
+    g_snapshot.n_lanes       = nl;
+    for (uint8_t i = 0; i < HUD_NAV16_MAX_LANES; ++i) {
+        if (lanes && i < nl) {
+            g_snapshot.lanes[i] = lanes[i];
+        } else {
+            g_snapshot.lanes[i].present_mask   = 0;
+            g_snapshot.lanes[i].highlight_mask = 0;
+        }
+    }
     seqlock_end();
 }

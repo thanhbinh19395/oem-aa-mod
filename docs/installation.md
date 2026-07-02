@@ -20,6 +20,7 @@ everything the on-device install needs:
 oem-aa-mod-<version>/
   libpatch-blmjciaapa.so              # -> /data_persist/oem-aa-mod/
   libpatch-svcjcinavi.so              # -> /data_persist/oem-aa-mod/ (optional; HUD merge)
+  libpatch-aap_service.so             # -> /data_persist/oem-aa-mod/ (optional; protocol v1.6)
   resources/
     aap_system_attributes.xml         # -> /etc/
     aap_system_attributes_UCP.xml     # -> /etc/
@@ -48,6 +49,10 @@ cp /mnt/sdb1/libpatch-blmjciaapa.so /data_persist/oem-aa-mod/
 # Optional: the HUD-merge shim (only useful with the nav SD card; see
 # hud_transport=svcnavi under Configuration below).
 cp /mnt/sdb1/libpatch-svcjcinavi.so /data_persist/oem-aa-mod/
+# Optional: the protocol v1.6 shim (only needed for use_protocol_v1_6=true;
+# enables lane guidance on the HUD; see Configuration below). Inert unless
+# that key is set.
+cp /mnt/sdb1/libpatch-aap_service.so /data_persist/oem-aa-mod/
 # Optional: runtime config (see Configuration below). Omit it to use
 # the built-in defaults.
 cp /mnt/sdb1/libpatch.conf /data_persist/oem-aa-mod/
@@ -114,6 +119,24 @@ want to patch.
 </service>
 ```
 
+**`aap_service`** (only needed for Android Auto GAL 1.6 — i.e.
+`use_protocol_v1_6 = true`). Find the `<service … name="aap_service" …>` block
+and add the same env var inside it:
+
+```xml
+<service type="process" name="aap_service" path="/usr/bin/aap_service" …>
+    <!-- existing entries left in place -->
+    <environ_var env_name="LD_PRELOAD"
+                 env_value="/data_persist/oem-aa-mod/libpatch-aap_service.so"/>
+</service>
+```
+
+For 1.6 HUD guidance BOTH `jciAAPA` (blmjciaapa) and `aap_service` must be
+preloaded: the aap_service shim advertises 1.6 and forwards the decoded
+navigation to the blmjciaapa shim, which renders it on the HUD. With
+`use_protocol_v1_6 = false` (the default) the aap_service shim is inert, so there
+is no reason to preload it unless you are enabling 1.6.
+
 (Leave the existing `<dependency>`/`<connection>`/attributes exactly as
 they are — only the `<environ_var>` line is added.) Skip this block
 entirely if you aren't using the svcnavi HUD transport; the shim
@@ -169,7 +192,9 @@ case-insensitive.
 | `hud` | `true` / `false` | `true` | Enable HUD guidance forwarding (turn arrow + distance to the head-up display). |
 | `hud_transport` | `svcnavi` / `vbs` | `svcnavi` | Which path HUD guidance takes (only relevant when `hud = true`). |
 | `force_street_name` | `true` / `false` | `false` | Force the Android Auto street name onto the HUD street line even where the OEM blanks it (see the EU note below). |
-| `hud_fold_latin` | `true` / `false` | `true` | Fold HUD-unrenderable precomposed Latin letters in street names to their base forms (see the note below). |
+| `hud_fold_latin` | `true` / `false` | `false` | Fold HUD-unrenderable precomposed Latin letters in street names to their base forms (see the note below). |
+| `use_protocol_v1_6` | `true` / `false` | `false` | Advertise Android Auto GAL 1.6 so the phone sends the 1.6 navigation protocol (maneuver / lanes / distance) for the HUD. Read by the `aap_service` shim; requires it to be preloaded (see the note below). |
+| `hud_lanes` | `true` / `false` | `true` | Send Android Auto lane guidance to the HUD (kill-switch for the lane path on both transports). Only carries data when `use_protocol_v1_6 = true`; set `false` to disable lane sends without redeploying (see the note below). |
 
 Booleans are lenient — `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`
 are all accepted.
@@ -207,8 +232,8 @@ the street, so it is safe to enable everywhere if preferred.
   3-byte-UTF-8 character renders as a blank space. For **precomposed
   Latin letters** — the Latin Extended Additional block (`U+1E00`–`U+1EFF`),
   where each character is a base letter plus diacritics — we can fold to
-  the renderable base instead of losing them. With this enabled (the
-  default) each such letter is folded to its base, keeping a renderable
+  the renderable base instead of losing them. When enabled, each such
+  letter is folded to its base, keeping a renderable
   accent where the letter is defined by one (`ă â ê ô ơ ư`) and dropping
   only the marks the font can't draw: `ễ`→`ê`, `ớ`→`ơ`, `ậ`→`â`,
   `ḍ`→`d`, `ṛ`→`r`, `ẁ`→`w`. So a name the font shows as `Nguy n Phư c`
@@ -218,15 +243,33 @@ the street, so it is safe to enable everywhere if preferred.
   — is passed through unchanged, so it is harmless everywhere. Set
   `false` to send names verbatim. Applies to both HUD transports.
 
+- **`use_protocol_v1_6`** advertises Android Auto **GAL 1.6** to the phone (the
+  OEM advertises 1.5). At 1.5 the phone only sends the deprecated turn events; at
+  1.6 it sends the full navigation protocol — maneuver, **lanes**, distance — which
+  is what feeds the richer HUD guidance. The `aap_service` shim catches and decodes
+  the 1.6 frames and forwards them to the `blmjciaapa` shim, which renders them on
+  the HUD via the same `hud` / `hud_transport` path as the 1.5 guidance. So this
+  needs the `aap_service` shim preloaded (step 2) **in addition to** `jciAAPA`; the
+  other libraries ignore the key. The GAL version is negotiated once per session,
+  so a change takes effect on the next Android Auto connection (restart `jciAAPA`
+  + `aap_service`, or reconnect the phone). Default `false` = stock 1.5.
+  Lanes are gated separately by `hud_lanes` (below).
+
+- **`hud_lanes`** controls whether lane guidance is sent to the HUD. It defaults to
+  `true`; set it `false` to stop the shim from sending lane data. Lanes only appear
+  with `use_protocol_v1_6 = true`, so on a stock 1.5 setup this key has no effect.
+
 After editing `libpatch.conf`, restart the affected service(s) —
-`jciAAPA`, and `jcinavi` if you patched it — or reboot for the change to
-take effect. The config is read once at library load.
+`jciAAPA`, `jcinavi` if you patched it, and `aap_service` if you enabled
+`use_protocol_v1_6` — or reboot for the change to take effect. The config is read
+once at library load.
 
 ## Uninstall / disable
 
 Remove (or comment out) the `<environ_var>` line(s) you added in
-`/jci/sm/sm.conf` (the `jciAAPA` one, and the `jcinavi` one if present),
-restore the original `/etc/aap_system_attributes*.xml` files from the
-`.orig` backups, then restart the affected services (`smctl -r -n
-jciAAPA` / `smctl -r -n jcinavi`) or reboot. The
+`/jci/sm/sm.conf` (the `jciAAPA` one, the `jcinavi` one if present, and the
+`aap_service` one if you enabled 1.6), restore the original
+`/etc/aap_system_attributes*.xml` files from the `.orig` backups, then restart
+the affected services (`smctl -r -n jciAAPA` / `smctl -r -n jcinavi` /
+`smctl -r -n aap_service`) or reboot. The
 `/data_persist/oem-aa-mod/` directory can be deleted afterwards.

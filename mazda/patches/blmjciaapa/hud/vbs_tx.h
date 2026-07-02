@@ -31,6 +31,7 @@
 #define LIBPATCH_BLMJCIAAPA_VBS_TX_H
 
 #include <stdint.h>
+#include "hud_nav16.h"   // AaLane, aa_nav16_lane_bytes, AA_NAV16_LANE_*
 
 // Defined in vbs_tx.cpp. HUD output lifecycle. vbs_tx_start opens
 // the OEM HMI + Service D-Bus connections, spawns a dispatcher
@@ -72,5 +73,14 @@ void vbs_tx_distance(int32_t  distance_meters,
                      int32_t  time_until_seconds,
                      int32_t  display_distance,
                      uint32_t display_distance_unit);
+
+// Android Auto GAL 1.6 path. The maneuver glyph is ALREADY the Mazda HUD code
+// and distance is already value*10 in the Mazda unit. Lanes are carried through
+// so the direct path is lane-ready; see vbs_tx.cpp for the emit-side OEM-ABI
+// note (the basic VBS_NAVI_SetHUDDisplayMsgReq frame has no lane field). One
+// call sets the frame.
+void vbs_tx_v16(uint32_t glyph, const char *road,
+                int32_t dist_dec, uint8_t dist_unit,
+                const AaLane *lanes, uint8_t n_lanes);
 
 #endif // LIBPATCH_BLMJCIAAPA_VBS_TX_H
