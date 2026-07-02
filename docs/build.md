@@ -16,14 +16,16 @@ make -C mazda blmjciaapa         # release build of just one patch
 make -C mazda blmjciaapa-debug   # debug build of just one patch
 make -C mazda svcjcinavi         # release build of the other patch
 make -C mazda svcjcinavi-debug   # debug build of the other patch
+make -C mazda aap_service        # release build of the aap_service patch
+make -C mazda aap_service-debug  # debug build of the aap_service patch
 make -C mazda clean
 ```
 
 Or use the VS Code tasks (`Ctrl+Shift+B` runs **Build Release**).
 
 Outputs land at `mazda/build/{debug,release}/libpatch-<name>.so` (one
-per patch — currently `libpatch-blmjciaapa.so` and
-`libpatch-svcjcinavi.so`). The `libpatch-` prefix is project convention
+per patch — currently `libpatch-blmjciaapa.so`, `libpatch-svcjcinavi.so`,
+and `libpatch-aap_service.so`). The `libpatch-` prefix is project convention
 so a quick `ls /jci/lib/libpatch-*` on the device shows everything we
 ship without colliding with stock OEM libraries.
 
