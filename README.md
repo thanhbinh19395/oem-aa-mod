@@ -25,7 +25,8 @@ actually needs.
 | --- | --- |
 | `mazda/` | Source code and build system for the on-device shims. Anything that gets cross-compiled lives here. |
 | `mazda/patches/` | One subdirectory per OEM `.so` we patch. The directory name is the OEM library's basename without the extension. |
-| `mazda/patches/blmjciaapa/` | Sources for `libpatch-blmjciaapa.so` — hooks into `blmjciaapa.so` (loaded by the `{L_jciAAPA}` `sm_svclauncher` PID) to add Android Auto touch passthrough and HUD guidance. |
+| `mazda/patches/blmjciaapa/` | Sources for `libpatch-blmjciaapa.so` — hooks into `blmjciaapa.so` (loaded by the `{L_jciAAPA}` `sm_svclauncher` PID) to add Android Auto touch passthrough and HUD guidance, including the GAL 1.6 maneuver/lane guidance relayed from the `aap_service` shim. |
+| `mazda/patches/aap_service/` | Sources for `libpatch-aap_service.so` — hooks into `aap_service` (the Android Auto projection daemon) to advertise GAL protocol 1.6, so the phone sends the richer navigation (maneuver, lanes, distance), and relays those frames to `libpatch-blmjciaapa.so` for the HUD. Optional: only needed with `use_protocol_v1_6 = true`. |
 | `mazda/patches/svcjcinavi/` | Sources for `libpatch-svcjcinavi.so` — hooks into `svcjcinavi.so` (the OEM navigation service PID) to merge Android Auto HUD guidance with the OEM nav engine's so the head-up display doesn't flicker between the two. Optional: only useful when the navigation SD card is present (without it `svcjcinavi` never runs). |
 | `mazda/Makefile` | Multi-target cross-compile build system. Targets: `make debug`, `make release` (default), `make all`, `make <patch>` / `make <patch>-debug`, `make clean`. Outputs go to `mazda/build/{debug,release}/libpatch-<patch>.so`. |
 | `mazda/m3-toolchain/` | Git submodule: ARM Cortex-A9 NEON GCC 4.9.1 cross toolchain (`arm-cortexa9_neon-linux-gnueabi`) plus sysroot matching the CMU's glibc. Source: <https://github.com/lmagder/m3-toolchain>. |
