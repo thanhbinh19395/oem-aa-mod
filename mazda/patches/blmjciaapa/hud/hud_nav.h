@@ -28,6 +28,7 @@
 // into the ECU firmware and is out of our scope. Same numbering
 // as the reference, no remapping.
 enum MazdaIcon : uint8_t {
+    HUD_BLANK              = 0,    // HUD draws nothing (implicit blank; named for the 1.6 map)
     HUD_STRAIGHT            = 1,
     HUD_LEFT                = 2,
     HUD_RIGHT               = 3,
@@ -61,6 +62,12 @@ enum MazdaIcon : uint8_t {
     HUD_DESTINATION_RIGHT   = 34,
     HUD_FLAG_LEFT           = 35,
     HUD_FLAG_RIGHT          = 36,
+    // Roundabout exit-glyph bases (12 directional glyphs per traffic side); the
+    // exit angle is added in roundabout_icon()/the 1.6 roundabout map. Named here
+    // so the 1.6 glyph map has a single source for them (1.5 roundabout_icon below
+    // uses the same 37/49 offsets).
+    HUD_ROUNDABOUT_CCW_BASE = 37,   // right-hand traffic, +round(angle/30) -> 37..48
+    HUD_ROUNDABOUT_CW_BASE  = 49,   // left-hand  traffic, +round(angle/30) -> 49..60
 };
 
 // === Android turn_event → Mazda icon ==========================

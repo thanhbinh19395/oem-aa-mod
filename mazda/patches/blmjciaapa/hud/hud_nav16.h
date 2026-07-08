@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// hud_nav16 — Android Auto GAL 1.6 navigation decoder + Mazda HUD glyph/lane map.
+// Handles NavigationState (msgId 0x8006) and NavigationCurrentPosition (0x8007).
+//
+// This is the single place that understands the Android-Auto 1.6 nav protocol:
+// the aap_service shim relays raw frames over the IPC socket and blmjciaapa
+// decodes + maps them here. Pure protobuf walk + constant lookup tables; no I/O,
+// no logging. The Mazda glyph IDs come from MazdaIcon (hud_nav.h) — one enum,
+// shared with the 1.5 path.
+
+#ifndef LIBPATCH_BLMJCIAAPA_HUD_HUD_NAV16_H
+#define LIBPATCH_BLMJCIAAPA_HUD_HUD_NAV16_H
+
+#include <stdint.h>
+
+enum { HUD_NAV16_MAX_LANES = 8 };
+
+// One physical lane: the arrows it shows (Shape 0..9) as bitmasks, plus which
+// are highlighted (recommended). bit s set iff a LaneDirection with shape==s.
+struct AaLane {
+    uint16_t present_mask;
+    uint16_t highlight_mask;
+};
+
+// Encode decoded lanes to the 8-slot HUD lane array, LEFT TO RIGHT. Only
+// marked-vs-unmarked is encoded for a present lane (recommended = highlight_mask
+// != 0); 1 (unmarked) and 22 (marked) are valid on both HUD variants (byte
+// ranges 0-32 and 0-62). The exact per-shape glyph code is TBD on-car.
+//
+// `hidden` (the "no lane in this slot" code) DIFFERS by transport:
+//   - direct VBS_NAVI_SetRecommLaneReq (vbs path): 0xFF hides a slot — confirmed
+//     against the OEM setter + lane_test (AA_NAV16_LANE_HIDDEN).
+//   - GuidanceChangedForHUD signal (svcnavi path): svcjcinavi's handler validates
+//     each lane arg to 0..0x46, so 0xFF is out of range there — pass 0.
+enum {
+    AA_NAV16_LANE_HIDDEN   = 0xFF,   // vbs / SetRecommLaneReq per-slot hide
+    AA_NAV16_LANE_UNMARKED = 1,
+    AA_NAV16_LANE_MARKED   = 22,
+};
+
+inline void aa_nav16_lane_bytes(const AaLane *lanes, uint8_t n,
+                                uint8_t out[8], uint8_t hidden)
+{
+    for (int i = 0; i < 8; ++i) {
+        out[i] = (lanes && i < (int)n)
+                     ? (uint8_t)(lanes[i].highlight_mask ? AA_NAV16_LANE_MARKED
+                                                         : AA_NAV16_LANE_UNMARKED)
+                     : hidden;
+    }
+}
+
+// Decoded NavigationState (the active/first step — the next maneuver).
+struct AaGuidance {
+    bool     have_maneuver;
+    uint32_t maneuver_type;            // NavigationManeuver.NavigationType, 0..42
+    int32_t  roundabout_exit_number;   // field 2 — meaningful for ROUNDABOUT_*
+    int32_t  roundabout_exit_angle;    // field 3 — degrees; selects the roundabout glyph
+    char     road[64];                 // NavigationRoad.name (UTF-8)
+    int      n_steps;                  // total steps present (diagnostic)
+    int      n_lanes;                  // lanes on step[0] (0..8)
+    AaLane   lanes[HUD_NAV16_MAX_LANES];
+};
+
+// Decoded NavigationCurrentPosition.
+struct AaPosition {
+    bool     have_step;                // distance to the next maneuver
+    int32_t  step_meters;
+    char     step_display[16];         // e.g. "350" / "1,3"
+    uint32_t step_units;               // NavigationDistance.DistanceUnits 0..7
+    bool     have_dest;
+    int32_t  dest_meters;
+    char     dest_display[16];
+    uint32_t dest_units;
+    char     eta[16];                  // estimated_time_at_arrival, e.g. "21:54"
+};
+
+// Decode the protobuf BODY (AFTER the 2-byte big-endian msgId). *out is zeroed
+// first; returns true on a clean walk (partial/unknown fields tolerated). Fully
+// bounds-checked — safe on truncated/malformed input (runs in a reset_board PID).
+bool hud_nav16_decode_navstate(const uint8_t *proto, int len, AaGuidance *out);
+bool hud_nav16_decode_position (const uint8_t *proto, int len, AaPosition *out);
+
+// Dispatch on a FULL frame (leading 2-byte big-endian msgId): 0x8006 -> *g,
+// 0x8007 -> *p. Returns the msgId (0 if too short). Pass NULL for the unwanted one.
+uint32_t hud_nav16_on_frame(const uint8_t *raw, int size, AaGuidance *g, AaPosition *p);
+
+// The maneuver-glyph map: decoded guidance -> Mazda HUD glyph (MazdaIcon, and
+// 37..60 for roundabouts by exit angle). The single source of truth for the
+// AA -> HUD maneuver pairing.
+uint8_t hud_nav16_glyph(const AaGuidance *g);
+
+// AA NavigationDistance.DistanceUnits (0..7) -> Mazda HUD unit (1=m,2=mi,3=km,
+// 4=yd,5=ft; 0=none). The 1.6 unit map (distinct from the 1.5 NAVDistanceMessage
+// map_distance_unit in hud_nav.h — different source enum).
+uint8_t aa_to_mazda_unit(uint32_t units);
+
+// Parse an AA display value ("350","1,3","1.3") to the HUD's value*10 form
+// (one decimal): "350"->3500, "1,3"->13. 0 on garbage; overflow-capped.
+int32_t parse_dist_x10(const char *s);
+
+// Pure formatters (snprintf into caller buffer; no I/O) for one-line logging.
+int hud_nav16_format_guidance(const AaGuidance *g, char *buf, int cap);
+int hud_nav16_format_position(const AaPosition *p, char *buf, int cap);
+
+// Name tables for logging (NULL-safe bounds): type 0..42 / shape 0..9.
+const char *hud_nav16_maneuver_name(uint32_t type);
+const char *hud_nav16_shape_name(int shape);
+
+// Read NavigationStatus (0x8003) field 1 (status enum varint) from a FULL frame
+// (leading 2-byte big-endian msgId). Returns true and sets *status_out if found.
+// Fully bounds-checked (same Pb/rd_tag/rd_varint/skip reader as the other decoders).
+// *status_out is set to -1 (sentinel) on entry; unchanged if the field is absent or
+// the frame is malformed. Safe on any phone-originated input.
+bool hud_nav16_read_status(const uint8_t *raw, int size, int *status_out);
+
+#endif  // LIBPATCH_BLMJCIAAPA_HUD_HUD_NAV16_H

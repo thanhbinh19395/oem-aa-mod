@@ -37,4 +37,14 @@ int VBS_NAVI_TMC_SetHUD_Display_Msg2(void *conn, VbsNaviHudMsg2 *msg2,
                                      void *unused, void *cb, void *user);
 int VBS_NAVI_GetHUDStatus(void *conn, void *cb, void *user);
 
+// Recommended-lane setter, wire signature ((ay)). UNLIKE the sibling setters
+// (which take the wire struct by pointer and read fields at offsets), this
+// one takes POINTERS to the data pointer and to the element count and
+// dereferences both. `*lanes` points at `*count` bytes — the HUD consumes 8,
+// one per lane slot, left→right; 0xFF hides a slot. The bytes are copied while
+// marshalling (the send is queued).
+// (conn, &data, &count, completion_cb, user) -> int (0 = queued OK).
+int VBS_NAVI_SetRecommLaneReq(void *conn, const uint8_t *const *lanes,
+                              const uint32_t *count, void *cb, void *user);
+
 #endif  // LIBPATCH_BLMJCIAAPA_LIBJCIVBSNAVICLIENT_H

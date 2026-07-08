@@ -26,7 +26,7 @@ CXX         := $(M3TOOLCHAIN)/bin/$(TRIPLE)-g++
 SYSROOT     := $(M3TOOLCHAIN)/$(TRIPLE)/sysroot
 
 # OEM libraries we patch. Order doesn't matter.
-PATCHES := blmjciaapa svcjcinavi
+PATCHES := blmjciaapa svcjcinavi aap_service
 
 # pkg-config wrapper pointed at the device's sysroot so it resolves
 # against the cross-compiled .pc files (not the host's). Same pattern
@@ -65,7 +65,10 @@ COMMON_CXXFLAGS := -std=c++11 \
                    -fvisibility=hidden \
                    -D_GLIBCXX_USE_CXX11_ABI=0 \
                    -Ipatches \
-                   $(PKG_CFLAGS)
+                   $(PKG_CFLAGS) \
+                   $(EXTRA_CXXFLAGS)
+# EXTRA_CXXFLAGS: appended to every compile. E.g. verbose logs in a release lib:
+#   make ... EXTRA_CXXFLAGS='-DLOG_LEVEL=LOG_LEVEL_VERBOSE'
 # -D_GLIBCXX_USE_CXX11_ABI=0 selects the pre-C++11 (COW) std::string
 # and std::list ABI. The device ships libstdc++.so.6.0.14 (GCC 4.6
 # era) which only knows that ABI; libdbus-c++-1.so is linked against

@@ -51,8 +51,20 @@ DBUSXX_LDFLAGS := --sysroot=$(SYSROOT) -static-libstdc++ \
                  -Wl,-Bstatic -ldbus-c++-1 -Wl,-Bdynamic \
                  -ldbus-1 -lpthread -lrt
 
+# --- host self-test (nav16_test) -------------------------------
+# nav16_test is a pure HOST build (plain g++, no ARM sysroot): it exercises the
+# AA 1.6 nav decoder via its public API by compiling test/nav16_test.cpp with
+# ../mazda/patches/blmjciaapa/hud/hud_nav16.cpp. -I points at the hud dir so
+# hud_nav16.h and (the header-only) hud_nav.h resolve. Returns non-zero on a
+# failed assertion so CI can gate on it.
+HOST_CXX      := g++
+HUD_DIR       := ../mazda/patches/blmjciaapa/hud
+# -I../mazda/patches: hud_nav16.cpp includes "common/aa_nav16_msg.h" (the
+# AA_NAV16_MSG_* msgId contract), same include root as the mazda build.
+HOST_CXXFLAGS := -std=gnu++11 -O2 -Wall -Wextra -I$(HUD_DIR) -I../mazda/patches
+
 BUILD := build
-TOOLS := gsi_test lane_test
+TOOLS := gsi_test lane_test nav16_test
 BINS  := $(addprefix $(BUILD)/,$(TOOLS))
 
 .PHONY: all clean $(TOOLS)
@@ -65,6 +77,10 @@ $(BUILD)/%: %.c | $(BUILD)
 # lane_test is C++ (dbus-c++). Explicit rule overrides the .c pattern.
 $(BUILD)/lane_test: lane_test.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(DBUSXX_LDFLAGS)
+
+# nav16_test is a HOST binary (plain g++) — runs on the build machine, not the CMU.
+$(BUILD)/nav16_test: nav16_test.cpp $(HUD_DIR)/hud_nav16.cpp | $(BUILD)
+	$(HOST_CXX) $(HOST_CXXFLAGS) $^ -o $@
 
 # Convenience: `make gsi_test` builds build/gsi_test.
 $(TOOLS): %: $(BUILD)/%
