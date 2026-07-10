@@ -22,7 +22,7 @@
 //   force_street_name = true|false    rewrite the HUD street strip with the AAP
 //                                     street even where the OEM blanks it (default false)
 //   hud_fold_latin = true|false       fold HUD-unrenderable precomposed Latin
-//                                     street-name letters to their base forms (default false)
+//                                     street-name letters to their base forms (default true)
 //   use_protocol_v1_6 = true|false    advertise Android Auto GAL 1.6 so the phone sends the
 //                                     1.6 navigation protocol (maneuver / lanes / distance)
 //                                     instead of the 1.5 turn events; read by aap_service
@@ -205,7 +205,7 @@ struct Settings {
     bool         hud               = true;
     HudTransport hud_transport     = HUD_TRANSPORT_SVCNAVI;
     bool         force_street_name = false;
-    bool         hud_fold_latin    = false;
+    bool         hud_fold_latin    = true;
     bool         use_protocol_v1_6 = false;
     bool         loaded            = false;
 };
