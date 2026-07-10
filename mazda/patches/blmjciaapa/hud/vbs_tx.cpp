@@ -41,7 +41,6 @@
 #include "vbs_tx.h"
 #include "hud_nav.h"
 #include "../oem/libjcivbsnaviclient.h"
-#include "common/config.h"   // libpatch_config::hud_lanes()
 
 #include <chrono>
 #include <condition_variable>
@@ -193,17 +192,12 @@ void send_one(const NaviSnapshot &cur,
     // both frames' lanes to the HUD byte form and send only when they differ
     // (the 1.5 path has no lanes -> both encode to all-0xFF -> never sent).
     // Direct SetRecommLaneReq path: 0xFF hides an empty slot.
-    // Gated by hud_lanes: runtime kill-switch for the lane path, so lane sends
-    // can be turned off in the field. See libjcivbsnaviclient.h for the OEM
-    // lane setter's ABI.
-    const bool lanes_enabled = libpatch_config::hud_lanes();
     uint8_t cur_lanes[8], prev_lanes[8];
     aa_nav16_lane_bytes(cur.use_precomp  ? cur.lanes  : nullptr,
                         cur.use_precomp  ? cur.n_lanes  : 0, cur_lanes,  AA_NAV16_LANE_HIDDEN);
     aa_nav16_lane_bytes(prev.use_precomp ? prev.lanes : nullptr,
                         prev.use_precomp ? prev.n_lanes : 0, prev_lanes, AA_NAV16_LANE_HIDDEN);
-    bool lanes_changed = lanes_enabled &&
-                         std::memcmp(cur_lanes, prev_lanes, sizeof(cur_lanes)) != 0;
+    bool lanes_changed = std::memcmp(cur_lanes, prev_lanes, sizeof(cur_lanes)) != 0;
 
     if (!event_changed && !distance_changed && !lanes_changed) {
         LOGV("hud_send: snapshot unchanged vs previous — no HUD frame sent");
@@ -236,7 +230,7 @@ void send_one(const NaviSnapshot &cur,
         if (cur_lanes[i] != AA_NAV16_LANE_HIDDEN) { cur_lanes_visible = true; break; }
     }
     bool send_lanes = lanes_changed ||
-                      (lanes_enabled && cur.use_precomp && send_msg2 && cur_lanes_visible);
+                      (cur.use_precomp && send_msg2 && cur_lanes_visible);
 
     if (send_msg2) {
         // Bump 1..7 cyclically — the HUD treats a new sync_bit as the start of a
@@ -404,8 +398,7 @@ void sender_teardown()
             LOGD("hud sender: sent HUD clear frame");
         }
         // Hide any lanes a 1.6 session left on the HUD (all slots hidden).
-        // Only when lane sends are enabled — none were shown otherwise.
-        if (libpatch_config::hud_lanes()) {
+        {
             uint8_t clear_lanes[8];
             std::memset(clear_lanes, AA_NAV16_LANE_HIDDEN, sizeof(clear_lanes));
             const uint8_t *lane_data  = clear_lanes;

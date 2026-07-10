@@ -29,7 +29,6 @@
 #include "hud_nav.h"
 #include "../oem/libdbus.h"
 #include "../../common/oem/vbs_navi_hud.h"   // kAapSpeedSentinel (shared with svcjcinavi)
-#include "common/config.h"                   // libpatch_config::hud_lanes()
 
 #include <condition_variable>
 #include <cstdlib>
@@ -172,10 +171,9 @@ void send_one(const NaviSnapshot &cur)
                         ? cur.precomp_icon
                         : compute_turn_icon(cur.turn_event, cur.turn_side, cur.turn_angle);
 
-    // Lane forwarding shares the hud_lanes kill-switch with the vbs
-    // transport; off -> all-zero lane slots ("no lane"), byte-identical
-    // to the 1.5 path.
-    const bool send_lanes = libpatch_config::hud_lanes() && cur.use_precomp;
+    // Lanes ride the 1.6 (precomp) frames only; the 1.5 path has none, so
+    // gating on use_precomp is what makes lanes follow use_protocol_v1_6.
+    const bool send_lanes = cur.use_precomp;
     emit_guidance(icon,
                   cur.distance_dec,
                   cur.distance_unit,

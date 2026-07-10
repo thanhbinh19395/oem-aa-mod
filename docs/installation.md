@@ -194,7 +194,6 @@ case-insensitive.
 | `force_street_name` | `true` / `false` | `false` | Force the Android Auto street name onto the HUD street line even where the OEM blanks it (see the EU note below). |
 | `hud_fold_latin` | `true` / `false` | `false` | Fold HUD-unrenderable precomposed Latin letters in street names to their base forms (see the note below). |
 | `use_protocol_v1_6` | `true` / `false` | `false` | Advertise Android Auto GAL 1.6 so the phone sends the 1.6 navigation protocol (maneuver / lanes / distance) for the HUD. Read by the `aap_service` shim; requires it to be preloaded (see the note below). |
-| `hud_lanes` | `true` / `false` | `true` | Send Android Auto lane guidance to the HUD (kill-switch for the lane path on both transports). Only carries data when `use_protocol_v1_6 = true`; set `false` to disable lane sends without redeploying (see the note below). |
 
 Booleans are lenient — `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`
 are all accepted.
@@ -253,11 +252,8 @@ the street, so it is safe to enable everywhere if preferred.
   other libraries ignore the key. The GAL version is negotiated once per session,
   so a change takes effect on the next Android Auto connection (restart `jciAAPA`
   + `aap_service`, or reconnect the phone). Default `false` = stock 1.5.
-  Lanes are gated separately by `hud_lanes` (below).
-
-- **`hud_lanes`** controls whether lane guidance is sent to the HUD. It defaults to
-  `true`; set it `false` to stop the shim from sending lane data. Lanes only appear
-  with `use_protocol_v1_6 = true`, so on a stock 1.5 setup this key has no effect.
+  Lane guidance is part of the 1.6 protocol, so it is sent automatically
+  whenever `use_protocol_v1_6 = true` (and never at stock 1.5).
 
 After editing `libpatch.conf`, restart the affected service(s) —
 `jciAAPA`, `jcinavi` if you patched it, and `aap_service` if you enabled
