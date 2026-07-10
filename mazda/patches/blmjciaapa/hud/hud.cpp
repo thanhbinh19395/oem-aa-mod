@@ -7,6 +7,7 @@
 #define LOG_TAG "HUD"
 #include "../log.h"
 #include "hud.h"
+#include "nav16_rx.h"        // hud_nav16_rx_start/stop/seen (receiver lifecycle)
 #include "common/config.h"   // libpatch_config::hud_transport()
 
 // HUD transport selection. Two transports send our guidance to the

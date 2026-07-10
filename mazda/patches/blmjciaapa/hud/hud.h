@@ -42,18 +42,4 @@ void hud_feed_nav16_raw(const uint8_t *frame, int len);
 // gate that suppresses the next session's first frame.
 void hud_feed_nav16_reset(void);
 
-// Defined in nav16_rx.cpp. Start/stop the receiver thread + socket. Started
-// from hud_post_aap_create_session when use_protocol_v1_6 is set, stopped from
-// hud_pre_aap_destroy_session. Both idempotent.
-void hud_nav16_rx_start(void);
-void hud_nav16_rx_stop(void);
-
-// Defined in nav16_rx.cpp. TRUE once a validated 1.6 frame has arrived on the
-// rx socket this session (reset by hud_nav16_rx_start). our_nav_cb keys the
-// legacy-1.5-callback drop on THIS — evidence the 1.6 chain really took — not
-// on the config flag, so a 1.6 setup that didn't take (aap_service shim not
-// preloaded / byte-verify aborted / phone declined the advertisement) falls
-// back to the stock 1.5 path instead of leaving the HUD dark.
-bool hud_nav16_rx_seen(void);
-
 #endif // LIBPATCH_BLMJCIAAPA_HUD_HUD_H

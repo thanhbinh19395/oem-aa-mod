@@ -19,6 +19,7 @@
 #define LOG_TAG "NAV16RX"
 #include "../log.h"
 #include "hud.h"
+#include "nav16_rx.h"
 #include "common/aa_nav16_msg.h"
 
 #include <atomic>
