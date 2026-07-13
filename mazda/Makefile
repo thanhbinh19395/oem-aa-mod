@@ -18,6 +18,8 @@
 #   make all            -> debug + release
 #   make <name>         -> release lib for one patch (e.g. `make blmjciaapa`)
 #   make <name>-debug   -> debug   lib for one patch (e.g. `make blmjciaapa-debug`)
+#   make splim_udpd     -> build the standalone UDP speed-limit daemon
+#   make installer      -> stage a ready-to-copy USB payload in build/installer/
 #   make clean          -> wipe build/
 
 M3TOOLCHAIN := ./m3-toolchain
@@ -26,7 +28,19 @@ CXX         := $(M3TOOLCHAIN)/bin/$(TRIPLE)-g++
 SYSROOT     := $(M3TOOLCHAIN)/$(TRIPLE)/sysroot
 
 # OEM libraries we patch. Order doesn't matter.
-PATCHES := blmjciaapa svcjcinavi aap_service
+PATCHES := blmjciaapa svcjcinavi aap_service blmjcicarplay
+
+# Per-patch extra compile flags, applied ONLY to that patch's objects (see
+# gen_patch_rules below). Leave a patch out of this list to build it with just
+# the common flags.
+#
+# blmjcicarplay has no per-patch defines: all of its former build-time feature
+# and diagnostic switches (CARPLAY_NO_SPLIM, CARPLAY_VN_NORMALIZE,
+# CARPLAY_NAV_DIAG, CARPLAY_MSGTYPE_DIAG, DEBUG) are now RUNTIME keys in
+# libpatch-carplay.conf (carplay_speed_limit, carplay_vn_normalize,
+# carplay_udpd_launch, carplay_nav_diag, carplay_msgtype_diag, carplay_hud_debug)
+# — one binary, configured on-device. NOTE the *_diag dumps write location data;
+# they default off and are documented with that warning in the conf file.
 
 # pkg-config wrapper pointed at the device's sysroot so it resolves
 # against the cross-compiled .pc files (not the host's). Same pattern
@@ -113,7 +127,7 @@ RELEASE_DIR := $(BUILD_DIR)/release
 DEBUG_LIBS   := $(addprefix $(DEBUG_DIR)/libpatch-,$(addsuffix .so,$(PATCHES)))
 RELEASE_LIBS := $(addprefix $(RELEASE_DIR)/libpatch-,$(addsuffix .so,$(PATCHES)))
 
-.PHONY: all debug release clean $(PATCHES) $(addsuffix -debug,$(PATCHES))
+.PHONY: all debug release installer clean $(PATCHES) $(addsuffix -debug,$(PATCHES))
 .DEFAULT_GOAL := release
 
 all: debug release
@@ -128,13 +142,16 @@ $(addsuffix -debug,$(PATCHES)): %-debug: $(DEBUG_DIR)/libpatch-%.so
 
 # Object-file pattern rules: mirror the patches/ tree under build/<cfg>/.
 #   build/release/<patch>/foo.o  <-  patches/<patch>/foo.cpp
+# $(PATCH_CXXFLAGS) is a target-specific variable set per-patch in
+# gen_patch_rules (defaults empty). It carries CXXFLAGS_<name> so a single
+# patch can add its own defines without affecting the others.
 $(DEBUG_DIR)/%.o: patches/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) -MD $(DEBUG_CXXFLAGS) -c $< -o $@
+	$(CXX) -MD $(DEBUG_CXXFLAGS) $(PATCH_CXXFLAGS) -c $< -o $@
 
 $(RELEASE_DIR)/%.o: patches/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) -MD $(RELEASE_CXXFLAGS) -c $< -o $@
+	$(CXX) -MD $(RELEASE_CXXFLAGS) $(PATCH_CXXFLAGS) -c $< -o $@
 
 # Per-patch link rules generated via $(eval). Sources are discovered
 # recursively (via `find`) at parse time, so subdivision of a patch
@@ -147,6 +164,11 @@ SRCS_$(1)         := $$(shell find patches/$(1) -name '*.cpp' -type f)
 DEBUG_OBJS_$(1)   := $$(patsubst patches/$(1)/%.cpp,$(DEBUG_DIR)/$(1)/%.o,$$(SRCS_$(1)))
 RELEASE_OBJS_$(1) := $$(patsubst patches/$(1)/%.cpp,$(RELEASE_DIR)/$(1)/%.o,$$(SRCS_$(1)))
 
+# Apply this patch's per-patch flags to all of its objects (both configs).
+# CXXFLAGS_$(1) is empty for patches that don't define one, so this is a no-op
+# for them.
+$$(DEBUG_OBJS_$(1)) $$(RELEASE_OBJS_$(1)): PATCH_CXXFLAGS := $$(CXXFLAGS_$(1))
+
 $(DEBUG_DIR)/libpatch-$(1).so: $$(DEBUG_OBJS_$(1))
 	$$(CXX) $$^ $$(DEBUG_LDFLAGS) -Wl,-soname,libpatch-$(1).so -o $$@
 
@@ -158,6 +180,45 @@ $(RELEASE_DIR)/libpatch-$(1).so: $$(RELEASE_OBJS_$(1))
 endef
 
 $(foreach p,$(PATCHES),$(eval $(call gen_patch_rules,$(p))))
+
+# --- splim_udpd: standalone speed-limit UDP daemon -------------------------
+# Not an LD_PRELOAD shim like the $(PATCHES) — a small standalone executable
+# that binds UDP:50505 and writes /data_persist/splim. Built with the same
+# cross toolchain but as a normal (non-PIC, non-shared) program.
+SPLIM_SRC        := tools/splim_udpd/splim_udpd.c
+SPLIM_BIN        := $(RELEASE_DIR)/splim_udpd
+SPLIM_START      := tools/splim_udpd/splim_udpd_start.sh
+
+.PHONY: splim_udpd
+splim_udpd: $(SPLIM_BIN)
+
+$(SPLIM_BIN): $(SPLIM_SRC)
+	@mkdir -p $(@D)
+	$(CXX) --sysroot=$(SYSROOT) -march=armv7-a -mtune=cortex-a9 -mfpu=neon \
+	       -O2 -Wall -Wextra -s -o $@ $<
+
+# --- USB installer package -------------------------------------------------
+# `make installer` builds the release libs and stages a self-contained,
+# ready-to-copy USB payload under $(USB_DIR). It gathers three things:
+#   1. the CMU installer harness (run.sh + the js/mp3/mp3title.txt autorun
+#      trigger) from installer/
+#   2. the OEM config files run.sh installs, from ../resources
+#   3. the freshly built release libpatch-*.so shims, flattened alongside them
+# so the .so files land right next to the installer exactly as run.sh expects.
+# Copy the *contents* of $(USB_DIR) to the FAT32 USB root.
+INSTALLER_SRC := installer
+RESOURCES_SRC := ../resources
+USB_DIR       := $(BUILD_DIR)/installer
+
+installer: release splim_udpd
+	rm -rf $(USB_DIR)
+	mkdir -p $(USB_DIR)
+	cp $(INSTALLER_SRC)/run.sh $(INSTALLER_SRC)/mp3title.txt $(USB_DIR)/
+	cp -r $(INSTALLER_SRC)/js $(INSTALLER_SRC)/mp3 $(USB_DIR)/
+	cp -r $(RESOURCES_SRC) $(USB_DIR)/resources
+	cp $(RELEASE_LIBS) $(USB_DIR)/
+	cp $(SPLIM_BIN) $(SPLIM_START) $(USB_DIR)/
+	@echo "USB installer staged in $(USB_DIR)/ — copy its contents to the FAT32 USB root."
 
 clean:
 	rm -rf $(BUILD_DIR)

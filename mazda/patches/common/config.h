@@ -8,12 +8,18 @@
 // OEM library we patch. So the config simply travels next to the
 // deployed .so, with no path hardcoded anywhere.
 //
-// This is a COMMON config: all libpatch-<name>.so libraries are deployed
-// into the same folder and read the same libpatch.conf with the same
-// settings. It defines the full schema for the family; a library simply
-// acts on the keys it cares about and ignores the rest (e.g. svcjcinavi
-// has no HUD transport, so it never reads hud_transport). The file and
-// every key are optional; anything unset keeps its default.
+// One schema, split across TWO deployed files (both live in the same
+// on-device folder as the .so libraries):
+//   * libpatch.conf         — the Android Auto family: blmjciaapa, svcjcinavi,
+//                             aap_service.
+//   * libpatch-carplay.conf — blmjcicarplay (the CarPlay -> HUD bridge).
+// Each library passes the filename it wants to load() (the AA family uses the
+// default). AA and CarPlay run in DIFFERENT processes, so each reads only its
+// own file into its own copy of the settings. This struct still defines the
+// FULL schema for the family; a library acts on the keys it cares about and
+// ignores the rest (e.g. svcjcinavi has no HUD transport, so it never reads
+// hud_transport). Both files, and every key, are optional; anything unset
+// keeps its default.
 //
 // Recognised keys:
 //   touch         = true|false        enable the AA touch-input shim   (default true)
@@ -36,6 +42,23 @@
 //   block_headunit_media_play = true|false
 //                                     block head-unit-generated Android Auto MEDIA_PLAY events
 //                                     and startup audio restoration (default false)
+//   carplay_vn_normalize = true|false fold Vietnamese 3-byte UTF-8 street-name letters to the
+//                                     2-byte/ASCII forms the HUD font can render; read by
+//                                     blmjcicarplay (default true)
+//   carplay_speed_limit  = true|false read + display the posted speed limit on the HUD; read by
+//                                     blmjcicarplay (default false = nav-only)
+//   carplay_udpd_launch  = true|false auto-launch the shared splim_udpd listener; read by
+//                                     blmjcicarplay, only acts when carplay_speed_limit = true
+//                                     (default true)
+//   carplay_nav_diag     = true|false dump every decoded nav maneuver/guidance payload to
+//                                     /data_persist/nav_diag.log (RE aid; LOGS LOCATION DATA —
+//                                     read by blmjcicarplay, default false)
+//   carplay_msgtype_diag = true|false dump every devmgr message (type/size + small-msg peek) to
+//                                     /data_persist/msgtype_diag.log (RE aid; LOGS LOCATION DATA —
+//                                     read by blmjcicarplay, default false)
+//   carplay_hud_debug    = true|false overlay raw turn codes on the HUD street strip when no
+//                                     glyph maps (developer aid; read by blmjcicarplay,
+//                                     default false)
 //
 // Booleans are lenient (true/1/yes/on, false/0/no/off). hud_transport
 // also accepts "svcjcinavi" as an alias for "svcnavi".
@@ -53,7 +76,14 @@
 #ifndef LIBPATCH_COMMON_CONFIG_H
 #define LIBPATCH_COMMON_CONFIG_H
 
+// The including patch already supplies the LOGx family (via its own log.h /
+// patch.h). Only pull in the shared logger as a fallback when none is defined
+// yet — so a patch that logs through a DIFFERENT sink (e.g. blmjcicarplay,
+// whose patch.h routes LOGx to a /tmp file) is not clobbered by a second,
+// conflicting LOG_EMIT/LOG_DROP definition.
+#ifndef LOGD
 #include "log.h"
+#endif
 #include <dlfcn.h>
 #include <limits.h>    // PATH_MAX
 #include <stddef.h>
@@ -71,7 +101,8 @@
 
 namespace libpatch_config {
 
-constexpr const char *kConfigFile = "libpatch.conf";
+constexpr const char *kConfigFile        = "libpatch.conf";          // Android Auto family
+constexpr const char *kCarplayConfigFile = "libpatch-carplay.conf";  // blmjcicarplay
 
 // HUD output transport. Both backends are compiled into blmjciaapa; the
 // active one is chosen from `hud_transport`. svcnavi routes through the
@@ -210,16 +241,22 @@ inline bool parse_bool(const char *val, bool deflt)
 // === Schema + state ===========================================
 
 struct Settings {
-    bool         touch             = true;
-    bool         hud               = true;
-    HudTransport hud_transport     = HUD_TRANSPORT_SVCNAVI;
-    bool         force_street_name = false;
-    bool         hud_fold_latin    = true;
-    bool         use_protocol_v1_6 = false;
-    bool         aa_audio_low_latency = false;
-    bool         mute_pauses_phone = true;
+    bool         touch                 = true;
+    bool         hud                   = true;
+    HudTransport hud_transport         = HUD_TRANSPORT_SVCNAVI;
+    bool         force_street_name     = false;
+    bool         hud_fold_latin        = true;
+    bool         use_protocol_v1_6     = false;
+    bool         aa_audio_low_latency  = false;
+    bool         mute_pauses_phone     = true;
     bool         block_headunit_media_play = false;
-    bool         loaded            = false;
+    bool         carplay_vn_normalize = true;   // blmjcicarplay: fold VN 3-byte street names for the HUD font
+    bool         carplay_speed_limit  = false;  // blmjcicarplay: read + show the posted speed limit
+    bool         carplay_udpd_launch  = true;   // blmjcicarplay: auto-launch splim_udpd (only when speed_limit)
+    bool         carplay_nav_diag     = false;  // blmjcicarplay: dump nav payloads to disk (RE aid; location data)
+    bool         carplay_msgtype_diag = false;  // blmjcicarplay: dump devmgr msg types to disk (RE aid; location data)
+    bool         carplay_hud_debug    = false;  // blmjcicarplay: overlay raw turn codes on the HUD street strip
+    bool         loaded               = false;
 };
 
 // The single parsed-config instance for this library. Function-local
@@ -268,6 +305,18 @@ inline void apply_kv(const char *key, const char *val, void *ud)
     } else if (strcasecmp(key, "block_headunit_media_play") == 0) {
         s.block_headunit_media_play =
             parse_bool(val, s.block_headunit_media_play);
+    } else if (strcasecmp(key, "carplay_vn_normalize") == 0) {
+        s.carplay_vn_normalize = parse_bool(val, s.carplay_vn_normalize);
+    } else if (strcasecmp(key, "carplay_speed_limit") == 0) {
+        s.carplay_speed_limit = parse_bool(val, s.carplay_speed_limit);
+    } else if (strcasecmp(key, "carplay_udpd_launch") == 0) {
+        s.carplay_udpd_launch = parse_bool(val, s.carplay_udpd_launch);
+    } else if (strcasecmp(key, "carplay_nav_diag") == 0) {
+        s.carplay_nav_diag = parse_bool(val, s.carplay_nav_diag);
+    } else if (strcasecmp(key, "carplay_msgtype_diag") == 0) {
+        s.carplay_msgtype_diag = parse_bool(val, s.carplay_msgtype_diag);
+    } else if (strcasecmp(key, "carplay_hud_debug") == 0) {
+        s.carplay_hud_debug = parse_bool(val, s.carplay_hud_debug);
     } else {
         // Common schema: a key this library doesn't act on is not an
         // error, just informational.
@@ -279,9 +328,10 @@ inline void log_effective(const char *prefix)
 {
     const Settings &s = settings();
     LOGD("config: %s touch=%s hud=%s hud_transport=%s force_street_name=%s "
-            "hud_fold_latin=%s use_protocol_v1_6=%s aa_audio_low_latency=%s "
-            "mute_pauses_phone=%s "
-         "block_headunit_media_play=%s",
+         "hud_fold_latin=%s use_protocol_v1_6=%s aa_audio_low_latency=%s "
+         "mute_pauses_phone=%s block_headunit_media_play=%s "
+         "carplay_vn_normalize=%s carplay_speed_limit=%s carplay_udpd_launch=%s "
+         "carplay_nav_diag=%s carplay_msgtype_diag=%s carplay_hud_debug=%s",
          prefix,
          s.touch ? "true" : "false",
          s.hud   ? "true" : "false",
@@ -291,16 +341,23 @@ inline void log_effective(const char *prefix)
          s.use_protocol_v1_6 ? "true" : "false",
          s.aa_audio_low_latency ? "true" : "false",
          s.mute_pauses_phone ? "true" : "false",
-         s.block_headunit_media_play ? "true" : "false");
+         s.block_headunit_media_play ? "true" : "false",
+         s.carplay_vn_normalize ? "true" : "false",
+         s.carplay_speed_limit ? "true" : "false",
+         s.carplay_udpd_launch ? "true" : "false",
+         s.carplay_nav_diag ? "true" : "false",
+         s.carplay_msgtype_diag ? "true" : "false",
+         s.carplay_hud_debug ? "true" : "false");
 }
 
 // === Public API ===============================================
 
-// Load libpatch.conf from the directory of the library that owns
-// `sym_in_self` (pass the address of any function in your own .so).
-// Idempotent: only the first call reads the file. Missing file or keys
-// fall back to the defaults above.
-inline void load(const void *sym_in_self)
+// Load the config file `filename` from the directory of the library that owns
+// `sym_in_self` (pass the address of any function in your own .so). The AA
+// family uses the default (libpatch.conf); blmjcicarplay passes
+// kCarplayConfigFile. Idempotent: only the first call reads the file. Missing
+// file or keys fall back to the defaults above.
+inline void load(const void *sym_in_self, const char *filename = kConfigFile)
 {
     Settings &s = settings();
     if (s.loaded) {
@@ -309,7 +366,7 @@ inline void load(const void *sym_in_self)
     s.loaded = true;
 
     char path[PATH_MAX];
-    if (!find_sibling_file(sym_in_self, kConfigFile, path, sizeof(path))) {
+    if (!find_sibling_file(sym_in_self, filename, path, sizeof(path))) {
         LOGW("config: could not resolve own .so directory — using defaults");
         log_effective("defaults:");
         return;
@@ -336,6 +393,12 @@ inline bool         use_protocol_v1_6() { return settings().use_protocol_v1_6; }
 inline bool         aa_audio_low_latency() { return settings().aa_audio_low_latency; }
 inline bool         mute_pauses_phone() { return settings().mute_pauses_phone; }
 inline bool         block_headunit_media_play() { return settings().block_headunit_media_play; }
+inline bool         carplay_vn_normalize() { return settings().carplay_vn_normalize; }
+inline bool         carplay_speed_limit()  { return settings().carplay_speed_limit; }
+inline bool         carplay_udpd_launch()  { return settings().carplay_udpd_launch; }
+inline bool         carplay_nav_diag()     { return settings().carplay_nav_diag; }
+inline bool         carplay_msgtype_diag() { return settings().carplay_msgtype_diag; }
+inline bool         carplay_hud_debug()    { return settings().carplay_hud_debug; }
 
 } // namespace libpatch_config
 

@@ -25,9 +25,11 @@
 // See config.{h,cpp}.
 #include "svcnavi_tx.h"
 #include "vbs_tx.h"
-#include "translit.h"   // hud_translit::fold() — precomposed-Latin street-name fold
-#include "hud_nav.h"    // compute_turn_icon() — AA turn fields -> Mazda HUD glyph
-#include "hud_lane.h"   // oem_lane_code_for_aa — AA lanes -> OEM lane codes
+#include "common/translit.h"   // hud_translit::fold() — shared Latin street-name fold
+#include "hud_nav.h"           // compute_turn_icon() — AA turn fields -> Mazda HUD glyph
+#include "hud_lane.h"          // oem_lane_code_for_aa — AA lanes -> OEM lane codes
+#include "hud_nav16.h"         // 1.6 decoder + AaLane + aa_nav16_lane_bytes + aa_to_mazda_unit/parse_dist_x10
+#include "common/aa_nav16_msg.h" // AA_NAV16_MSG_* — sender/receiver msgId contract
 
 #include <stdint.h>
 #include <string.h>

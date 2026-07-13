@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// HUD street-name transliteration.
+// HUD street-name transliteration (shared by blmjciaapa + blmjcicarplay).
 //
 // The Mazda HUD ECU font only has glyphs for Unicode code points below
 // roughly U+0800 (verified on-device: 2-byte-UTF-8 letters like ư=U+01B0
@@ -32,11 +32,16 @@
 // never lengthens the string (a 3-byte sequence becomes ≤2 bytes;
 // everything else keeps its length).
 //
+// Unrenderable-sequence policy is a caller choice via fold()'s optional
+// `unrenderable` byte: AA passes 0 (leave the blank slot the ECU font
+// draws), CarPlay passes '?' (replace an unfoldable 3-/4-byte sequence
+// with one visible byte so the slot doesn't render as ECU font garbage).
+//
 // Header-only: the patches/ tree compiles only patches/<name>/*.cpp, so
-// shared inline code lives in headers (same convention as hud_nav.h).
+// shared inline code lives in headers (same convention as config.h).
 
-#ifndef LIBPATCH_BLMJCIAAPA_HUD_TRANSLIT_H
-#define LIBPATCH_BLMJCIAAPA_HUD_TRANSLIT_H
+#ifndef LIBPATCH_COMMON_TRANSLIT_H
+#define LIBPATCH_COMMON_TRANSLIT_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -114,12 +119,22 @@ inline size_t encode_utf8(uint32_t code_point, char *out)
 // sequence verbatim; malformed bytes pass through one at a time. NULL is
 // a no-op; the result is NUL-terminated.
 //
+// `unrenderable` selects what happens to a 3-/4-byte sequence the font
+// can't draw and that has no Latin base to fold to (CJK, Thai, emoji, …):
+//   0            -> pass the sequence through unchanged (it draws blank);
+//                   AA's behaviour, no visible change outside the block.
+//   any byte b   -> replace the whole sequence with the single byte b
+//                   (CarPlay passes '?') so the slot stays visible instead
+//                   of the ECU font rendering uninitialised garbage.
+// A non-zero `unrenderable` still only shortens the string, so the
+// in-place invariant below is unaffected.
+//
 // In-place is safe because the fold never lengthens the string: a folded
 // code point is always a 3-byte input that re-encodes to ≤2 bytes, and
 // every other sequence is rewritten at its own length, so the write
 // cursor stays at or behind the read cursor for the whole pass and never
 // clobbers a byte that hasn't been read yet.
-inline void fold(char *str)
+inline void fold(char *str, char unrenderable = 0)
 {
     if (str == nullptr) {
         return;
@@ -151,7 +166,7 @@ inline void fold(char *str)
             // font blanks all of it; the Latin Extended Additional block
             // (U+1E00..U+1EFF, precomposed Latin) folds to a renderable
             // base, while everything else here (CJK, Thai, Indic, Hangul,
-            // Georgian, …) has no Latin base and is copied (stays blank).
+            // Georgian, …) has no Latin base.
             saw_long_seq = true;
             uint32_t code_point = ((lead & 0x0Fu) << 12) |
                                   ((read_ptr[1] & 0x3Fu) << 6) |
@@ -164,12 +179,24 @@ inline void fold(char *str)
                 read_ptr  += 3;
                 continue;
             }
+            if (unrenderable != 0) {
+                // No Latin base — replace the blank-drawing sequence with
+                // one visible byte (write 1 for 3, still shrinks).
+                *write_ptr++ = unrenderable;
+                read_ptr    += 3;
+                continue;
+            }
             seq_len = 3;
         } else if ((lead & 0xF8) == 0xF0 && (read_ptr[1] & 0xC0) == 0x80 &&
                    (read_ptr[2] & 0xC0) == 0x80 && (read_ptr[3] & 0xC0) == 0x80) {
             // 4-byte, U+10000..U+10FFFF — supplementary planes (emoji,
             // rare/historic CJK, …). Never renderable, nothing to fold.
             saw_long_seq = true;
+            if (unrenderable != 0) {
+                *write_ptr++ = unrenderable;
+                read_ptr    += 4;
+                continue;
+            }
             seq_len = 4;
         } else {
             // Invalid lead/continuation — pass the raw byte through.
@@ -196,4 +223,4 @@ inline void fold(char *str)
 
 } // namespace hud_translit
 
-#endif  // LIBPATCH_BLMJCIAAPA_HUD_TRANSLIT_H
+#endif  // LIBPATCH_COMMON_TRANSLIT_H

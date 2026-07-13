@@ -30,6 +30,15 @@
 #  define LIBPATCH_NAME "patch"
 #endif
 
+// Output sink for every emitted line. Defaults to stderr (captured by sm
+// into the device log for most services). A patch whose stderr is NOT
+// captured — e.g. blmjcicarplay, whose jciCARPLAY stderr is swallowed by
+// syslog-ng — defines this before including to redirect to its own FILE*
+// (e.g. `(g_logf ? g_logf : stderr)`). Evaluated at each call site.
+#ifndef LIBPATCH_LOG_SINK
+#  define LIBPATCH_LOG_SINK stderr
+#endif
+
 #define LOG_LEVEL_VERBOSE  0
 #define LOG_LEVEL_DEBUG    1
 #define LOG_LEVEL_WARN     2
@@ -53,10 +62,11 @@
 
 #define LOG_EMIT(tag, fmt, ...)                                                \
     do {                                                                       \
-        std::fprintf(stderr,                                                   \
+        std::FILE *_lf = (LIBPATCH_LOG_SINK);                                  \
+        std::fprintf(_lf,                                                      \
                      "[libpatch-" LIBPATCH_NAME "][" LOG_TAG "][" tag "] " fmt "\n", \
                      ##__VA_ARGS__);                                           \
-        std::fflush(stderr);                                                   \
+        std::fflush(_lf);                                                      \
     } while (0)
 
 // Keep the format string type-checked even when the level is

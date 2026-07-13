@@ -1,10 +1,11 @@
 # oem-aa-mod
 
 Custom `LD_PRELOAD` shims for the Mazda CMU (Connectivity Master Unit)
-infotainment system. Each shim targets one specific OEM `.so` (e.g.
-`blmjciaapa.so`) and is deployed into a single PID via `sm.conf`'s
-`<environ_var>` mechanism. Cross-compiled on WSL/Linux with the
-`m3-toolchain` and deployed to the head unit via SD card.
+infotainment system, adding HUD navigation for **both Android Auto and
+CarPlay**. Each shim targets one specific OEM `.so` (e.g. `blmjciaapa.so`)
+and is deployed into a single PID via `sm.conf`'s `<environ_var>`
+mechanism. Cross-compiled on WSL/Linux with the `m3-toolchain` and
+deployed to the head unit via SD card.
 
 > **Disclaimer.** This is an unofficial, community-developed
 > modification. It is not affiliated with, endorsed by, supported by,
@@ -28,6 +29,7 @@ actually needs.
 | `mazda/patches/blmjciaapa/` | Sources for `libpatch-blmjciaapa.so` — hooks into `blmjciaapa.so` (loaded by the `{L_jciAAPA}` `sm_svclauncher` PID) to add Android Auto touch passthrough, HUD guidance (including the GAL 1.6 maneuver/lane guidance relayed from the `aap_service` shim), and an optional mute→media bridge that pauses the phone's Android Auto media on a user mute and resumes it on unmute. |
 | `mazda/patches/aap_service/` | Sources for `libpatch-aap_service.so` — hooks into `aap_service` (the Android Auto projection daemon) to advertise GAL protocol 1.6, so the phone sends the richer navigation (maneuver, lanes, distance), and relays those frames to `libpatch-blmjciaapa.so` for the HUD. Optional: only needed with `use_protocol_v1_6 = true`. |
 | `mazda/patches/svcjcinavi/` | Sources for `libpatch-svcjcinavi.so` — hooks into `svcjcinavi.so` (the OEM navigation service PID) to merge Android Auto HUD guidance with the OEM nav engine's so the head-up display doesn't flicker between the two. Optional: only useful when the navigation SD card is present (without it `svcjcinavi` never runs). |
+| `mazda/patches/blmjcicarplay/` | Sources for `libpatch-blmjcicarplay.so` — hooks into `blmjcicarplay.so` (loaded by the `jciCARPLAY` PID) to decode Apple iAP2 turn-by-turn navigation and forward maneuver / distance / road name to the OEM navigation HUD (`com.jci.vbs.navi`). Merged in from the `mazda-carplay-hud` project. |
 | `mazda/Makefile` | Multi-target cross-compile build system. Targets: `make debug`, `make release` (default), `make all`, `make <patch>` / `make <patch>-debug`, `make clean`. Outputs go to `mazda/build/{debug,release}/libpatch-<patch>.so`. |
 | `mazda/m3-toolchain/` | Git submodule: ARM Cortex-A9 NEON GCC 4.9.1 cross toolchain (`arm-cortexa9_neon-linux-gnueabi`) plus sysroot matching the CMU's glibc. Source: <https://github.com/lmagder/m3-toolchain>. |
 | `mazda/build/` | Build output. Ignored by git. `debug/` is `-O0 -g3`, `release/` is `-O3 -flto -Wl,--gc-sections -Wl,-s`. |

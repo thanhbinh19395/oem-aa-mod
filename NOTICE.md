@@ -15,6 +15,16 @@ were copied verbatim or adapted from that repository. Derived source
 files carry an `SPDX-License-Identifier: AGPL-3.0-or-later` header
 and a back-reference to the upstream.
 
+## mazda-carplay-hud — CarPlay → HUD bridge ("KID MIXER-MODER")
+
+* License:   GNU Affero General Public License v3.0 (same terms as
+             this project's [LICENSE](LICENSE))
+
+The `mazda/patches/blmjcicarplay/` shim (CarPlay iAP2 turn-by-turn
+forwarded to the OEM navigation HUD) was merged in from the
+`mazda-carplay-hud` project. It shares the same `headunit` lineage as
+the rest of this repository and is likewise AGPL-3.0.
+
 ## License compatibility note
 
 AGPL-3.0 is copyleft: any derivative work must also be licensed

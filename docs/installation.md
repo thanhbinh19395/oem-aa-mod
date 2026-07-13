@@ -21,10 +21,12 @@ oem-aa-mod-<version>/
   libpatch-blmjciaapa.so              # -> /data_persist/oem-aa-mod/
   libpatch-svcjcinavi.so              # -> /data_persist/oem-aa-mod/ (optional; HUD merge)
   libpatch-aap_service.so             # -> /data_persist/oem-aa-mod/ (optional; protocol v1.6)
+  libpatch-blmjcicarplay.so           # -> /data_persist/oem-aa-mod/ (optional; CarPlay HUD nav)
   resources/
     aap_system_attributes.xml         # -> /etc/
     aap_system_attributes_UCP.xml     # -> /etc/
-    libpatch.conf                     # -> /data_persist/oem-aa-mod/ (optional; runtime config)
+    libpatch.conf                     # -> /data_persist/oem-aa-mod/ (optional; Android Auto runtime config)
+    libpatch-carplay.conf             # -> /data_persist/oem-aa-mod/ (optional; CarPlay runtime config)
 ```
 
 These shims are per-service `LD_PRELOAD` libraries, each scoped to the
@@ -53,9 +55,11 @@ cp /mnt/sdb1/libpatch-svcjcinavi.so /data_persist/oem-aa-mod/
 # enables lane guidance on the HUD; see Configuration below). Inert unless
 # that key is set.
 cp /mnt/sdb1/libpatch-aap_service.so /data_persist/oem-aa-mod/
-# Optional: runtime config (see Configuration below). Omit it to use
-# the built-in defaults.
+# Optional: runtime config (see Configuration below). Omit either to use
+# the built-in defaults. libpatch.conf configures the Android Auto
+# libraries; libpatch-carplay.conf configures the CarPlay bridge.
 cp /mnt/sdb1/libpatch.conf /data_persist/oem-aa-mod/
+cp /mnt/sdb1/libpatch-carplay.conf /data_persist/oem-aa-mod/
 chmod 0644 /data_persist/oem-aa-mod/libpatch-*.so
 sync
 ```
@@ -76,7 +80,7 @@ load into different services — `libpatch-blmjciaapa.so` is preloaded for
 > market, so the street name will be missing even with everything else
 > working. To show it, deploy `libpatch.conf` and set
 > **`force_street_name = true`** — see
-> [Configuration](#configuration-libpatchconf) for details. NA units
+> [Configuration](#configuration) for details. NA units
 > show the street with the defaults and need no change.
 
 SD cards mount under `/mnt/sd<x><n>` (e.g. `/mnt/sda1`, `/mnt/sdb1`, …)
@@ -161,6 +165,46 @@ sync
 (Adjust the source path to wherever you staged the files from
 [resources/](../resources/) — SD card mount, `scp`, etc.)
 
+### 3b. CarPlay HUD navigation (optional)
+
+`libpatch-blmjcicarplay.so` forwards Apple CarPlay turn-by-turn to the
+same navigation HUD. It is independent of the Android Auto shims — skip
+this if you don't use CarPlay. Two on-device changes:
+
+**Preload it for `jciCARPLAY`.** Find the `<service … name="jciCARPLAY" …>`
+block in `sm.conf` and add both env vars inside it:
+
+```xml
+<service type="jci_service" name="jciCARPLAY" path="…/blmjcicarplay.so" …>
+    <!-- existing entries left in place -->
+    <environ_var env_name="LD_PRELOAD"
+                 env_value="/data_persist/oem-aa-mod/libpatch-blmjcicarplay.so"/>
+    <environ_var env_name="LD_LIBRARY_PATH" env_value="/jci/lib:/usr/lib"/>
+</service>
+```
+
+> **Wireless CarPlay (WCP) units:** if `/jci/sm/sm_WCP.conf` exists, the
+> service manager *merges* the `jciCARPLAY` stanza from `sm.conf` **and**
+> `sm_WCP.conf`. Add the `<environ_var>` to **exactly one** of them
+> (patch `sm_WCP.conf` if present, otherwise `sm.conf`) — putting it in
+> both yields a duplicate `LD_PRELOAD` that crash-loops the service. It's
+> also wise to set `reset_board="no"` on the `jciCARPLAY` service so a
+> shim fault restarts only CarPlay instead of rebooting the unit.
+
+**Enable nav advertisement** so CarPlay offers guidance to the HUD — set
+`NaviSupported` to `TRUE` in `/etc/devmgr_config_master.xml` (back it up
+first):
+
+```sh
+cp /etc/devmgr_config_master.xml /etc/devmgr_config_master.xml.orig
+sed -i 's#<name>NaviSupported</name><value>FALSE</value>#<name>NaviSupported</name><value>TRUE</value>#' /etc/devmgr_config_master.xml
+sync
+```
+
+> The [oem-aa-mod-installer](https://github.com/Bijan-A/oem-aa-mod-installer)
+> automates all of the above (Android Auto **and** CarPlay, WCP-safe) in a
+> single USB run — this manual path is for reference or fine-grained control.
+
 ### 4. Restart the services (or reboot)
 
 Restart just the services you changed:
@@ -172,19 +216,24 @@ smctl -r -n jcinavi    # only if you patched jcinavi in step 2
 
 …or reboot the unit.
 
-## Configuration (`libpatch.conf`)
+## Configuration
 
-Runtime behaviour is controlled by an optional `libpatch.conf` placed in
-the same folder as the libraries (`/data_persist/oem-aa-mod/` — step 1
-copies it there). It is the common config for the whole mod: every
-library reads the same file and acts on the keys it understands,
-ignoring the rest. A sample is shipped at
-[resources/libpatch.conf](../resources/libpatch.conf).
+Runtime behaviour is controlled by two optional files placed in the same
+folder as the libraries (`/data_persist/oem-aa-mod/` — step 1 copies them
+there):
 
-The file is entirely optional — if it is missing, or a key is omitted,
+- **`libpatch.conf`** — the Android Auto libraries (`blmjciaapa`,
+  `svcjcinavi`, `aap_service`). Sample:
+  [resources/libpatch.conf](../resources/libpatch.conf).
+- **`libpatch-carplay.conf`** — the CarPlay bridge (`blmjcicarplay`).
+  Sample: [resources/libpatch-carplay.conf](../resources/libpatch-carplay.conf).
+
+Each file is entirely optional — if it is missing, or a key is omitted,
 the built-in default is used. Syntax is one `key = value` per line; `#`
 begins a comment; whitespace around keys/values is ignored; keys are
 case-insensitive.
+
+### Android Auto (`libpatch.conf`)
 
 | Key | Values | Default | Effect |
 | --- | --- | --- | --- |
@@ -194,6 +243,17 @@ case-insensitive.
 | `force_street_name` | `true` / `false` | `false` | Force the Android Auto street name onto the HUD street line even where the OEM blanks it (see the EU note below). |
 | `hud_fold_latin` | `true` / `false` | `true` | Fold HUD-unrenderable precomposed Latin letters in street names to their base forms (see the note below). |
 | `use_protocol_v1_6` | `true` / `false` | `false` | Advertise Android Auto GAL 1.6 so the phone sends the 1.6 navigation protocol (maneuver / lanes / distance) for the HUD. Read by the `aap_service` shim; requires it to be preloaded (see the note below). |
+
+### CarPlay (`libpatch-carplay.conf`)
+
+| Key | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `carplay_vn_normalize` | `true` / `false` | `true` | Fold HUD-unrenderable Vietnamese street-name letters to the nearest renderable form (see the note below). |
+| `carplay_speed_limit` | `true` / `false` | `false` | Show the posted speed limit on the HUD. Requires the shared speed-limit feed; off = navigation-only (see the note below). |
+| `carplay_udpd_launch` | `true` / `false` | `true` | Auto-launch the shared `splim_udpd` listener. Only acts when `carplay_speed_limit = true`; set `false` if the Android Auto mod already runs it (see the note below). |
+| `carplay_nav_diag` | `true` / `false` | `false` | **Developer/RE aid** — dump decoded nav payloads to `/data_persist/nav_diag.log`. Writes location data; leave off (see the note below). |
+| `carplay_msgtype_diag` | `true` / `false` | `false` | **Developer/RE aid** — dump devmgr message types to `/data_persist/msgtype_diag.log`. Writes location data; leave off (see the note below). |
+| `carplay_hud_debug` | `true` / `false` | `false` | **Developer aid** — overlay raw turn codes on the HUD street strip when no glyph maps (see the note below). |
 
 Booleans are lenient — `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`
 are all accepted.
@@ -255,17 +315,54 @@ the street, so it is safe to enable everywhere if preferred.
   Lane guidance is part of the 1.6 protocol, so it is sent automatically
   whenever `use_protocol_v1_6 = true` (and never at stock 1.5).
 
-After editing `libpatch.conf`, restart the affected service(s) —
-`jciAAPA`, `jcinavi` if you patched it, and `aap_service` if you enabled
-`use_protocol_v1_6` — or reboot for the change to take effect. The config is read
-once at library load.
+The `carplay_*` keys live in **`libpatch-carplay.conf`** and are read by the
+**CarPlay** shim (`blmjcicarplay`, patched into `jciCARPLAY`):
+
+- **`carplay_vn_normalize`** is the CarPlay counterpart of `hud_fold_latin`: the
+  HUD ECU font can't draw the 3-byte-UTF-8 precomposed Vietnamese letters (the
+  double-stacked diacritics such as `ề ớ ấ`), so they blank out. When `true`
+  (default) they are mapped to the renderable 2-byte letter — tone dropped, base
+  kept (`ề`→`ê`, `ớ`→`ơ`, `ấ`→`â`) — or to ASCII where there is no 2-byte form.
+  Set `false` to send names unchanged (a HUD with a full Vietnamese font, or a
+  non-Vietnamese locale).
+
+- **`carplay_speed_limit`** shows the posted speed limit on the HUD. It needs the
+  shared speed-limit feed — the OCR daemon writing `/data_persist/splim`, plus
+  `carspeed_d` for the over-speed blink. Default `false` gives the navigation-only
+  HUD (maneuver + distance + road name). When `true`, the speed-limit sign stays
+  live after in-app navigation ends, mirroring the Android Auto behaviour.
+
+- **`carplay_udpd_launch`** lets the CarPlay shim auto-start the shared
+  `splim_udpd` UDP listener. It only acts when `carplay_speed_limit = true`. Set it
+  `false` on a unit where the Android Auto mod already runs `splim_udpd`, so CarPlay
+  stays a pure reader of `/data_persist/splim` and never starts a second,
+  competing daemon.
+
+- **`carplay_nav_diag`** / **`carplay_msgtype_diag`** are reverse-engineering aids
+  that append raw navigation payloads / message metadata to
+  `/data_persist/nav_diag.log` and `/data_persist/msgtype_diag.log`. **Privacy:
+  those payloads are your location/route data**, and they cause flash writes, so
+  both default `false` — switch one on only for a bench session, then turn it back
+  off and delete the log. **`carplay_hud_debug`** overlays the raw turn codes
+  (`EV/S/A`) on the HUD street strip whenever the icon lookup finds no glyph — a
+  developer aid for extending the icon table; it corrupts the normal street display
+  while on, so it also defaults `false`.
+
+After editing either file, restart the affected service(s) — `jciAAPA`,
+`jcinavi` if you patched it, `aap_service` if you enabled `use_protocol_v1_6`
+(all `libpatch.conf`), and `jciCARPLAY` if you changed a `carplay_*` key
+(`libpatch-carplay.conf`) — or reboot for the change to take effect. Each file
+is read once at library load.
 
 ## Uninstall / disable
 
 Remove (or comment out) the `<environ_var>` line(s) you added in
-`/jci/sm/sm.conf` (the `jciAAPA` one, the `jcinavi` one if present, and the
-`aap_service` one if you enabled 1.6), restore the original
-`/etc/aap_system_attributes*.xml` files from the `.orig` backups, then restart
-the affected services (`smctl -r -n jciAAPA` / `smctl -r -n jcinavi` /
-`smctl -r -n aap_service`) or reboot. The
-`/data_persist/oem-aa-mod/` directory can be deleted afterwards.
+`/jci/sm/sm.conf` (the `jciAAPA` one, the `jcinavi` one if present, the
+`aap_service` one if you enabled 1.6, and the `jciCARPLAY` one plus its
+`LD_LIBRARY_PATH` if you installed the CarPlay shim — remember WCP units
+may have these in `sm_WCP.conf`), restore the original
+`/etc/aap_system_attributes*.xml` and `/etc/devmgr_config_master.xml`
+files from the `.orig` backups, then restart the affected services
+(`smctl -r -n jciAAPA` / `smctl -r -n jcinavi` / `smctl -r -n aap_service`
+/ `smctl -r -n jciCARPLAY`) or reboot. The `/data_persist/oem-aa-mod/`
+directory can be deleted afterwards.
