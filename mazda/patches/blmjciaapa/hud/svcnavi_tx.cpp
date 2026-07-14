@@ -27,6 +27,7 @@
 #include "../log.h"
 #include "svcnavi_tx.h"
 #include "hud_nav.h"
+#include "hud_lane.h"
 #include "../oem/libdbus.h"
 #include "../../common/oem/vbs_navi_hud.h"   // kAapSpeedSentinel (shared with svcjcinavi)
 
@@ -70,7 +71,7 @@ struct NaviSnapshot {
     uint32_t dir_icon;       // Mazda HUD maneuver glyph (resolved by hud.cpp)
     int32_t  distance_dec;   // value * 10
     uint8_t  distance_unit;  // mapped to Mazda enum
-    uint8_t  lanes[8];       // Mazda lane bytes: 0=hidden, 1=unmarked, 22=marked
+    uint8_t  lanes[8];       // OEM lane codes: 0=hidden, 1..70 (svcjcinavi maps code->glyph)
 };
 
 NaviSnapshot            g_snapshot = {};
@@ -387,7 +388,7 @@ void svcnavi_tx_lanes(const uint8_t *lanes)
     if (lanes) {
         std::memcpy(g_snapshot.lanes, lanes, sizeof(g_snapshot.lanes));
     } else {
-        std::memset(g_snapshot.lanes, HUD_LANE_HIDDEN, sizeof(g_snapshot.lanes));
+        std::memset(g_snapshot.lanes, OEM_LANE_NONE, sizeof(g_snapshot.lanes));
     }
     seqlock_end();
 }
