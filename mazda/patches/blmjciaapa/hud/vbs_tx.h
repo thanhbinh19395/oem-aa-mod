@@ -31,7 +31,6 @@
 #define LIBPATCH_BLMJCIAAPA_VBS_TX_H
 
 #include <stdint.h>
-#include "hud_nav16.h"   // AaLane, aa_nav16_lane_bytes, AA_NAV16_LANE_*
 
 // Defined in vbs_tx.cpp. HUD output lifecycle. vbs_tx_start opens
 // the OEM HMI + Service D-Bus connections, spawns a dispatcher
@@ -45,42 +44,22 @@ void vbs_tx_stop(void);
 // Anything else is treated as STOP (defensive).
 void vbs_tx_status(uint32_t status);
 
-// 0x501 NAVTurnMessage. `road_name` may be NULL or empty.
-//   turn_side  - 1=LEFT, 2=RIGHT, 3=UNSPECIFIED (proto TURN_SIDE)
-//   turn_event - sparse 0..19  (proto TURN_EVENT)
-//   turn_angle - degrees, signed
-//   turn_number - maneuver / exit number
-//
-// road_name lifetime: NOT held past return. The pointer is
-// snapshot-copied into a fixed-size buffer inline.
-void vbs_tx_next_turn(const char *road_name,
-                      uint32_t    turn_side,
-                      uint32_t    turn_event,
-                      int32_t     turn_angle,
-                      int32_t     turn_number);
+// 0x501 NAVTurnMessage. `road_name` may be NULL or empty; `dir_icon` is the
+// resolved Mazda HUD glyph (hud.cpp maps the AA turn_side/event/angle fields to
+// it via compute_turn_icon). road_name lifetime: NOT held past return — the
+// pointer is snapshot-copied into a fixed-size buffer inline.
+void vbs_tx_next_turn(const char *road_name, uint32_t dir_icon);
 
-// 0x502 NAVDistanceMessage.
-//   distance_meters  - raw meters (proto `distance`)
-//   time_until_seconds - ETA seconds (proto `time_until`)
-//   display_distance - the "raw unit * 1000" int32 from the SDK
-//                      header (truncated from proto uint64). The
-//                      HUD wire format wants "raw unit * 10", so
-//                      we divide by 100 on the way in.
-//   display_distance_unit - proto DISPLAY_DISTANCE_UNIT, 1..6.
-//                           Mapped to the HUD's own unit enum
-//                           inside vbs_tx.cpp.
-void vbs_tx_distance(int32_t  distance_meters,
-                     int32_t  time_until_seconds,
-                     int32_t  display_distance,
-                     uint32_t display_distance_unit);
+// Distance to the next maneuver, in Mazda-HUD form:
+//   dist_dec  - display distance * 10 (one decimal)
+//   dist_unit - Mazda HUD unit (1=m, 2=mi, 3=km, 4=yd, 5=ft; 0=none)
+// hud.cpp maps the AA proto values to this form before calling.
+void vbs_tx_distance(int32_t dist_dec, uint8_t dist_unit);
 
-// Android Auto GAL 1.6 path. The maneuver glyph is ALREADY the Mazda HUD code
-// and distance is already value*10 in the Mazda unit. Lanes are carried through
-// so the direct path is lane-ready; see vbs_tx.cpp for the emit-side OEM-ABI
-// note (the basic VBS_NAVI_SetHUDDisplayMsgReq frame has no lane field). One
-// call sets the frame.
-void vbs_tx_v16(uint32_t glyph, const char *road,
-                int32_t dist_dec, uint8_t dist_unit,
-                const AaLane *lanes, uint8_t n_lanes);
+// Recommended-lane array (GAL 1.6 only; the 1.5 path never sends lanes). Exactly
+// 8 Mazda lane bytes, LEFT to RIGHT (0=hidden, 1=unmarked, 22=marked; hud.cpp
+// encodes them). Carried on a SEPARATE OEM method (VBS_NAVI_SetRecommLaneReq) —
+// see vbs_tx.cpp for the emit-side 0 -> 0xFF hidden-slot remap.
+void vbs_tx_lanes(const uint8_t *lanes);
 
 #endif // LIBPATCH_BLMJCIAAPA_VBS_TX_H

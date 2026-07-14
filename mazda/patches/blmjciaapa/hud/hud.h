@@ -26,16 +26,12 @@ void hud_pre_aap_destroy_session(void);
 //
 // The aap_service shim (a SEPARATE process) swallows the 1.6 navigation frames
 // and relays them RAW over an abstract AF_UNIX datagram socket. The receiver
-// thread (nav16_rx.cpp) hands each raw frame to hud_feed_nav16_raw(), which is
-// the single place that decodes the AA protocol, maps it to the Mazda HUD
-// domain, and renders it through the SAME transport (glyph emit, street fold,
-// lanes) the 1.5 path uses.
+// thread (nav16_rx.cpp) hands each raw frame to hud_nav16_feed() (hud_nav16.h),
+// which decodes the AA protocol and invokes the sink callbacks hud.cpp
+// registers; those map it to the Mazda HUD domain and render it through the SAME
+// transport (glyph emit, street fold, lanes) the 1.5 path uses.
 
-// Defined in hud.cpp. Decode + render one raw GAL 1.6 nav frame (full frame,
-// leading 2-byte big-endian msgId). Runs on the nav16 receiver thread.
-void hud_feed_nav16_raw(const uint8_t *frame, int len);
-
-// Defined in hud.cpp. Reset hud_feed_nav16_raw's accumulator + change-gate.
+// Defined in hud.cpp. Reset the GAL 1.6 HUD accumulator + change-gate.
 // Called from hud_nav16_rx_start() while the receiver thread is NOT running
 // (it is the only other toucher of that state), so a session that ended
 // abnormally — cable pull, no INACTIVE/STOP received — can't leave a stale

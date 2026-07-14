@@ -194,10 +194,6 @@ const char *kManeuver[] = {
     "RA_ENTER_EXIT_CCW_ANGLE","STRAIGHT","FERRY_BOAT","FERRY_TRAIN","DESTINATION",
     "DESTINATION_STRAIGHT","DESTINATION_LEFT","DESTINATION_RIGHT",
 };
-const char *kShape[] = {
-    "UNK","STRAIGHT","SLIGHT_L","SLIGHT_R","NORMAL_L","NORMAL_R",
-    "SHARP_L","SHARP_R","UTURN_L","UTURN_R",
-};
 
 // AA NavigationType (0..42) -> Mazda HUD glyph. Values cross-referenced to the
 // MazdaIcon 1.5 glyph atlas in hud_nav.h (the road-validated reference table);
@@ -264,13 +260,9 @@ uint8_t roundabout_glyph(int32_t exit_angle, bool clockwise)
 
 } // namespace
 
-const char *hud_nav16_maneuver_name(uint32_t t)
+static const char *hud_nav16_maneuver_name(uint32_t t)
 {
     return (t < sizeof(kManeuver)/sizeof(kManeuver[0])) ? kManeuver[t] : "?";
-}
-const char *hud_nav16_shape_name(int s)
-{
-    return (s >= 0 && s < (int)(sizeof(kShape)/sizeof(kShape[0]))) ? kShape[s] : "?";
 }
 
 uint8_t hud_nav16_glyph(const AaGuidance *g)
@@ -321,7 +313,7 @@ int32_t parse_dist_x10(const char *s)
     return any ? (int32_t)(ip * 10 + frac) : 0;
 }
 
-bool hud_nav16_decode_navstate(const uint8_t *proto, int len, AaGuidance *out)
+static bool hud_nav16_decode_navstate(const uint8_t *proto, int len, AaGuidance *out)
 {
     if (!out) return false;
     std::memset(out, 0, sizeof(*out));
@@ -337,7 +329,7 @@ bool hud_nav16_decode_navstate(const uint8_t *proto, int len, AaGuidance *out)
     return true;
 }
 
-bool hud_nav16_decode_position(const uint8_t *proto, int len, AaPosition *out)
+static bool hud_nav16_decode_position(const uint8_t *proto, int len, AaPosition *out)
 {
     if (!out) return false;
     std::memset(out, 0, sizeof(*out));
@@ -408,4 +400,66 @@ int hud_nav16_format_position(const AaPosition *p, char *buf, int cap)
         "nav16 POS: step=%dm \"%s\" u%u | dest=%dm \"%s\" u%u eta=\"%s\"",
         p->step_meters, p->step_display, p->step_units,
         p->dest_meters, p->dest_display, p->dest_units, p->eta);
+}
+
+// === Push API =================================================================
+
+// Registered callbacks. Set on the lifecycle thread before the rx thread starts
+// and cleared after it stops (see nav16_rx.cpp), so hud_nav16_feed() — which only
+// runs on the rx thread — never races them.
+static HudNav16GuidanceFn g_on_guidance = nullptr;
+static HudNav16PositionFn g_on_position = nullptr;
+static HudNav16StatusFn   g_on_status   = nullptr;
+
+void hud_nav16_set_sink(HudNav16GuidanceFn on_guidance,
+                        HudNav16PositionFn on_position,
+                        HudNav16StatusFn   on_status)
+{
+    g_on_guidance = on_guidance;
+    g_on_position = on_position;
+    g_on_status   = on_status;
+}
+
+void hud_nav16_feed(const uint8_t *frame, int len)
+{
+    if (!frame || len < 2) return;
+
+    const uint32_t id = ((uint32_t)frame[0] << 8) | frame[1];   // big-endian msgId
+    switch (id) {
+    case AA_NAV16_MSG_NAV_STATE: {          // 0x8006 — maneuver + road + lanes
+        if (!g_on_guidance) break;
+        AaGuidance g;
+        hud_nav16_on_frame(frame, len, &g, nullptr);
+        g_on_guidance(&g);
+        break;
+    }
+    case AA_NAV16_MSG_POSITION: {           // 0x8007 — distance to next maneuver
+        if (!g_on_position) break;
+        AaPosition p;
+        hud_nav16_on_frame(frame, len, nullptr, &p);
+        g_on_position(&p);
+        break;
+    }
+    case AA_NAV16_MSG_STATUS: {             // 0x8003 — NavigationStatus lifecycle
+        if (!g_on_status) break;
+        AaStatus s;
+        s.nav_status   = -1;
+        s.cluster_stop = false;
+        hud_nav16_read_status(frame, len, &s.nav_status);
+        g_on_status(&s);
+        break;
+    }
+    case AA_NAV16_MSG_CLUSTER_STOP: {       // 0x8002 — blank the HUD
+        if (!g_on_status) break;
+        AaStatus s;
+        s.nav_status   = -1;
+        s.cluster_stop = true;
+        g_on_status(&s);
+        break;
+    }
+    default:
+        // CLUSTER_START (0x8001) / NEXT_TURN (0x8004) / NEXT_TURN_DIST (0x8005):
+        // nothing to render.
+        break;
+    }
 }

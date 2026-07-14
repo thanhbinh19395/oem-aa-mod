@@ -5,10 +5,11 @@
 // aap_service (a separate process) swallows the Android Auto 1.6 navigation
 // frames and relays them RAW (an AaNav16Hdr + the original frame bytes) over an
 // abstract AF_UNIX datagram socket. This thread binds that socket, validates the
-// header, and hands the raw frame to hud_feed_nav16_raw(), which decodes it and
-// renders it through the existing HUD transport. So the 1.6 protocol is parsed
-// in exactly one place (hud_nav16, here in blmjciaapa), reusing the same
-// renderer (glyph map, street fold, lanes) as the 1.5 callback path.
+// header, and hands the raw frame to hud_nav16_feed(), which decodes it and
+// invokes the HUD sink callbacks (registered by hud.cpp) that render it through
+// the existing HUD transport. So the 1.6 protocol is parsed in exactly one place
+// (hud_nav16, here in blmjciaapa), reusing the same renderer (glyph map, street
+// fold, lanes) as the 1.5 callback path.
 //
 // Lifecycle is bracketed by aap_create/destroy_session via hud.cpp, and only
 // armed when use_protocol_v1_6 is set. Fail-safe: any socket error just leaves
@@ -20,6 +21,7 @@
 #include "../log.h"
 #include "hud.h"
 #include "nav16_rx.h"
+#include "hud_nav16.h"
 #include "common/aa_nav16_msg.h"
 
 #include <atomic>
@@ -111,8 +113,8 @@ void *rx_main(void *)
         if (!g_seen.exchange(true, std::memory_order_release)) {
             LOGD("nav16_rx: first 1.6 frame received — 1.5 callback path now suppressed");
         }
-        hud_feed_nav16_raw(reinterpret_cast<const uint8_t *>(buf) + sizeof(AaNav16Hdr),
-                           len);
+        hud_nav16_feed(reinterpret_cast<const uint8_t *>(buf) + sizeof(AaNav16Hdr),
+                       len);
     }
 
     close(g_fd);
@@ -123,11 +125,16 @@ void *rx_main(void *)
 
 } // namespace
 
-void hud_nav16_rx_start(void)
+void hud_nav16_rx_start(HudNav16GuidanceFn on_guidance,
+                        HudNav16PositionFn on_position,
+                        HudNav16StatusFn   on_status)
 {
     if (g_thread_up) {
         return;
     }
+    // Register the decode callbacks before the thread exists (the only feeder),
+    // so the first frame it hands to hud_nav16_feed() already has a destination.
+    hud_nav16_set_sink(on_guidance, on_position, on_status);
     // The previous session may have ended without a clean INACTIVE/STOP
     // (cable pull) — reset the decoder state here, before the rx thread
     // exists, so it can't suppress the new session's first frame. The seen
@@ -143,6 +150,7 @@ void hud_nav16_rx_start(void)
     }
     if (pthread_create(&g_thread, nullptr, rx_main, nullptr) != 0) {
         LOGC("hud_nav16_rx_start: pthread_create failed — no 1.6 HUD this session");
+        hud_nav16_set_sink(nullptr, nullptr, nullptr);   // no feeder will run — drop them
         if (g_stop_fd >= 0) {
             close(g_stop_fd);
             g_stop_fd = -1;
@@ -171,6 +179,7 @@ void hud_nav16_rx_stop(void)
         while (write(g_stop_fd, &one, sizeof(one)) < 0 && errno == EINTR) {}
     }
     pthread_join(g_thread, nullptr);
+    hud_nav16_set_sink(nullptr, nullptr, nullptr);   // joined: no more feed() -> safe to detach
     if (g_stop_fd >= 0) {
         close(g_stop_fd);                     // after join: rx_main can't touch it now
         g_stop_fd = -1;

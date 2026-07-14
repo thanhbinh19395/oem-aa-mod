@@ -23,33 +23,6 @@ struct AaLane {
     uint16_t highlight_mask;
 };
 
-// Encode decoded lanes to the 8-slot HUD lane array, LEFT TO RIGHT. Only
-// marked-vs-unmarked is encoded for a present lane (recommended = highlight_mask
-// != 0); 1 (unmarked) and 22 (marked) are valid on both HUD variants (byte
-// ranges 0-32 and 0-62). The exact per-shape glyph code is TBD on-car.
-//
-// `hidden` (the "no lane in this slot" code) DIFFERS by transport:
-//   - direct VBS_NAVI_SetRecommLaneReq (vbs path): 0xFF hides a slot — confirmed
-//     against the OEM setter + lane_test (AA_NAV16_LANE_HIDDEN).
-//   - GuidanceChangedForHUD signal (svcnavi path): svcjcinavi's handler validates
-//     each lane arg to 0..0x46, so 0xFF is out of range there — pass 0.
-enum {
-    AA_NAV16_LANE_HIDDEN   = 0xFF,   // vbs / SetRecommLaneReq per-slot hide
-    AA_NAV16_LANE_UNMARKED = 1,
-    AA_NAV16_LANE_MARKED   = 22,
-};
-
-inline void aa_nav16_lane_bytes(const AaLane *lanes, uint8_t n,
-                                uint8_t out[8], uint8_t hidden)
-{
-    for (int i = 0; i < 8; ++i) {
-        out[i] = (lanes && i < (int)n)
-                     ? (uint8_t)(lanes[i].highlight_mask ? AA_NAV16_LANE_MARKED
-                                                         : AA_NAV16_LANE_UNMARKED)
-                     : hidden;
-    }
-}
-
 // Decoded NavigationState (the active/first step — the next maneuver).
 struct AaGuidance {
     bool     have_maneuver;
@@ -75,12 +48,6 @@ struct AaPosition {
     char     eta[16];                  // estimated_time_at_arrival, e.g. "21:54"
 };
 
-// Decode the protobuf BODY (AFTER the 2-byte big-endian msgId). *out is zeroed
-// first; returns true on a clean walk (partial/unknown fields tolerated). Fully
-// bounds-checked — safe on truncated/malformed input (runs in a reset_board PID).
-bool hud_nav16_decode_navstate(const uint8_t *proto, int len, AaGuidance *out);
-bool hud_nav16_decode_position (const uint8_t *proto, int len, AaPosition *out);
-
 // Dispatch on a FULL frame (leading 2-byte big-endian msgId): 0x8006 -> *g,
 // 0x8007 -> *p. Returns the msgId (0 if too short). Pass NULL for the unwanted one.
 uint32_t hud_nav16_on_frame(const uint8_t *raw, int size, AaGuidance *g, AaPosition *p);
@@ -103,15 +70,47 @@ int32_t parse_dist_x10(const char *s);
 int hud_nav16_format_guidance(const AaGuidance *g, char *buf, int cap);
 int hud_nav16_format_position(const AaPosition *p, char *buf, int cap);
 
-// Name tables for logging (NULL-safe bounds): type 0..42 / shape 0..9.
-const char *hud_nav16_maneuver_name(uint32_t type);
-const char *hud_nav16_shape_name(int shape);
-
 // Read NavigationStatus (0x8003) field 1 (status enum varint) from a FULL frame
 // (leading 2-byte big-endian msgId). Returns true and sets *status_out if found.
 // Fully bounds-checked (same Pb/rd_tag/rd_varint/skip reader as the other decoders).
 // *status_out is set to -1 (sentinel) on entry; unchanged if the field is absent or
 // the frame is malformed. Safe on any phone-originated input.
 bool hud_nav16_read_status(const uint8_t *raw, int size, int *status_out);
+
+// === Push API: decode a raw frame and deliver to a registered sink ==========
+//
+// hud_nav16 owns ALL Android-Auto msgId dispatch + protobuf decode; the HUD
+// consumer registers callbacks and receives the decoded structs, then does the
+// HUD-domain mapping (glyph / units / change-gate / blank) itself. Keeps the AA
+// protocol knowledge in exactly one translation unit. (The decoder entry points
+// above stay public for the host self-test.)
+
+// NavigationStatus (0x8003) + cluster lifecycle (0x8002 STOP), reported so the
+// consumer can decide blank-vs-keep. hud_nav16 applies no HUD policy — it only
+// reports what arrived.
+struct AaStatus {
+    int  nav_status;    // 0x8003 NavigationStatus enum: 0=UNAVAILABLE, 1=ACTIVE,
+                        // 2=INACTIVE, 3=REROUTING; -1 if absent/malformed, or on
+                        // a cluster STOP (see cluster_stop).
+    bool cluster_stop;  // true iff this was a 0x8002 InstrumentClusterStop.
+};
+
+// Callbacks the consumer registers to receive decoded 1.6 nav. Each fires on the
+// caller's (rx) thread. Any may be NULL to ignore that stream.
+typedef void (*HudNav16GuidanceFn)(const AaGuidance *g);   // 0x8006 NavigationState
+typedef void (*HudNav16PositionFn)(const AaPosition *p);   // 0x8007 CurrentPosition
+typedef void (*HudNav16StatusFn)  (const AaStatus   *s);   // 0x8003 status / 0x8002 stop
+
+// Register the callbacks hud_nav16_feed() delivers to. Call before the rx thread
+// starts (feed is single-threaded w.r.t. this). Pass NULL for any/all to detach.
+void hud_nav16_set_sink(HudNav16GuidanceFn on_guidance,
+                        HudNav16PositionFn on_position,
+                        HudNav16StatusFn   on_status);
+
+// Decode one RAW frame (leading 2-byte big-endian msgId) and invoke the
+// registered sink: 0x8006->on_guidance, 0x8007->on_position, 0x8003/0x8002->
+// on_status. Other ids (cluster START, legacy turn/dist) are ignored. Runs on
+// the rx thread; safe on truncated/malformed input.
+void hud_nav16_feed(const uint8_t *frame, int len);
 
 #endif  // LIBPATCH_BLMJCIAAPA_HUD_HUD_NAV16_H

@@ -144,6 +144,21 @@ inline uint8_t map_distance_unit(uint32_t android_unit)
     }
 }
 
+// === Mazda HUD recommended-lane byte codes ====================
+//
+// Per-slot value in the HUD's 8-lane array. hud.cpp encodes the decoded AA
+// lanes to these before handing them to a transport (Mazda domain, like the
+// glyph/unit maps above). marked/unmarked are shared by both transports; the
+// hidden sentinel is canonical 0 here, so a zero-init / cleared snapshot is
+// "all hidden" for free — the vbs transport remaps 0 -> 0xFF for
+// VBS_NAVI_SetRecommLaneReq, while svcnavi's GuidanceChangedForHUD takes 0
+// as-is (its handler validates each lane arg to 0..0x46).
+enum {
+    HUD_LANE_HIDDEN   = 0,     // no lane in this slot
+    HUD_LANE_UNMARKED = 1,     // a lane, not the recommended one
+    HUD_LANE_MARKED   = 22,    // the recommended lane
+};
+
 // === Turn-icon resolution =====================================
 //
 // Resolve the HUD glyph from the proto turn fields. Pure function of

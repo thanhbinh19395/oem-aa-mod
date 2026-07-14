@@ -7,7 +7,8 @@
 #define LOG_TAG "HUD"
 #include "../log.h"
 #include "hud.h"
-#include "nav16_rx.h"        // hud_nav16_rx_start/stop/seen (receiver lifecycle)
+#include "nav16_rx.h"        // receiver lifecycle/seen + re-exported hud_nav16 API
+                             // (HudNav16Sink, AaGuidance/Position/Status, AaLane, mappers)
 #include "common/config.h"   // libpatch_config::hud_transport()
 
 // HUD transport selection. Two transports send our guidance to the
@@ -25,8 +26,7 @@
 #include "svcnavi_tx.h"
 #include "vbs_tx.h"
 #include "translit.h"   // hud_translit::fold() — precomposed-Latin street-name fold
-#include "hud_nav16.h"  // 1.6 decoder + AaLane + aa_nav16_lane_bytes + aa_to_mazda_unit/parse_dist_x10
-#include "common/aa_nav16_msg.h"   // AA_NAV16_MSG_* — the sender/receiver msgId contract
+#include "hud_nav.h"    // compute_turn_icon() — AA turn fields -> Mazda HUD glyph
 
 #include <stdint.h>
 #include <string.h>
@@ -41,29 +41,62 @@ struct HudTransportOps {
     void (*start)();
     void (*stop)();
     void (*status)(uint32_t status);
-    void (*next_turn)(const char *road, uint32_t side, uint32_t event,
-                      int32_t angle, int32_t number);
-    void (*distance)(int32_t dist_m, int32_t time_s,
-                     int32_t disp_dist, uint32_t disp_unit);
-    void (*guidance_v16)(uint32_t glyph, const char *road, int32_t dist_dec,
-                         uint8_t unit, const AaLane *lanes, uint8_t n);
+    void (*next_turn)(const char *road, uint32_t icon);
+    void (*distance)(int32_t dist_dec, uint8_t dist_unit);
+    void (*lanes)(const AaLane *lanes, uint8_t n);   // encoded per-transport below
 };
 
-// Forward to the vbs transport. Lanes are carried through (the vbs transport
-// holds them); see vbs_tx.cpp for the emit-side OEM-ABI note on the direct frame.
-void vbs_v16_adapter(uint32_t glyph, const char *road, int32_t dist_dec,
-                     uint8_t unit, const AaLane *lanes, uint8_t n)
+// Per-transport next_turn adapters. Today both just forward the resolved glyph +
+// road, but a distinct wrapper per backend gives hud.cpp a seam to encode
+// next_turn differently per transport later (e.g. a road-name transform one
+// backend needs and the other doesn't) without touching the ops-table wiring.
+void svcnavi_next_turn_adapter(const char *road, uint32_t icon)
 {
-    vbs_tx_v16(glyph, road, dist_dec, unit, lanes, n);
+    svcnavi_tx_next_turn(road, icon);
+}
+void vbs_next_turn_adapter(const char *road, uint32_t icon)
+{
+    vbs_tx_next_turn(road, icon);
+}
+
+// Encode the decoded 1.6 lanes to the 8-slot Mazda HUD lane array, LEFT to
+// RIGHT: a present lane is MARKED if any of its arrows is highlighted
+// (recommended), else UNMARKED; absent slots are HIDDEN (canonical 0). (Per-shape
+// glyph detail is TBD on-car.)
+void nav16_encode_lanes(const AaLane *lanes, int n, uint8_t out[HUD_NAV16_MAX_LANES])
+{
+    for (int i = 0; i < HUD_NAV16_MAX_LANES; ++i) {
+        out[i] = (lanes && i < n)
+                     ? (uint8_t)(lanes[i].highlight_mask ? HUD_LANE_MARKED
+                                                         : HUD_LANE_UNMARKED)
+                     : HUD_LANE_HIDDEN;
+    }
+}
+
+// Per-transport lane adapters: encode the decoded AA lanes to the 8-slot Mazda
+// byte array for THIS backend, then hand the bytes to its setter. Same seam as
+// the next_turn adapters — today both encode identically (canonical hidden 0;
+// vbs remaps to 0xFF at its own wire), but each could diverge.
+void svcnavi_lanes_adapter(const AaLane *lanes, uint8_t n)
+{
+    uint8_t lane_bytes[HUD_NAV16_MAX_LANES];
+    nav16_encode_lanes(lanes, n, lane_bytes);
+    svcnavi_tx_lanes(lane_bytes);
+}
+void vbs_lanes_adapter(const AaLane *lanes, uint8_t n)
+{
+    uint8_t lane_bytes[HUD_NAV16_MAX_LANES];
+    nav16_encode_lanes(lanes, n, lane_bytes);
+    vbs_tx_lanes(lane_bytes);
 }
 
 const HudTransportOps kSvcnaviOps = {
     &svcnavi_tx_start, &svcnavi_tx_stop, &svcnavi_tx_status,
-    &svcnavi_tx_next_turn, &svcnavi_tx_distance, &svcnavi_tx_v16,
+    &svcnavi_next_turn_adapter, &svcnavi_tx_distance, &svcnavi_lanes_adapter,
 };
 const HudTransportOps kVbsOps = {
     &vbs_tx_start, &vbs_tx_stop, &vbs_tx_status,
-    &vbs_tx_next_turn, &vbs_tx_distance, &vbs_v16_adapter,
+    &vbs_next_turn_adapter, &vbs_tx_distance, &vbs_lanes_adapter,
 };
 
 // The active backend. Bound once in hud_tx_start() (the first transport
@@ -86,8 +119,13 @@ inline void hud_tx_stop()   { g_tx->stop(); }
 // hud_tx_status is intentionally NOT guarded: the 1.6 CLEAR path calls it.
 inline void hud_tx_status(uint32_t status) { g_tx->status(status); }
 inline void hud_tx_next_turn(const char *road, uint32_t side, uint32_t event,
-                             int32_t angle, int32_t number)
+                             int32_t angle, int32_t /*number*/)
 {
+    // hud.cpp owns the AA turn_event/side/angle -> Mazda glyph mapping now; the
+    // transports just relay the resolved icon + street name (see hud_nav.h).
+    // turn_number is unused (the HUD frame has no maneuver-number field).
+    uint32_t icon = compute_turn_icon(event, side, angle);
+
     // Fold HUD-unrenderable precomposed Latin letters (Latin Extended
     // Additional, U+1E00..U+1EFF) down to their base forms so accented
     // street names show legibly instead of gapping (gated by
@@ -100,30 +138,17 @@ inline void hud_tx_next_turn(const char *road, uint32_t side, uint32_t event,
         strncpy(buf, road, sizeof(buf) - 1);
         buf[sizeof(buf) - 1] = '\0';
         hud_translit::fold(buf);
-        g_tx->next_turn(buf, side, event, angle, number);
+        g_tx->next_turn(buf, icon);
         return;
     }
-    g_tx->next_turn(road, side, event, angle, number);
+    g_tx->next_turn(road, icon);
 }
-inline void hud_tx_distance(int32_t dist_m, int32_t time_s,
-                            int32_t disp_dist, uint32_t disp_unit)
-{ g_tx->distance(dist_m, time_s, disp_dist, disp_unit); }
-
-// GAL 1.6 guidance forwarder. Unlike hud_tx_next_turn, no fold here: the road
-// arrives ALREADY folded — hud_feed_nav16_raw folds once at 0x8006 ingest, so
-// the per-tick distance emits (every 0x8007 on final approach) do zero string
-// work on the rx thread.
-inline void hud_tx_guidance_v16(uint32_t glyph, const char *road, int32_t dist_dec,
-                                uint8_t unit, const AaLane *lanes, uint8_t n)
+inline void hud_tx_distance(int32_t disp_dist, uint32_t disp_unit)
 {
-    // Single-writer guard: 1.5 cb thread owns g_snapshot in v1.5 mode. The rx
-    // thread only runs under v1.6, so this should never fire — log it if it
-    // somehow does (config changed under us) rather than dropping silently.
-    if (!libpatch_config::use_protocol_v1_6()) {
-        LOGV("hud_tx_guidance_v16: dropped — use_protocol_v1_6 not set");
-        return;
-    }
-    g_tx->guidance_v16(glyph, road, dist_dec, unit, lanes, n);
+    // The transports take Mazda-domain distance (value*10) + Mazda unit, so do
+    // the AA-proto conversion here: display_distance is raw_unit*1000 (the HUD
+    // wire wants raw_unit*10) and disp_unit is proto DISPLAY_DISTANCE_UNIT.
+    g_tx->distance(disp_dist / 100, map_distance_unit(disp_unit));
 }
 
 // cb_list shape: 19 word slots, total 76 bytes. The SDK memcpy's
@@ -479,8 +504,7 @@ void our_nav_cb(void *user_ctx, void *hdr36)
     case kTagDistance: {
         const DistanceHdr *d = static_cast<const DistanceHdr *>(hdr36);
         dump_distance(d);
-        hud_tx_distance(d->distance, d->time_until,
-                        d->display_distance, d->display_distance_unit);
+        hud_tx_distance(d->display_distance, d->display_distance_unit);
         break;
     }
     default:
@@ -561,20 +585,21 @@ int32_t quantize_dist_x10(int32_t v, uint8_t mazda_unit)
 }
 
 // Accumulated Mazda-domain guidance: maneuver/road/lanes come from 0x8006,
-// distance from 0x8007, so the two streams are merged here before display. Laid
-// out gap-free (and zero-initialised as a static) so the memcmp change-gate is
-// exact — KEEP IT GAP-FREE if you add a field.
+// distance from 0x8007, so the two streams are merged here before display. The
+// memcmp change-gate below is only a change *detector*, not a correctness
+// mechanism: it returns non-zero whenever a real field differs, so a stray
+// padding byte could at worst cause one extra, harmless HUD re-emit — never a
+// missed change. (In practice it won't even do that: both instances are
+// zero-init statics and nothing writes padding.) So exact/gap-free layout is
+// not required — no manual padding, no size assert.
 struct AaNav16HudState {
     uint32_t glyph;                       // Mazda HUD maneuver glyph (MazdaIcon; 0=blank)
     int32_t  dist_dec;                    // display distance * 10
     uint8_t  dist_unit;                   // Mazda HUD unit 0..5
     uint8_t  n_lanes;                     // 0..HUD_NAV16_MAX_LANES
-    uint8_t  pad0, pad1;                  // keep gap-free for the memcmp change-gate
     char     road[64];                    // street name (UTF-8, folded at 0x8006 ingest)
     AaLane   lanes[HUD_NAV16_MAX_LANES];
 };
-static_assert(sizeof(AaNav16HudState) == 108,
-              "AaNav16HudState must stay gap-free (memcmp change-gate)");
 
 static AaNav16HudState g_nav16_acc;   // merged guidance (zero-init: gap-free memcmp)
 static AaNav16HudState g_nav16_last;  // last frame fed to the transport (change-gate)
@@ -593,99 +618,103 @@ void hud_feed_nav16_reset(void)
     LOGV("nav: accumulator + change-gate reset");
 }
 
-// Render a RAW GAL 1.6 nav frame relayed from the aap_service shim (runs on the
-// nav16 receiver thread). This is the SINGLE place that decodes the AA protocol
-// and maps it to the Mazda HUD domain: 0x8006 -> maneuver/road/lanes, 0x8007 ->
-// distance, 0x8003 -> lifecycle, 0x8002 -> blank. Decoded guidance goes through
-// the shared transport (glyph + fold + lanes), reusing the existing renderer.
-void hud_feed_nav16_raw(const uint8_t *frame, int len)
+// Change-gate emit: feed the transport only when the displayed frame changed.
+// The svcnavi transport has no consumer-side diff, so this is what prevents a
+// duplicate/continuous-tick flood on the HUD D-Bus. Shared by the guidance and
+// position callbacks (both mutate g_nav16_acc, then ask to emit).
+static void nav16_emit_if_changed()
 {
-    if (!frame || len < 2) return;
+    AaNav16HudState &acc = g_nav16_acc;
+    if (g_nav16_have_last && memcmp(&acc, &g_nav16_last, sizeof(acc)) == 0) return;
+    // acc holds Mazda-domain values (resolved glyph, folded road, value*10
+    // distance in the Mazda unit) plus the decoded lanes; the per-transport lane
+    // adapter encodes them to HUD bytes. The rx thread is the sole writer under
+    // v1.6, so the transport's snapshot merge is race-free.
+    g_tx->next_turn(acc.road, acc.glyph);
+    g_tx->distance(acc.dist_dec, acc.dist_unit);
+    g_tx->lanes(acc.lanes, acc.n_lanes);
+    g_nav16_last      = acc;
+    g_nav16_have_last = true;
+}
 
-    AaNav16HudState &acc  = g_nav16_acc;
-    AaNav16HudState &last = g_nav16_last;
-    bool &have_last       = g_nav16_have_last;
+// hud_nav16 sink callbacks (run on the rx thread). hud_nav16 has already decoded
+// the AA protocol; these only map the decoded structs to the Mazda HUD domain
+// (glyph, unit, fold, change-gate) and drive the shared transport.
 
-    // Change-gate: only feed the transport when the displayed frame changed. The
-    // svcnavi transport has no consumer-side diff, so this is what prevents a
-    // duplicate/continuous-tick flood on the HUD D-Bus.
-    auto emit_if_changed = [&]() {
-        if (have_last && memcmp(&acc, &last, sizeof(acc)) == 0) return;
-        hud_tx_guidance_v16(acc.glyph, acc.road, acc.dist_dec, acc.dist_unit,
-                            acc.lanes, acc.n_lanes);
-        last = acc;
-        have_last = true;
-    };
-
-    const uint32_t id = ((uint32_t)frame[0] << 8) | frame[1];
-
-    if (id == AA_NAV16_MSG_NAV_STATE) {  // maneuver + road + lanes
-        AaGuidance g;
-        hud_nav16_on_frame(frame, len, &g, nullptr);
+// 0x8006 NavigationState -> maneuver glyph + road + lanes.
+static void nav16_on_guidance(const AaGuidance *g)
+{
 #if LOG_LEVEL <= LOG_LEVEL_VERBOSE
-        char line[320]; hud_nav16_format_guidance(&g, line, sizeof(line)); LOGV("%s", line);
+    char line[320]; hud_nav16_format_guidance(g, line, sizeof(line)); LOGV("%s", line);
 #endif
-        uint32_t glyph = hud_nav16_glyph(&g);
-        if (glyph > 60) glyph = 0;                         // clamp untrusted glyph
-        // Fold once here, at road ingest, not in the per-emit forwarder —
-        // distance ticks re-emit the road far more often than 0x8006 changes
-        // it. Folding g.road (our stack copy) BEFORE the strncpy matters: the
-        // fold shrinks in place without clearing its residue, and the gap-free
-        // memcmp change-gate needs acc.road's tail zero-padded — which strncpy
-        // does when the source is already its final length.
-        if (libpatch_config::hud_fold_latin()) {
-            hud_translit::fold(g.road);
-        }
-        // A different maneuver means the held distance belongs to the PREVIOUS
-        // step (distance only ever arrives on 0x8007) — invalidate it so the
-        // new arrow is never shown against the old step's ticking-down figure.
-        // 0 + unit 0 ("none") is the same not-yet-any-distance state every
-        // session starts in; the real figure lands with the next 0x8007 (~1 s).
-        if (glyph != acc.glyph || strcmp(g.road, acc.road) != 0) {
-            acc.dist_dec  = 0;
-            acc.dist_unit = 0;
-        }
-        acc.glyph = glyph;
-        strncpy(acc.road, g.road, sizeof(acc.road) - 1);
-        acc.road[sizeof(acc.road) - 1] = '\0';
-        int nl = g.n_lanes;
-        if (nl < 0) nl = 0;
-        if (nl > HUD_NAV16_MAX_LANES) nl = HUD_NAV16_MAX_LANES;
-        acc.n_lanes = (uint8_t)nl;
-        for (int i = 0; i < HUD_NAV16_MAX_LANES; ++i) {
-            acc.lanes[i].present_mask   = (i < nl) ? g.lanes[i].present_mask   : 0;
-            acc.lanes[i].highlight_mask = (i < nl) ? g.lanes[i].highlight_mask : 0;
-        }
-        emit_if_changed();
-    } else if (id == AA_NAV16_MSG_POSITION) {      // distance to next maneuver
-        AaPosition p;
-        hud_nav16_on_frame(frame, len, nullptr, &p);
+    AaNav16HudState &acc = g_nav16_acc;
+
+    uint32_t glyph = hud_nav16_glyph(g);
+    if (glyph > 60) glyph = 0;                          // clamp untrusted glyph
+
+    // Fold once here, at road ingest, not in the per-emit forwarder — distance
+    // ticks re-emit the road far more often than 0x8006 changes it. Fold a local
+    // copy (g is const, decoder-owned); strncpy into acc.road zero-pads the tail
+    // so a shorter road leaves no stale bytes for the memcmp change-gate to trip
+    // on (at worst a harmless extra emit, but free to avoid).
+    char road[sizeof(acc.road)];
+    strncpy(road, g->road, sizeof(road) - 1);
+    road[sizeof(road) - 1] = '\0';
+    if (libpatch_config::hud_fold_latin()) hud_translit::fold(road);
+
+    // A different maneuver means the held distance belongs to the PREVIOUS step
+    // (distance only ever arrives on 0x8007) — invalidate it so the new arrow is
+    // never shown against the old step's ticking-down figure. 0 + unit 0 ("none")
+    // is the same not-yet-any-distance state every session starts in; the real
+    // figure lands with the next 0x8007 (~1 s).
+    if (glyph != acc.glyph || strcmp(road, acc.road) != 0) {
+        acc.dist_dec  = 0;
+        acc.dist_unit = 0;
+    }
+    acc.glyph = glyph;
+    strncpy(acc.road, road, sizeof(acc.road) - 1);
+    acc.road[sizeof(acc.road) - 1] = '\0';
+    int nl = g->n_lanes;
+    if (nl < 0) nl = 0;
+    if (nl > HUD_NAV16_MAX_LANES) nl = HUD_NAV16_MAX_LANES;
+    acc.n_lanes = (uint8_t)nl;
+    for (int i = 0; i < HUD_NAV16_MAX_LANES; ++i) {
+        acc.lanes[i].present_mask   = (i < nl) ? g->lanes[i].present_mask   : 0;
+        acc.lanes[i].highlight_mask = (i < nl) ? g->lanes[i].highlight_mask : 0;
+    }
+    nav16_emit_if_changed();
+}
+
+// 0x8007 NavigationCurrentPosition -> distance to next maneuver.
+static void nav16_on_position(const AaPosition *p)
+{
 #if LOG_LEVEL <= LOG_LEVEL_VERBOSE
-        char line[320]; hud_nav16_format_position(&p, line, sizeof(line)); LOGV("%s", line);
+    char line[320]; hud_nav16_format_position(p, line, sizeof(line)); LOGV("%s", line);
 #endif
-        if (p.have_step) {
-            uint8_t unit = aa_to_mazda_unit(p.step_units);
-            if (unit > 5) unit = 0;                        // clamp untrusted unit
-            acc.dist_unit = unit;
-            acc.dist_dec  = quantize_dist_x10(parse_dist_x10(p.step_display), unit);
-            emit_if_changed();
-        }
-    } else if (id == AA_NAV16_MSG_STATUS) {        // lifecycle
-        int status = -1;
-        hud_nav16_read_status(frame, len, &status);
-        if (status == NAV_INACTIVE || status == NAV_UNAVAILABLE) {
-            hud_tx_status(2);                              // guidance ended -> blank
-            hud_feed_nav16_reset();
-            LOGD("nav: NavigationStatus=%d -> HUD cleared", status);
-        } else {
-            LOGV("nav: NavigationStatus=%d (active/rerouting) -> HUD kept", status);
-        }
-    } else if (id == AA_NAV16_MSG_CLUSTER_STOP) {
-        hud_tx_status(2);
+    if (!p->have_step) return;
+    uint8_t unit = aa_to_mazda_unit(p->step_units);
+    if (unit > 5) unit = 0;                             // clamp untrusted unit
+    g_nav16_acc.dist_unit = unit;
+    g_nav16_acc.dist_dec  = quantize_dist_x10(parse_dist_x10(p->step_display), unit);
+    nav16_emit_if_changed();
+}
+
+// 0x8003 NavigationStatus / 0x8002 cluster STOP -> lifecycle: blank or keep.
+static void nav16_on_status(const AaStatus *s)
+{
+    if (s->cluster_stop) {
+        hud_tx_status(2);                               // guidance ended -> blank
         hud_feed_nav16_reset();
         LOGD("nav: cluster STOP (0x8002) -> HUD cleared");
+        return;
     }
-    // CLUSTER_START / NEXT_TURN / NEXT_TURN_DIST: nothing to render
+    if (s->nav_status == NAV_INACTIVE || s->nav_status == NAV_UNAVAILABLE) {
+        hud_tx_status(2);                               // guidance ended -> blank
+        hud_feed_nav16_reset();
+        LOGD("nav: NavigationStatus=%d -> HUD cleared", s->nav_status);
+    } else {
+        LOGV("nav: NavigationStatus=%d (active/rerouting) -> HUD kept", s->nav_status);
+    }
 }
 
 void hud_post_aap_create_session(void)
@@ -693,15 +722,17 @@ void hud_post_aap_create_session(void)
     hud_tx_start();
     // Start the GAL 1.6 receiver only when that protocol is enabled — otherwise
     // the aap_service shim never sends and the socket would idle for nothing.
+    // rx_start registers our decode callbacks before spawning the thread, so the
+    // first frame it feeds already has a destination.
     if (libpatch_config::use_protocol_v1_6()) {
-        hud_nav16_rx_start();
+        hud_nav16_rx_start(&nav16_on_guidance, &nav16_on_position, &nav16_on_status);
     }
 }
 
 void hud_pre_aap_destroy_session(void)
 {
     if (libpatch_config::use_protocol_v1_6()) {
-        hud_nav16_rx_stop();
+        hud_nav16_rx_stop();          // joins the rx thread + detaches the sink
     }
     hud_tx_stop();
 }

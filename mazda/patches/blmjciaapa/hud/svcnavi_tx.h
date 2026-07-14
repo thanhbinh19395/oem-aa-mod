@@ -47,7 +47,6 @@
 #define LIBPATCH_BLMJCIAAPA_HUD_SVCNAVI_TX_H
 
 #include <stdint.h>
-#include "hud_nav16.h"   // AaLane, aa_nav16_lane_bytes, AA_NAV16_LANE_*
 
 // HUD output lifecycle. svcnavi_tx_start opens the OEM service-bus
 // connection (libjcidbus, exit-on-disconnect disabled) on a
@@ -62,38 +61,20 @@ void svcnavi_tx_stop(void);
 // blanking signal so svcjcinavi clears the HUD.
 void svcnavi_tx_status(uint32_t status);
 
-// 0x501 NAVTurnMessage. Identical contract to vbs_tx_next_turn:
-//   turn_side  - 1=LEFT, 2=RIGHT, 3=UNSPECIFIED (proto TURN_SIDE)
-//   turn_event - sparse 0..19  (proto TURN_EVENT)
-//   turn_angle - degrees, signed
-//   turn_number - maneuver / exit number
-// road_name is NOT held past return (snapshot-copied inline).
-void svcnavi_tx_next_turn(const char *road_name,
-                          uint32_t    turn_side,
-                          uint32_t    turn_event,
-                          int32_t     turn_angle,
-                          int32_t     turn_number);
+// 0x501 NAVTurnMessage. Identical contract to vbs_tx_next_turn: `dir_icon` is
+// the resolved Mazda HUD glyph (hud.cpp maps the AA turn fields via
+// compute_turn_icon). road_name is NOT held past return (snapshot-copied inline).
+void svcnavi_tx_next_turn(const char *road_name, uint32_t dir_icon);
 
-// 0x502 NAVDistanceMessage. Identical contract to vbs_tx_distance:
-//   display_distance - "raw unit * 1000" int32 from the SDK header;
-//                      converted to the HUD's "raw unit * 10" here.
-//   display_distance_unit - proto DISPLAY_DISTANCE_UNIT, 1..6.
-void svcnavi_tx_distance(int32_t  distance_meters,
-                         int32_t  time_until_seconds,
-                         int32_t  display_distance,
-                         uint32_t display_distance_unit);
+// Distance to the next maneuver, in Mazda-HUD form:
+//   dist_dec  - display distance * 10 (one decimal)
+//   dist_unit - Mazda HUD unit (1=m, 2=mi, 3=km, 4=yd, 5=ft; 0=none)
+// hud.cpp maps the AA proto values to this form before calling.
+void svcnavi_tx_distance(int32_t dist_dec, uint8_t dist_unit);
 
-// Android Auto GAL 1.6 path (fed from the aap_service shim via blmjciaapa's
-// nav16 receiver). The maneuver glyph is ALREADY the Mazda HUD code, distance
-// is already value*10 in the Mazda unit, and lanes are carried through to
-// lane0..7 of GuidanceChangedForHUD. One call sets the whole frame.
-//   glyph     - Mazda HUD maneuver code (MazdaIcon; 0=blank)
-//   road      - street name (already latin-folded by the caller)
-//   dist_dec  - display distance * 10
-//   dist_unit - Mazda HUD unit (1=m,2=mi,3=km,4=yd,5=ft; 0=none)
-//   lanes/n   - up to 8 decoded lanes (may be null / 0)
-void svcnavi_tx_v16(uint32_t glyph, const char *road,
-                    int32_t dist_dec, uint8_t dist_unit,
-                    const AaLane *lanes, uint8_t n_lanes);
-
+// Recommended-lane array (GAL 1.6 only; the 1.5 path never sends lanes). Exactly
+// 8 Mazda lane bytes, LEFT to RIGHT (0=hidden, 1=unmarked, 22=marked; hud.cpp
+// encodes them), forwarded to lane0..7 of GuidanceChangedForHUD.
+void svcnavi_tx_lanes(const uint8_t *lanes);
+  
 #endif // LIBPATCH_BLMJCIAAPA_HUD_SVCNAVI_TX_H
