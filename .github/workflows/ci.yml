@@ -1,9 +1,9 @@
 name: CI
 
-# Compile-only check to catch breakage before a release tag is cut.
-# Builds both configs and packages the same two tarballs the release
-# workflow ships (versioned by short SHA instead of a tag), so what CI
-# produces matches a real release.
+# Catches breakage before a release tag is cut: runs the host self-tests
+# (test/nav16_test), then builds both configs and packages the same two
+# tarballs the release workflow ships (versioned by short SHA instead of
+# a tag), so what CI produces matches a real release.
 # Tag pushes are intentionally NOT built here — release.yml owns those.
 on:
   # Manual on-demand build: lets a maintainer compile the .so files and
@@ -26,6 +26,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Host self-tests — pure g++ builds that run on the runner itself, so
+  # this job needs no cross toolchain and reports independently of the
+  # (slower) ARM build job. Only nav16_test qualifies: gsi_test/lane_test
+  # are on-device ARM tools (lane_test also needs a local-only dbus header).
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build nav16_test (host g++)
+        run: make -C test nav16_test
+
+      - name: Run nav16_test
+        run: ./test/build/nav16_test
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20

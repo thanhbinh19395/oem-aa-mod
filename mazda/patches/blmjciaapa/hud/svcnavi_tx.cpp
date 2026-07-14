@@ -58,22 +58,19 @@ constexpr const char *kSignalMember = "GuidanceChangedForHUD";
 // patch keys on the exact same value. On the GuidanceChangedForHUD
 // wire the speedLimit arg is int32; 0xFFFF round-trips unchanged.
 
-// The HUD turn-icon enum, kTurnIcons table, roundabout_icon(),
-// map_distance_unit(), and compute_turn_icon() are shared with the
-// vbs transport — see hud_nav.h.
+// map_distance_unit() (distance-unit enum) comes from hud_nav.h, shared with
+// the vbs transport. The turn-icon mapping (kTurnIcons / compute_turn_icon) now
+// lives in hud.cpp — this transport receives an already-resolved glyph.
 
 // === Shared snapshot (seqlock-protected) ======================
 // Single producer (SDK cb), single consumer (sender thread). Same
 // pattern as vbs_tx.cpp.
 struct NaviSnapshot {
     char     road_name[64];
-    uint32_t turn_side;
-    uint32_t turn_event;
-    int32_t  turn_angle;
-    int32_t  turn_number;
+    uint32_t dir_icon;       // Mazda HUD maneuver glyph (resolved by hud.cpp)
     int32_t  distance_dec;   // value * 10
     uint8_t  distance_unit;  // mapped to Mazda enum
-    int32_t  time_until;
+    uint8_t  lanes[8];       // Mazda lane bytes: 0=hidden, 1=unmarked, 22=marked
 };
 
 NaviSnapshot            g_snapshot = {};
@@ -101,7 +98,8 @@ bool append_i32(DBusMessageIter *iter, int32_t value)
 // way the NNG engine emits it (libjcidbus's signal_send would reject
 // a signal we don't serve).
 void emit_guidance(uint32_t dir_icon, int32_t maneuver_dist,
-                   int32_t dist_unit, const char *street)
+                   int32_t dist_unit, const char *street,
+                   const uint8_t *lanes)
 {
     void *msg = dbus_message_new_signal(kSignalPath, kSignalIface, kSignalMember);
     if (msg == nullptr) {
@@ -120,8 +118,11 @@ void emit_guidance(uint32_t dir_icon, int32_t maneuver_dist,
     ok = ok && (dbus_message_iter_append_basic(&it, DBUS_TYPE_STRING, &s) != 0);
     ok = ok && append_i32(&it, kAapSpeedSentinel); // speedLimit
     ok = ok && append_i32(&it, 0);                 // speedUnit
+    // lane0..7: the Mazda lane bytes verbatim. Our canonical hidden code is 0,
+    // which is exactly what GuidanceChangedForHUD wants for an empty slot (its
+    // handler validates each lane arg to 0..0x46), so no remap is needed.
     for (int i = 0; i < 8 && ok; ++i) {
-        ok = append_i32(&it, 0);                   // lane0..7
+        ok = append_i32(&it, static_cast<int32_t>(lanes ? lanes[i] : 0));
     }
     if (!ok) {
         LOGE("svcnavi sender: marshalling GuidanceChangedForHUD failed (OOM)");
@@ -152,12 +153,12 @@ void emit_guidance(uint32_t dir_icon, int32_t maneuver_dist,
 // frame was dropped.
 void send_one(const NaviSnapshot &cur)
 {
-    uint32_t icon = compute_turn_icon(cur.turn_event, cur.turn_side, cur.turn_angle);
-
-    emit_guidance(icon,
+    // hud.cpp already resolved the glyph and encoded the lanes; emit verbatim.
+    emit_guidance(cur.dir_icon,
                   cur.distance_dec,
                   cur.distance_unit,
-                  cur.road_name);
+                  cur.road_name,
+                  cur.lanes);
 }
 
 // Bring up the service-bus connection on the sender thread. Returns
@@ -211,8 +212,8 @@ void sender_teardown()
 
     // Emit a zeroed guidance frame so svcjcinavi blanks the HUD
     // instead of holding our last maneuver. dirIcon 0, dist 0, empty
-    // street; sentinel speed still marks it as ours.
-    emit_guidance(0, 0, 0, "");
+    // street, no lanes; sentinel speed still marks it as ours.
+    emit_guidance(0, 0, 0, "", nullptr);
     LOGD("svcnavi sender: sent blanking GuidanceChangedForHUD");
 
     // Private connections must be closed before the final unref.
@@ -341,11 +342,7 @@ void svcnavi_tx_status(uint32_t status)
     }
 }
 
-void svcnavi_tx_next_turn(const char *road_name,
-                          uint32_t    turn_side,
-                          uint32_t    turn_event,
-                          int32_t     turn_angle,
-                          int32_t     turn_number)
+void svcnavi_tx_next_turn(const char *road_name, uint32_t dir_icon)
 {
     if (!g_active.load(std::memory_order_relaxed)) {
         note_inactive_drop("next_turn (0x501)");
@@ -360,17 +357,13 @@ void svcnavi_tx_next_turn(const char *road_name,
     } else {
         g_snapshot.road_name[0] = '\0';
     }
-    g_snapshot.turn_side   = turn_side;
-    g_snapshot.turn_event  = turn_event;
-    g_snapshot.turn_angle  = turn_angle;
-    g_snapshot.turn_number = turn_number;
+    // Relay: hud.cpp already resolved the Mazda glyph. The 1.5 path carries no
+    // lanes (the snapshot's lane bytes default to all-hidden).
+    g_snapshot.dir_icon = dir_icon;
     seqlock_end();
 }
 
-void svcnavi_tx_distance(int32_t  /*distance_meters*/,
-                         int32_t  time_until_seconds,
-                         int32_t  display_distance,
-                         uint32_t display_distance_unit)
+void svcnavi_tx_distance(int32_t dist_dec, uint8_t dist_unit)
 {
     if (!g_active.load(std::memory_order_relaxed)) {
         note_inactive_drop("distance (0x502)");
@@ -378,8 +371,23 @@ void svcnavi_tx_distance(int32_t  /*distance_meters*/,
     }
 
     seqlock_begin();
-    g_snapshot.distance_dec  = display_distance / 100;  // *1000 -> *10
-    g_snapshot.distance_unit = map_distance_unit(display_distance_unit);
-    g_snapshot.time_until    = time_until_seconds;
+    g_snapshot.distance_dec  = dist_dec;
+    g_snapshot.distance_unit = dist_unit;
+    seqlock_end();
+}
+
+void svcnavi_tx_lanes(const uint8_t *lanes)
+{
+    if (!g_active.load(std::memory_order_relaxed)) {
+        note_inactive_drop("lanes");
+        return;
+    }
+
+    seqlock_begin();
+    if (lanes) {
+        std::memcpy(g_snapshot.lanes, lanes, sizeof(g_snapshot.lanes));
+    } else {
+        std::memset(g_snapshot.lanes, HUD_LANE_HIDDEN, sizeof(g_snapshot.lanes));
+    }
     seqlock_end();
 }

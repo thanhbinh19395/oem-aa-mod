@@ -66,9 +66,9 @@ namespace {
 // oem/libjcivbsnaviclient.{h,cpp}.
 constexpr const char *kBusName = "com.jci.aapa.hud";
 
-// The HUD turn-icon enum, kTurnIcons table, roundabout_icon(),
-// map_distance_unit(), and compute_turn_icon() are shared with the
-// svcnavi transport — see hud_nav.h.
+// map_distance_unit() (distance-unit enum) comes from hud_nav.h, shared with
+// the svcnavi transport. The turn-icon mapping (kTurnIcons / compute_turn_icon)
+// now lives in hud.cpp — this transport receives an already-resolved glyph.
 
 // === Shared snapshot (seqlock-protected) ======================
 //
@@ -78,13 +78,10 @@ constexpr const char *kBusName = "com.jci.aapa.hud";
 // readers; readers retry on torn snapshots.
 struct NaviSnapshot {
     char     road_name[64];      // NUL-terminated UTF-8
-    uint32_t turn_side;          // proto TURN_SIDE: 1=L, 2=R, 3=U
-    uint32_t turn_event;         // proto TURN_EVENT: 0..19 sparse
-    int32_t  turn_angle;         // degrees, signed
-    int32_t  turn_number;        // maneuver / exit number
+    uint32_t dir_icon;           // Mazda HUD maneuver glyph (resolved by hud.cpp)
     int32_t  distance_dec;       // value * 10 (one decimal place)
     uint8_t  distance_unit;      // ALREADY mapped to Mazda enum
-    int32_t  time_until;         // seconds — ETA to next maneuver
+    uint8_t  lanes[8];           // Mazda lane bytes: 0=hidden, 1=unmarked, 22=marked
 };
 
 NaviSnapshot           g_snapshot   = {};
@@ -160,20 +157,25 @@ void send_one(const NaviSnapshot &cur,
     // re-latches the Msg2 street page) on a new *maneuver instance* —
     // i.e. when the maneuver icon changes OR the street name changes —
     // not on distance/speed ticks. Mirror that: a new road name or a
-    // new resolved turn-icon both start a new instance.
+    // new maneuver glyph both start a new instance. hud.cpp already
+    // resolved the glyph, so the diff is a plain field compare.
+    uint32_t cur_icon  = cur.dir_icon;
+    uint32_t prev_icon = prev.dir_icon;
+
     bool event_changed = (std::strncmp(cur.road_name, prev.road_name,
                                        sizeof(cur.road_name)) != 0) ||
-                         (compute_turn_icon(cur.turn_event, cur.turn_side, cur.turn_angle) !=
-                          compute_turn_icon(prev.turn_event, prev.turn_side, prev.turn_angle));
+                         (cur_icon != prev_icon);
     bool distance_changed = event_changed ||
                             cur.distance_dec  != prev.distance_dec  ||
-                            cur.distance_unit != prev.distance_unit ||
-                            cur.time_until    != prev.time_until    ||
-                            cur.turn_angle    != prev.turn_angle    ||
-                            cur.turn_side     != prev.turn_side     ||
-                            cur.turn_event    != prev.turn_event;
+                            cur.distance_unit != prev.distance_unit;
 
-    if (!event_changed && !distance_changed) {
+    // Lanes ride a SEPARATE OEM method (SetRecommLaneReq, see below). The
+    // snapshot already holds Mazda lane bytes (hud.cpp encoded them; 0=hidden),
+    // so just diff the two frames (the 1.5 path never sets lanes -> both
+    // all-hidden -> never sent).
+    bool lanes_changed = std::memcmp(cur.lanes, prev.lanes, sizeof(cur.lanes)) != 0;
+
+    if (!event_changed && !distance_changed && !lanes_changed) {
         LOGV("hud_send: snapshot unchanged vs previous — no HUD frame sent");
         return;
     }
@@ -188,51 +190,45 @@ void send_one(const NaviSnapshot &cur,
     VbsNaviHudMsg2    msg2 = {};
     std::string       road;
 
-    if (event_changed) {
-        // Per reference: bump 1..7 cyclically. The HUD treats a
-        // sync_bit change as a hint to refresh the street-name page
-        // even if the underlying string is identical.
+    // A lane array carries no sync of its own — the HUD pairs it with the
+    // maneuver + street frames of the SAME sync generation. So a lane change
+    // starts a new generation just like a maneuver change, and whenever lanes
+    // are sent we re-send the maneuver + street frames carrying that same bumped
+    // sync (this is what the OEM / lane_test do: all three per generation). A
+    // distance-only tick stays in the current generation (no bump, no lanes).
+    bool send_msg2  = event_changed || lanes_changed;   // street strip (carries the sync)
+    bool send_disp  = distance_changed || send_msg2;     // maneuver/distance frame
+    // Re-send lanes with a new sync generation only when there is a lane to
+    // show — an all-hidden array has nothing to pair with the generation, and
+    // shown->hidden transitions are already covered by lanes_changed.
+    bool cur_lanes_visible = false;
+    for (size_t i = 0; i < sizeof(cur.lanes); ++i) {
+        if (cur.lanes[i] != HUD_LANE_HIDDEN) { cur_lanes_visible = true; break; }
+    }
+    bool send_lanes = lanes_changed || (send_msg2 && cur_lanes_visible);
+
+    if (send_msg2) {
+        // Bump 1..7 cyclically — the HUD treats a new sync_bit as the start of a
+        // new maneuver/street/lane generation.
         sync_bit = static_cast<uint8_t>((sync_bit % 7) + 1);
         road = cur.road_name;
         msg2.guidancePointName = road.c_str();
         msg2.syncBit           = sync_bit;
     }
 
-    if (distance_changed) {
-        uint32_t icon = compute_turn_icon(cur.turn_event, cur.turn_side, cur.turn_angle);
-
-#ifdef DEBUG
-        // Debug aid: when our mapping produced no glyph for this
-        // (turn_event, turn_side) pair, hijack the street-name strip
-        // to show the raw codes so an observer on the HUD can record
-        // them and extend the table later. Stripped in release.
-        char dbg_label[33];
-        if (icon == 0) {
-            snprintf(dbg_label, sizeof(dbg_label),
-                     "EV=%u S=%u A=%d",
-                          static_cast<unsigned>(cur.turn_event),
-                          static_cast<unsigned>(cur.turn_side),
-                          static_cast<int>(cur.turn_angle));
-            if (!event_changed) {
-                sync_bit = static_cast<uint8_t>((sync_bit % 7) + 1);
-            }
-            road = dbg_label;
-            msg2.guidancePointName = road.c_str();
-            msg2.syncBit           = sync_bit;
-            icon = MazdaIcon::HUD_EMPTY;
-            event_changed = true;   // force Msg2 send below
-        }
-#endif
-
-        disp.nextManeuverInfo  = icon;
+    if (send_disp) {
+        disp.nextManeuverInfo  = cur_icon;
         disp.distanceValue     = static_cast<uint16_t>(cur.distance_dec);
         disp.distanceUnit      = cur.distance_unit;
         disp.displaySpeedLimit = 0;     // speed limit — unused here
         disp.displaySpeedUnit  = 0;     // speed units — unused here
         disp.text_ID3          = sync_bit;
+        // Lanes are NOT part of this uqyqyy frame — they go on their own OEM
+        // method, VBS_NAVI_SetRecommLaneReq ((ay)), sent below in the same sync
+        // generation.
     }
 
-    if (distance_changed) {
+    if (send_disp) {
         LOGV("hud_send: SetHUDDisplayMsgReq icon=%u dist=%u unit=%u sync=%u",
              static_cast<unsigned>(disp.nextManeuverInfo),
              static_cast<unsigned>(disp.distanceValue),
@@ -243,12 +239,35 @@ void send_one(const NaviSnapshot &cur,
             LOGE("hud_send: SetHUDDisplayMsgReq failed rc=%d", rc);
         }
     }
-    if (event_changed) {
+    if (send_msg2) {
         LOGV("hud_send: SetHUD_Display_Msg2 road=\"%s\" sync=%u",
              road.c_str(), static_cast<unsigned>(msg2.syncBit));
         int rc = VBS_NAVI_TMC_SetHUD_Display_Msg2(g_conn, &msg2, nullptr, nullptr, nullptr);
         if (rc != 0) {
             LOGE("hud_send: SetHUD_Display_Msg2 failed rc=%d", rc);
+        }
+    }
+    if (send_lanes) {
+        // Same sync generation as the disp/msg2 just sent (send_msg2 is forced
+        // true whenever lanes go out, so sync was bumped above). The HUD ties the
+        // lane array to that generation. SetRecommLaneReq hides a slot with 0xFF,
+        // so remap our canonical hidden (0) to it; the marked/unmarked codes go on
+        // the wire unchanged. The OEM setter dereferences both middle args (see
+        // libjcivbsnaviclient.h), so it gets pointers to the data pointer and the
+        // count.
+        uint8_t wire[8];
+        for (int i = 0; i < 8; ++i)
+            wire[i] = (cur.lanes[i] == HUD_LANE_HIDDEN) ? 0xFF : cur.lanes[i];
+        const uint8_t *lane_data  = wire;
+        const uint32_t lane_count = sizeof(wire);
+        int rc = VBS_NAVI_SetRecommLaneReq(g_conn, &lane_data, &lane_count,
+                                           nullptr, nullptr);
+        LOGV("hud_send: SetRecommLaneReq sync=%u [%u %u %u %u %u %u %u %u] rc=%d",
+             static_cast<unsigned>(sync_bit),
+             wire[0], wire[1], wire[2], wire[3],
+             wire[4], wire[5], wire[6], wire[7], rc);
+        if (rc != 0) {
+            LOGE("hud_send: SetRecommLaneReq failed rc=%d", rc);
         }
     }
 }
@@ -331,7 +350,17 @@ void sender_teardown()
         } else {
             LOGD("hud sender: sent HUD clear frame");
         }
-        // The clear frame is queued on the libjcidbus worker; give it
+        // Hide any lanes a 1.6 session left on the HUD (all slots hidden). 0xFF
+        // is SetRecommLaneReq's per-slot hide code.
+        {
+            uint8_t clear_lanes[8];
+            std::memset(clear_lanes, 0xFF, sizeof(clear_lanes));
+            const uint8_t *lane_data  = clear_lanes;
+            const uint32_t lane_count = sizeof(clear_lanes);
+            VBS_NAVI_SetRecommLaneReq(g_conn, &lane_data, &lane_count,
+                                      nullptr, nullptr);
+        }
+        // The frames are queued on the libjcidbus worker; give them
         // a brief moment to flush before we stop the worker below.
         usleep(50 * 1000);
     }
@@ -508,11 +537,7 @@ void vbs_tx_status(uint32_t status)
     }
 }
 
-void vbs_tx_next_turn(const char *road_name,
-                      uint32_t    turn_side,
-                      uint32_t    turn_event,
-                      int32_t     turn_angle,
-                      int32_t     turn_number)
+void vbs_tx_next_turn(const char *road_name, uint32_t dir_icon)
 {
     if (!g_active.load(std::memory_order_relaxed)) {
         note_inactive_drop("next_turn (0x501)");
@@ -527,17 +552,13 @@ void vbs_tx_next_turn(const char *road_name,
     } else {
         g_snapshot.road_name[0] = '\0';
     }
-    g_snapshot.turn_side   = turn_side;
-    g_snapshot.turn_event  = turn_event;
-    g_snapshot.turn_angle  = turn_angle;
-    g_snapshot.turn_number = turn_number;
+    // Relay: hud.cpp already resolved the Mazda glyph. The 1.5 path carries no
+    // lanes (the snapshot's lane bytes default to all-hidden).
+    g_snapshot.dir_icon = dir_icon;
     seqlock_end();
 }
 
-void vbs_tx_distance(int32_t  /*distance_meters*/,
-                     int32_t  time_until_seconds,
-                     int32_t  display_distance,
-                     uint32_t display_distance_unit)
+void vbs_tx_distance(int32_t dist_dec, uint8_t dist_unit)
 {
     if (!g_active.load(std::memory_order_relaxed)) {
         note_inactive_drop("distance (0x502)");
@@ -545,9 +566,23 @@ void vbs_tx_distance(int32_t  /*distance_meters*/,
     }
 
     seqlock_begin();
-    // raw_unit * 1000 (proto) → raw_unit * 10 (HUD wire).
-    g_snapshot.distance_dec  = display_distance / 100;
-    g_snapshot.distance_unit = map_distance_unit(display_distance_unit);
-    g_snapshot.time_until    = time_until_seconds;
+    g_snapshot.distance_dec  = dist_dec;
+    g_snapshot.distance_unit = dist_unit;
+    seqlock_end();
+}
+
+void vbs_tx_lanes(const uint8_t *lanes)
+{
+    if (!g_active.load(std::memory_order_relaxed)) {
+        note_inactive_drop("lanes");
+        return;
+    }
+
+    seqlock_begin();
+    if (lanes) {
+        std::memcpy(g_snapshot.lanes, lanes, sizeof(g_snapshot.lanes));
+    } else {
+        std::memset(g_snapshot.lanes, HUD_LANE_HIDDEN, sizeof(g_snapshot.lanes));
+    }
     seqlock_end();
 }

@@ -42,12 +42,17 @@ constexpr char kTouchDevice[] = "/dev/input/filtered-touchscreen0";
 
 // Open-retry policy. The evdev node can be momentarily absent right
 // after a session comes up (device re-enumeration, filtered-touch
-// daemon still creating the node). Rather than give up on the first
-// failure — which would silently kill multi-touch for the whole
-// session — the reader thread retries a bounded number of times with
-// a fixed backoff before giving up.
+// daemon still creating the node). On a cold boot it can take well
+// over a second to appear, so the old 5-try / 2.5 s ceiling was too
+// tight and silently killed touch for the whole session when the node
+// was merely slow. This runs on the dedicated reader thread (not a hot
+// path), so we can afford a generous ceiling: retry with a fixed
+// backoff up to kOpenMaxAttempts before giving up loudly. A bounded
+// loop still surfaces a genuinely permanent failure (EACCES, ENODEV)
+// instead of spinning on it forever. The stop eventfd interrupts the
+// backoff immediately, so the long ceiling never delays shutdown.
 constexpr int kOpenRetryDelayMs = 500;
-constexpr int kOpenMaxAttempts  = 5;
+constexpr int kOpenMaxAttempts  = 60;   // ~30 s of retries
 
 pthread_t g_thread;
 bool      g_thread_alive = false;
@@ -123,14 +128,20 @@ int open_touch_device(void)
 
         if (attempt + 1 >= kOpenMaxAttempts) {
             LOGE("touch reader: open(%s) failed: %s — giving up after "
-                 "%d attempts", kTouchDevice, strerror(errno),
-                 kOpenMaxAttempts);
+                 "%d attempts (~%d s)", kTouchDevice, strerror(errno),
+                 kOpenMaxAttempts, kOpenMaxAttempts * kOpenRetryDelayMs / 1000);
             break;
         }
 
-        LOGW("touch reader: open(%s) failed: %s — retrying in %d ms "
-             "(attempt %d/%d)", kTouchDevice, strerror(errno),
-             kOpenRetryDelayMs, attempt + 1, kOpenMaxAttempts);
+        // Log the first failure loudly, then stay quiet so a
+        // slow-to-appear node doesn't flood the log while we wait.
+        if (attempt == 0) {
+            LOGW("touch reader: open(%s) failed: %s — retrying every %d ms "
+                 "(up to %d attempts) until the node appears",
+                 kTouchDevice, strerror(errno), kOpenRetryDelayMs,
+                 kOpenMaxAttempts);
+        }
+
         if (wait_for_stop(kOpenRetryDelayMs)) {
             LOGD("touch reader: stop requested during open backoff");
             return -1;
@@ -249,6 +260,10 @@ void *reader_main(void *)
 void touch_post_aap_create_session(void)
 {
     if (g_thread_alive) return;
+
+    // Clear any diff/axis state left over from a previous session so a
+    // reconnect starts clean and the reader can re-probe the device.
+    touch_send_reset();
 
     // Create the stop eventfd before the thread so the reader can poll
     // it from the very first open() attempt. EFD_NONBLOCK keeps our

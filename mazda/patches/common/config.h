@@ -23,6 +23,10 @@
 //                                     street even where the OEM blanks it (default false)
 //   hud_fold_latin = true|false       fold HUD-unrenderable precomposed Latin
 //                                     street-name letters to their base forms (default true)
+//   use_protocol_v1_6 = true|false    advertise Android Auto GAL 1.6 so the phone sends the
+//                                     1.6 navigation protocol (maneuver / lanes / distance)
+//                                     instead of the 1.5 turn events; read by aap_service
+//                                     (default false = stock 1.5)
 //
 // Booleans are lenient (true/1/yes/on, false/0/no/off). hud_transport
 // also accepts "svcjcinavi" as an alias for "svcnavi".
@@ -201,7 +205,8 @@ struct Settings {
     bool         hud               = true;
     HudTransport hud_transport     = HUD_TRANSPORT_SVCNAVI;
     bool         force_street_name = false;
-    bool         hud_fold_latin    = false;
+    bool         hud_fold_latin    = true;
+    bool         use_protocol_v1_6 = false;
     bool         loaded            = false;
 };
 
@@ -242,6 +247,8 @@ inline void apply_kv(const char *key, const char *val, void *ud)
         s.force_street_name = parse_bool(val, s.force_street_name);
     } else if (strcasecmp(key, "hud_fold_latin") == 0) {
         s.hud_fold_latin = parse_bool(val, s.hud_fold_latin);
+    } else if (strcasecmp(key, "use_protocol_v1_6") == 0) {
+        s.use_protocol_v1_6 = parse_bool(val, s.use_protocol_v1_6);
     } else {
         // Common schema: a key this library doesn't act on is not an
         // error, just informational.
@@ -253,13 +260,14 @@ inline void log_effective(const char *prefix)
 {
     const Settings &s = settings();
     LOGD("config: %s touch=%s hud=%s hud_transport=%s force_street_name=%s "
-         "hud_fold_latin=%s",
+         "hud_fold_latin=%s use_protocol_v1_6=%s",
          prefix,
          s.touch ? "true" : "false",
          s.hud   ? "true" : "false",
          transport_name(s.hud_transport),
          s.force_street_name ? "true" : "false",
-         s.hud_fold_latin ? "true" : "false");
+         s.hud_fold_latin ? "true" : "false",
+         s.use_protocol_v1_6 ? "true" : "false");
 }
 
 // === Public API ===============================================
@@ -300,6 +308,7 @@ inline bool         hud_enabled()    { return settings().hud; }
 inline HudTransport hud_transport()  { return settings().hud_transport; }
 inline bool         force_street_name() { return settings().force_street_name; }
 inline bool         hud_fold_latin() { return settings().hud_fold_latin; }
+inline bool         use_protocol_v1_6() { return settings().use_protocol_v1_6; }
 
 } // namespace libpatch_config
 

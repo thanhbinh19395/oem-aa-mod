@@ -38,3 +38,7 @@ OEM_THUNK(int, VBS_NAVI_TMC_SetHUD_Display_Msg2,
           (conn, msg2, unused, cb, user), -1)
 OEM_THUNK(int, VBS_NAVI_GetHUDStatus,
           (void *conn, void *cb, void *user), (conn, cb, user), -1)
+OEM_THUNK(int, VBS_NAVI_SetRecommLaneReq,
+          (void *conn, const uint8_t *const *lanes, const uint32_t *count,
+           void *cb, void *user),
+          (conn, lanes, count, cb, user), -1)

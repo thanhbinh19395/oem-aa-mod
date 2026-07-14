@@ -21,6 +21,7 @@
 #include "lifecycle.h"
 #include "common/config.h"
 #include "hud/hud.h"
+#include "bt16pair/bt16pair.h"
 #include "monitor/navi_monitor.h"
 #include "oem/blmjciaapa.h"
 #include "touch/touch.h"
@@ -177,6 +178,17 @@ int aap_create_session(const char *cfg, void *unknown_r1,
     // a stock library (no point capturing data we won't forward).
     if (g_enabled && libpatch_config::hud_enabled()) {
         hud_pre_aap_create_session(cb_list);
+    }
+
+    // Wireless GAL-1.6 BT-pairing bypass: wrap ProjectionStatusCb
+    // (cb_list slot 4) so we can synthesize the pairing success that the
+    // AAWireless dongle omits at GAL >= 1.6 (see bt16pair/). Gated on
+    // use_protocol_v1_6; the wrapper is transparent and only acts when the
+    // connected USB device is "AAWireless", so wired and non-1.6
+    // sessions are unaffected. Must run before the real create so the
+    // SDK copies our wrapper into the session handle's callback table.
+    if (g_enabled && libpatch_config::use_protocol_v1_6()) {
+        bt16pair_pre_aap_create_session(cb_list);
     }
 
     LOGD("aap_create_session: calling real impl at %p",

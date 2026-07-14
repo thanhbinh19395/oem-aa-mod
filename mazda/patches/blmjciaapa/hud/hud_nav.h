@@ -28,6 +28,7 @@
 // into the ECU firmware and is out of our scope. Same numbering
 // as the reference, no remapping.
 enum MazdaIcon : uint8_t {
+    HUD_BLANK              = 0,    // HUD draws nothing (implicit blank; named for the 1.6 map)
     HUD_STRAIGHT            = 1,
     HUD_LEFT                = 2,
     HUD_RIGHT               = 3,
@@ -61,6 +62,12 @@ enum MazdaIcon : uint8_t {
     HUD_DESTINATION_RIGHT   = 34,
     HUD_FLAG_LEFT           = 35,
     HUD_FLAG_RIGHT          = 36,
+    // Roundabout exit-glyph bases (12 directional glyphs per traffic side); the
+    // exit angle is added in roundabout_icon()/the 1.6 roundabout map. Named here
+    // so the 1.6 glyph map has a single source for them (1.5 roundabout_icon below
+    // uses the same 37/49 offsets).
+    HUD_ROUNDABOUT_CCW_BASE = 37,   // right-hand traffic, +round(angle/30) -> 37..48
+    HUD_ROUNDABOUT_CW_BASE  = 49,   // left-hand  traffic, +round(angle/30) -> 49..60
 };
 
 // === Android turn_event → Mazda icon ==========================
@@ -136,6 +143,21 @@ inline uint8_t map_distance_unit(uint32_t android_unit)
     default: return 0; // Unknown — HUD will render nothing.
     }
 }
+
+// === Mazda HUD recommended-lane byte codes ====================
+//
+// Per-slot value in the HUD's 8-lane array. hud.cpp encodes the decoded AA
+// lanes to these before handing them to a transport (Mazda domain, like the
+// glyph/unit maps above). marked/unmarked are shared by both transports; the
+// hidden sentinel is canonical 0 here, so a zero-init / cleared snapshot is
+// "all hidden" for free — the vbs transport remaps 0 -> 0xFF for
+// VBS_NAVI_SetRecommLaneReq, while svcnavi's GuidanceChangedForHUD takes 0
+// as-is (its handler validates each lane arg to 0..0x46).
+enum {
+    HUD_LANE_HIDDEN   = 0,     // no lane in this slot
+    HUD_LANE_UNMARKED = 1,     // a lane, not the recommended one
+    HUD_LANE_MARKED   = 22,    // the recommended lane
+};
 
 // === Turn-icon resolution =====================================
 //

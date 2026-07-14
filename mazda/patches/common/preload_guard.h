@@ -199,4 +199,22 @@ static inline bool preload_is_launcher_process(const char *cmdline)
     return blen == kTlen && memcmp(base, kTarget, kTlen) == 0;
 }
 
+// True iff argv[0] is the aap_service executable. The aap_service shim patches
+// fixed virtual addresses inside aap_service; since LD_PRELOAD is inherited by
+// every process aap_service forks/execs (e.g. gst-plugin-scanner), those
+// addresses are unmapped in the child and patching there would fault. Gate on
+// argv[0] so the shim stays inert in inherited children. Compares the BASENAME
+// of argv[0] to "aap_service" (exact), like preload_is_launcher_process — not a
+// substring match, so a sibling such as /tmp/aap_service_helper can't trip it.
+static inline bool preload_in_aap_service()
+{
+    char cl[256];
+    if (preload_read_cmdline(cl, sizeof cl) <= 0) return false;
+    char *sp = strchr(cl, ' ');
+    if (sp) *sp = '\0';                  // keep argv[0] only
+    const char *base = strrchr(cl, '/');
+    base = base ? base + 1 : cl;         // basename of argv[0]
+    return strcmp(base, "aap_service") == 0;
+}
+
 #endif  // LIBPATCH_COMMON_PRELOAD_GUARD_H

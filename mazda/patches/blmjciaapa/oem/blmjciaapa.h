@@ -68,4 +68,37 @@ void *AapProc_GetRaceAap(void *self);
 int   VideoManager_IsAAVideoInFocus(void *self);
 int   RaceAap_SendTouchInput(void *self, AAP_TouchEvent *evt);
 
+// AapConnectionManager access, used by the wireless GAL-1.6 BT-pairing
+// bypass (bt16pair/). The AapConnectionManager is a subobject of the
+// AapProc singleton at AapProc+0x98 (= AapProc::GetAapConnectionManager,
+// which just returns this+0x98). These helpers resolve/read it; all
+// degrade to nullptr / -1 when blmjciaapa.so isn't mapped or the
+// singleton isn't up yet.
+//   AapConnectionManager_instance()          -> AapConnectionManager* / NULL
+//   AapConnectionManager_dev_name(cm)        -> USB device name (cm+0x54):
+//                                               "AAWireless" for the dongle,
+//                                               the phone model when wired.
+//   AapConnectionManager_connect_mode(cm)    -> connect mode (cm+0xdc):
+//                                               0 = idle, 2 = pending BT pair
+//                                               (AOA session up, dongle parks
+//                                               here at GAL 1.6), 3 = activated.
+//                                               Offset EMPIRICALLY pinned by a
+//                                               3-state /proc/mem object diff
+//                                               (idle/wired/dongle) — NOT the
+//                                               decompile's "0x254".
+//   AapConnectionManager_NotifyBtPairingResult(cm, result)
+//       -> OEM guarded pairing-result entry; result==1 while mode==2
+//          triggers ActivateAapSession. Its guard reads the real mode field
+//          (cm+0xdc), so it works when mode==2 is observed.
+//   AapConnectionManager_ActivateAapSession(cm)
+//       -> the OEM "AA connected" activation itself (StartResourcesControl,
+//          ResumeLastMode, NotifyBTConnectionComplete, mode:=3). Takes NO
+//          mode precondition, so it can be invoked directly to force
+//          activation when the in-band BT pairing is skipped (dongle GAL 1.6).
+void       *AapConnectionManager_instance(void);
+const char *AapConnectionManager_dev_name(void *cm);
+int         AapConnectionManager_connect_mode(void *cm);
+void        AapConnectionManager_NotifyBtPairingResult(void *cm, int result);
+void        AapConnectionManager_ActivateAapSession(void *cm);
+
 #endif  // LIBPATCH_BLMJCIAAPA_BLMJCIAAPA_H

@@ -61,25 +61,20 @@ void svcnavi_tx_stop(void);
 // blanking signal so svcjcinavi clears the HUD.
 void svcnavi_tx_status(uint32_t status);
 
-// 0x501 NAVTurnMessage. Identical contract to vbs_tx_next_turn:
-//   turn_side  - 1=LEFT, 2=RIGHT, 3=UNSPECIFIED (proto TURN_SIDE)
-//   turn_event - sparse 0..19  (proto TURN_EVENT)
-//   turn_angle - degrees, signed
-//   turn_number - maneuver / exit number
-// road_name is NOT held past return (snapshot-copied inline).
-void svcnavi_tx_next_turn(const char *road_name,
-                          uint32_t    turn_side,
-                          uint32_t    turn_event,
-                          int32_t     turn_angle,
-                          int32_t     turn_number);
+// 0x501 NAVTurnMessage. Identical contract to vbs_tx_next_turn: `dir_icon` is
+// the resolved Mazda HUD glyph (hud.cpp maps the AA turn fields via
+// compute_turn_icon). road_name is NOT held past return (snapshot-copied inline).
+void svcnavi_tx_next_turn(const char *road_name, uint32_t dir_icon);
 
-// 0x502 NAVDistanceMessage. Identical contract to vbs_tx_distance:
-//   display_distance - "raw unit * 1000" int32 from the SDK header;
-//                      converted to the HUD's "raw unit * 10" here.
-//   display_distance_unit - proto DISPLAY_DISTANCE_UNIT, 1..6.
-void svcnavi_tx_distance(int32_t  distance_meters,
-                         int32_t  time_until_seconds,
-                         int32_t  display_distance,
-                         uint32_t display_distance_unit);
+// Distance to the next maneuver, in Mazda-HUD form:
+//   dist_dec  - display distance * 10 (one decimal)
+//   dist_unit - Mazda HUD unit (1=m, 2=mi, 3=km, 4=yd, 5=ft; 0=none)
+// hud.cpp maps the AA proto values to this form before calling.
+void svcnavi_tx_distance(int32_t dist_dec, uint8_t dist_unit);
 
+// Recommended-lane array (GAL 1.6 only; the 1.5 path never sends lanes). Exactly
+// 8 Mazda lane bytes, LEFT to RIGHT (0=hidden, 1=unmarked, 22=marked; hud.cpp
+// encodes them), forwarded to lane0..7 of GuidanceChangedForHUD.
+void svcnavi_tx_lanes(const uint8_t *lanes);
+  
 #endif // LIBPATCH_BLMJCIAAPA_HUD_SVCNAVI_TX_H
