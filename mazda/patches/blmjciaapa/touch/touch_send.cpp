@@ -25,51 +25,39 @@ namespace {
 // Coordinate scaling.
 //
 // AAP_TouchEvent expects display pixels (0..799 X, 0..479 Y).
-// Whether /dev/input/filtered-touchscreen0 already reports pixels or
-// reports raw 0..~4099 device units is an open empirical question.
-// We adapt at runtime by inspecting the first non-trivial frame:
-// if any value exceeds the display's pixel range, switch into
-// "raw / 4099 * size" scaling for the rest of the process lifetime.
+// /dev/input/filtered-touchscreen0 reports raw touch-controller units
+// spanning 0..~4099. The OEM HMIEventHandler::InputTouchScreen maps
+// these to pixels with fixed constants (float immediates decoded from
+// blmjciaapa.so: 0x44480000=800.0, 0x43f00000=480.0, 0x45801800=4099.0):
+//
+//     x_px = (int)(raw_x * 800.0f / 4099.0f)
+//     y_px = (int)(raw_y * 480.0f / 4099.0f)
+//
+// We reproduce that mapping exactly and unconditionally. There is no
+// per-touch heuristic and no runtime axis probe: the panel range is a
+// fixed property of this firmware, so hardcoding the stock constants
+// guarantees identical behaviour to the native HMI. (A first-touch
+// heuristic was tried and removed — it mis-detected a raw panel as
+// "already pixels" whenever the first tap landed in the top-left
+// region where both raw coords fall below the pixel thresholds,
+// collapsing the whole usable area into a corner.) Integer division
+// truncates toward zero, matching the OEM's __aeabi_f2iz.
 // ---------------------------------------------------------------
 
 constexpr uint32_t kDisplayWidth  = 800;
 constexpr uint32_t kDisplayHeight = 480;
-constexpr uint32_t kRawMax        = 4099;
-
-bool g_scaling_decided = false;
-bool g_scale_from_raw  = false;  // true => values are 0..~4099, scale down
-
-void decide_scaling(const MtState &s)
-{
-    if (g_scaling_decided) return;
-    if (s.n_active == 0) return;  // wait for a real touch
-
-    uint32_t max_x = 0, max_y = 0;
-    for (int i = 0; i < kMaxFingers; ++i) {
-        if (s.fingers[i].tracking_id < 0) continue;
-        if (s.fingers[i].x > max_x) max_x = s.fingers[i].x;
-        if (s.fingers[i].y > max_y) max_y = s.fingers[i].y;
-    }
-
-    g_scale_from_raw = (max_x >= kDisplayWidth) || (max_y >= kDisplayHeight);
-    g_scaling_decided = true;
-    LOGD("touch send: scaling mode = %s (first-frame max %u,%u)",
-              g_scale_from_raw ? "raw->pixels" : "passthrough",
-              max_x, max_y);
-}
+constexpr uint32_t kRawMax        = 4099;   // OEM divisor (blmjciaapa.so)
 
 inline uint32_t scale_x(uint32_t v)
 {
-    if (!g_scale_from_raw) return v;
-    uint64_t out = static_cast<uint64_t>(v) * kDisplayWidth / kRawMax;
-    return static_cast<uint32_t>(out);
+    return static_cast<uint32_t>(
+        static_cast<uint64_t>(v) * kDisplayWidth / kRawMax);
 }
 
 inline uint32_t scale_y(uint32_t v)
 {
-    if (!g_scale_from_raw) return v;
-    uint64_t out = static_cast<uint64_t>(v) * kDisplayHeight / kRawMax;
-    return static_cast<uint32_t>(out);
+    return static_cast<uint32_t>(
+        static_cast<uint64_t>(v) * kDisplayHeight / kRawMax);
 }
 
 // ---------------------------------------------------------------
@@ -194,10 +182,16 @@ int insert_sorted(SnapEntry *arr, int n, int slot, const Finger &fg)
 
 } // namespace
 
+void touch_send_reset(void)
+{
+    // Force the phantom-finger fix-up to run again on the next frame so
+    // stale finger state from a previous session can't corrupt the
+    // first diff of a new one.
+    g_prev_init = false;
+}
+
 void touch_on_frame(const MtState &cur)
 {
-    decide_scaling(cur);
-
     if (!g_prev_init) {
         // One-shot init for g_prev. The "slot empty" sentinel is
         // tracking_id = -1, but `MtState g_prev;` at file scope is

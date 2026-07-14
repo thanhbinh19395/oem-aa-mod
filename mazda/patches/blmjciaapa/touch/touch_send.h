@@ -29,4 +29,10 @@ struct MtState {
 // SYN_REPORT with the freshly-built current state.
 void touch_on_frame(const MtState &cur);
 
+
+// Drop any per-session diff/axis state so a fresh session starts clean
+// (no stale fingers from a previous connection leaking into the first
+// frame's diff). Called by touch_post_aap_create_session().
+void touch_send_reset(void);
+
 #endif // LIBPATCH_BLMJCIAAPA_TOUCH_TOUCH_SEND_H
