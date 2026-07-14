@@ -23,6 +23,7 @@
 #include "hud/hud.h"
 #include "bt16pair/bt16pair.h"
 #include "monitor/navi_monitor.h"
+#include "mute/mute.h"
 #include "oem/blmjciaapa.h"
 #include "touch/touch.h"
 #include "common/preload.h"   // PRELOAD_EXPORT + resolve_real_symbol
@@ -232,6 +233,20 @@ int aap_create_session(const char *cfg, void *unknown_r1,
             LOGD("aap_create_session: HUD disabled by config — skipping sender");
         }
 
+        // Mute -> phone media bridge: watch the OEM audio manager's user-mute
+        // signal (com.jci.vbs.am / EntertainmentMuteStatus) and pause/resume
+        // the phone's AA media accordingly. Same once-per-process gate; the
+        // watcher thread owns its own service-bus connection and tolerates the
+        // session not being fully connected yet.
+        if (libpatch_config::mute_pauses_phone()) {
+            LOGD("aap_create_session: spawning mute watcher");
+            mute_post_aap_create_session();
+            LOGD("mute watcher hook completed");
+        } else {
+            LOGD("aap_create_session: mute_pauses_phone disabled by config — "
+                 "skipping mute watcher");
+        }
+
 #if defined(DEBUG) && BLMJCIAAPA_ENABLE_NAVI_MONITOR
         // Debug-only: eavesdrop on com.jci.vbs.navi(.tmc) traffic and
         // forward dbus-monitor output to the patch log. Compiled out
@@ -273,6 +288,12 @@ int aap_destroy_session(void *handle)
                 LOGD("aap_destroy_session: stopping HUD sender");
                 hud_pre_aap_destroy_session();
                 LOGD("HUD pre-destroy hook completed");
+            }
+
+            if (libpatch_config::mute_pauses_phone()) {
+                LOGD("aap_destroy_session: stopping mute watcher");
+                mute_pre_aap_destroy_session();
+                LOGD("mute watcher stopped");
             }
 
 #if defined(DEBUG) && BLMJCIAAPA_ENABLE_NAVI_MONITOR
