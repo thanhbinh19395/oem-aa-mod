@@ -21,11 +21,12 @@
 // keying off it gives exactly the deliberate mute the user perceives.
 //
 // Action: RaceAap::SendKeyInput with the same AAP_KeyEvent the OEM builds
-// (eType = 0xe00, an Android keycode, a press then a release). Guarded by
-// AudioManager::IsAAMediaInFocus so we only touch playback when AA media is
-// the active audio source. A "we paused it" latch means we only ever resume
-// what we paused, so a source change while muted (AA loses focus) can't
-// spuriously resume AA in the background.
+// (eType = 0xe00, an Android keycode, a press then a release). We only PAUSE
+// when AudioManager::IsAAMediaInPlaying reports AA media is actively playing
+// (mirroring the OEM's own InputKey media handling) — so muting media the user
+// already paused never arms a resume. A "we paused it" latch, updated only when
+// a key is actually delivered, means we only ever resume what we paused; a
+// source change while muted (AA loses focus) can't spuriously resume AA.
 //
 // Gated by libpatch.conf `mute_pauses_phone` (default off). Lifecycle-
 // bracketed by aap_create_session / aap_destroy_session, so exactly one
@@ -101,7 +102,7 @@ bool wait_stop(int ms)
 // Return true if AA media is the active/focused audio source right now.
 // IsAAMediaInFocus reads the AudioManager focus field (set by
 // AudioFocusChangeCb), which stays true through a pause — so it correctly
-// gates both the pause (on mute) and the resume (on unmute).
+// gates the resume (on unmute) even after we paused.
 bool aa_media_in_focus()
 {
     void *aap = Singleton_AapProc_GetInstance();
@@ -111,15 +112,31 @@ bool aa_media_in_focus()
     return AudioManager_IsAAMediaInFocus(am) != 0;
 }
 
-// Send one media key press (down then up) to the phone via the OEM
-// RaceAap::SendKeyInput, mirroring HMIEventHandler::InputKey's press/release
-// pair and its eType = 0xe00.
-void send_media_key(uint32_t keycode)
+// Return true if AA media is actively PLAYING right now (not paused/stopped).
+// Used to decide whether a mute should pause: if the user already paused the
+// media, IsAAMediaInFocus is still true but IsAAMediaInPlaying is false, so we
+// must not arm the resume latch (else unmute would force playback back on).
+bool aa_media_in_playing()
 {
     void *aap = Singleton_AapProc_GetInstance();
-    if (!aap) { LOGV("send_media_key: AapProc instance not available"); return; }
+    if (!aap) return false;
+    void *am = AapProc_GetAudioManager(aap);
+    if (!am) return false;
+    return AudioManager_IsAAMediaInPlaying(am) != 0;
+}
+
+// Send one media key press (down then up) to the phone via the OEM
+// RaceAap::SendKeyInput, mirroring HMIEventHandler::InputKey's press/release
+// pair and its eType = 0xe00. Returns true only if BOTH the press and release
+// were accepted (rc 0). A rejected key — most commonly rc 0x108 while the
+// session hasn't reached CONNECTED — means the phone did NOT act on it, so the
+// caller must not treat the media as (un)paused.
+bool send_media_key(uint32_t keycode)
+{
+    void *aap = Singleton_AapProc_GetInstance();
+    if (!aap) { LOGV("send_media_key: AapProc instance not available"); return false; }
     void *race = AapProc_GetRaceAap(aap);
-    if (!race) { LOGV("send_media_key: RaceAap not available"); return; }
+    if (!race) { LOGV("send_media_key: RaceAap not available"); return false; }
 
     AAP_KeyEvent evt;
     std::memset(&evt, 0, sizeof(evt));
@@ -127,16 +144,18 @@ void send_media_key(uint32_t keycode)
     evt.eKeyCode = keycode;
 
     evt.bDown = 1;                      // press
-    int rc = RaceAap_SendKeyInput(race, &evt);
-    if (rc != 0 && rc != kAapSessionNotConnected)
-        LOGE("SendKeyInput(down key=0x%x) -> %d", keycode, rc);
+    int rc_down = RaceAap_SendKeyInput(race, &evt);
+    if (rc_down != 0 && rc_down != kAapSessionNotConnected)
+        LOGE("SendKeyInput(down key=0x%x) -> %d", keycode, rc_down);
 
     evt.bDown = 0;                      // release
-    rc = RaceAap_SendKeyInput(race, &evt);
-    if (rc != 0 && rc != kAapSessionNotConnected)
-        LOGE("SendKeyInput(up key=0x%x) -> %d", keycode, rc);
+    int rc_up = RaceAap_SendKeyInput(race, &evt);
+    if (rc_up != 0 && rc_up != kAapSessionNotConnected)
+        LOGE("SendKeyInput(up key=0x%x) -> %d", keycode, rc_up);
 
-    LOGD("sent media key 0x%x (down+up)", keycode);
+    bool delivered = (rc_down == 0 && rc_up == 0);
+    LOGD("media key 0x%x (down+up) delivered=%d", keycode, delivered ? 1 : 0);
+    return delivered;
 }
 
 // Act on a fresh EntertainmentMuteStatus value.
@@ -147,25 +166,35 @@ void on_mute_changed(bool muted)
             LOGV("mute: already paused by us — ignoring");
             return;
         }
-        if (!aa_media_in_focus()) {
-            LOGD("mute: AA media not in focus — not pausing");
+        // Only pause when AA media is actually PLAYING. If the user (or the
+        // phone) already paused it, IsAAMediaInFocus would still be true, but
+        // arming the latch here would make the later unmute force playback of
+        // media the user deliberately paused. IsAAMediaInPlaying implies AA
+        // media is also the focused source, so it subsumes the focus check.
+        if (!aa_media_in_playing()) {
+            LOGD("mute: AA media not actively playing — not pausing");
             return;
         }
-        send_media_key(kAAPKeyMediaPause);
-        g_we_paused = true;
+        // Arm the latch ONLY if the PAUSE was actually delivered; a rejected
+        // key did not pause the phone, so we must not later resume it.
+        if (send_media_key(kAAPKeyMediaPause))
+            g_we_paused = true;
     } else {
         if (!g_we_paused) {
             LOGV("unmute: we did not pause — ignoring");
             return;
         }
-        // Clear the latch regardless: even if AA is no longer the focused
-        // source (source switched while muted), the mute cycle is over.
-        g_we_paused = false;
         if (!aa_media_in_focus()) {
-            LOGD("unmute: AA media not in focus — not resuming");
+            // Source switched away while muted; abandon the pending resume so
+            // we never resume AA in the background.
+            LOGD("unmute: AA media not in focus — dropping pending resume");
+            g_we_paused = false;
             return;
         }
-        send_media_key(kAAPKeyMediaPlay);
+        // Clear the latch ONLY once the PLAY is delivered, so a rejected resume
+        // is retried on the next unmute rather than silently lost.
+        if (send_media_key(kAAPKeyMediaPlay))
+            g_we_paused = false;
     }
 }
 
@@ -243,11 +272,16 @@ void teardown_connection()
 
 void *watcher_main(void *)
 {
-    // We track our own pause latch across reconnects; only session start
-    // (mute_post_aap_create_session) resets it. Initial mute state is not
-    // queried: we act on edges, so a "muted at connect" session simply stays
-    // as stock until the next mute cycle, then self-syncs.
+    // Initial mute state is not queried: we act on signal edges, so a "muted at
+    // connect" session simply stays as stock until the next mute cycle, then
+    // self-syncs. Likewise, each (RE)connection below starts from an unknown
+    // mute state — after a bus disconnect we may have missed an unmute, so we
+    // clear the "we paused it" latch on every connect. That prefers "mute
+    // always silences" over "always auto-resume": worst case we miss one resume
+    // right after a (rare) reconnect, instead of a mute becoming a silent no-op.
     while (!g_stop.load(std::memory_order_relaxed)) {
+        g_we_paused = false;
+
         if (!setup_connection()) {
             teardown_connection();
             if (wait_stop(kReconnectDelayMs)) break;

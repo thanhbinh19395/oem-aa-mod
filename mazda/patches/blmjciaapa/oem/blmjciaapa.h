@@ -83,7 +83,8 @@ constexpr uint32_t kAAPKeyMediaPause = 0x7f;  // 127 KEYCODE_MEDIA_PAUSE
 //   AapProc::GetRaceAap()                  -> RaceAap *
 //   AapProc::GetAudioManager()             -> AudioManager *
 //   VideoManager::IsAAVideoInFocus()       -> int (bool)
-//   AudioManager::IsAAMediaInFocus()       -> int (bool)
+//   AudioManager::IsAAMediaInFocus()       -> int (bool)  AA media is the active/focused source
+//   AudioManager::IsAAMediaInPlaying()     -> int (bool)  AA media is actively PLAYING (not paused)
 //   RaceAap::SendTouchInput(AAP_TouchEvent*) -> int (0 = ok)
 //   RaceAap::SendKeyInput(AAP_KeyEvent*)     -> int (0 = ok)
 void *Singleton_AapProc_GetInstance(void);
@@ -92,6 +93,7 @@ void *AapProc_GetRaceAap(void *self);
 void *AapProc_GetAudioManager(void *self);
 int   VideoManager_IsAAVideoInFocus(void *self);
 int   AudioManager_IsAAMediaInFocus(void *self);
+int   AudioManager_IsAAMediaInPlaying(void *self);
 int   RaceAap_SendTouchInput(void *self, AAP_TouchEvent *evt);
 int   RaceAap_SendKeyInput(void *self, AAP_KeyEvent *evt);
 

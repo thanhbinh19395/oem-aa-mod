@@ -37,6 +37,8 @@ constexpr uintptr_t AapProc_GetAapConnectionManager = 0x000872fc;
 constexpr uintptr_t VideoManager_IsAAVideoInFocus = 0x000b3af4;
 //   _ZN12AudioManager16IsAAMediaInFocusEv
 constexpr uintptr_t AudioManager_IsAAMediaInFocus = 0x000ac3b0;
+//   _ZN12AudioManager18IsAAMediaInPlayingEv
+constexpr uintptr_t AudioManager_IsAAMediaInPlaying = 0x000ac3f8;
 //   _ZN7RaceAap14SendTouchInputEP14AAP_TouchEvent
 constexpr uintptr_t RaceAap_SendTouchInput        = 0x0008e3a8;
 //   _ZN7RaceAap12SendKeyInputEP12AAP_KeyEvent
@@ -162,6 +164,7 @@ BLM_THUNK(void *, AapProc_GetAudioManager, (void *self), (self), nullptr)
 BLM_THUNK(void *, AapProc_GetAapConnectionManager, (void *self), (self), nullptr)
 BLM_THUNK(int,    VideoManager_IsAAVideoInFocus, (void *self), (self), 0)
 BLM_THUNK(int,    AudioManager_IsAAMediaInFocus, (void *self), (self), 0)
+BLM_THUNK(int,    AudioManager_IsAAMediaInPlaying, (void *self), (self), 0)
 BLM_THUNK(int,    RaceAap_SendTouchInput,
           (void *self, AAP_TouchEvent *evt), (self, evt), -1)
 BLM_THUNK(int,    RaceAap_SendKeyInput,
