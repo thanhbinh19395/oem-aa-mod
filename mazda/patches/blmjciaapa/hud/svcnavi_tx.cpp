@@ -30,6 +30,7 @@
 #include "hud_lane.h"
 #include "../oem/libdbus.h"
 #include "../../common/oem/vbs_navi_hud.h"   // kAapSpeedSentinel (shared with svcjcinavi)
+#include "common/thread_util.h"
 
 #include <condition_variable>
 #include <cstdlib>
@@ -299,7 +300,7 @@ void svcnavi_tx_start(void)
     g_stop.store(false, std::memory_order_release);
     g_active.store(false, std::memory_order_release);
 
-    if (pthread_create(&g_sender_thread, nullptr, sender_main, nullptr) != 0) {
+    if (preload_thread_create(&g_sender_thread, sender_main, nullptr) != 0) {
         LOGC("svcnavi_tx_start: failed to spawn sender thread");
         return;
     }

@@ -42,6 +42,7 @@
 #include "hud_nav.h"
 #include "hud_lane.h"   // oem_lane_glyph — OEM lane code -> cluster glyph (mapped on this wire)
 #include "../oem/libjcivbsnaviclient.h"
+#include "common/thread_util.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -492,8 +493,7 @@ void vbs_tx_start(void)
     g_stop.store(false, std::memory_order_release);
     g_active.store(false, std::memory_order_release);
 
-    if (pthread_create(&g_sender_thread, nullptr,
-                       sender_main, nullptr) != 0) {
+    if (preload_thread_create(&g_sender_thread, sender_main, nullptr) != 0) {
         LOGC("vbs_tx_start: failed to spawn sender thread");
         return;
     }
