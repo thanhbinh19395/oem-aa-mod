@@ -57,9 +57,10 @@ void vbs_tx_next_turn(const char *road_name, uint32_t dir_icon);
 void vbs_tx_distance(int32_t dist_dec, uint8_t dist_unit);
 
 // Recommended-lane array (GAL 1.6 only; the 1.5 path never sends lanes). Exactly
-// 8 Mazda lane bytes, LEFT to RIGHT (0=hidden, 1=unmarked, 22=marked; hud.cpp
-// encodes them). Carried on a SEPARATE OEM method (VBS_NAVI_SetRecommLaneReq) —
-// see vbs_tx.cpp for the emit-side 0 -> 0xFF hidden-slot remap.
+// 8 Mazda cluster GLYPH bytes, LEFT to RIGHT (0=hidden) — hud.cpp encodes the AA
+// lanes to OEM codes and maps each to a cluster glyph, since this path bypasses
+// svcjcinavi. Carried on a SEPARATE OEM method (VBS_NAVI_SetRecommLaneReq) — see
+// vbs_tx.cpp for the emit-side 0 -> kVbsLaneHidden (0xFF) hidden-slot remap.
 void vbs_tx_lanes(const uint8_t *lanes);
 
 #endif // LIBPATCH_BLMJCIAAPA_VBS_TX_H

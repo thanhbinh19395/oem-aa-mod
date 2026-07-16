@@ -27,6 +27,7 @@
 #include "vbs_tx.h"
 #include "translit.h"   // hud_translit::fold() — precomposed-Latin street-name fold
 #include "hud_nav.h"    // compute_turn_icon() — AA turn fields -> Mazda HUD glyph
+#include "hud_lane.h"   // oem_lane_code_for_aa — AA lanes -> OEM lane codes
 
 #include <stdint.h>
 #include <string.h>
@@ -43,7 +44,7 @@ struct HudTransportOps {
     void (*status)(uint32_t status);
     void (*next_turn)(const char *road, uint32_t icon);
     void (*distance)(int32_t dist_dec, uint8_t dist_unit);
-    void (*lanes)(const AaLane *lanes, uint8_t n);   // encoded per-transport below
+    void (*lanes)(const uint8_t *codes);             // raw setter; fed by emit_lane_codes
 };
 
 // Per-transport next_turn adapters. Today both just forward the resolved glyph +
@@ -59,44 +60,28 @@ void vbs_next_turn_adapter(const char *road, uint32_t icon)
     vbs_tx_next_turn(road, icon);
 }
 
-// Encode the decoded 1.6 lanes to the 8-slot Mazda HUD lane array, LEFT to
-// RIGHT: a present lane is MARKED if any of its arrows is highlighted
-// (recommended), else UNMARKED; absent slots are HIDDEN (canonical 0). (Per-shape
-// glyph detail is TBD on-car.)
-void nav16_encode_lanes(const AaLane *lanes, int n, uint8_t out[HUD_NAV16_MAX_LANES])
+// Encode the decoded 1.6 lanes to 8 OEM lane CODES (0..70), LEFT to RIGHT; an
+// absent slot is HIDDEN (canonical 0 == OEM_LANE_NONE).
+// hud_lane.h owns the full AA-shape -> OEM-code mapping: single arrows, the
+// multi-direction combos, and the recommended-direction detail codes that pick
+// out the highlighted arrow within a combo.
+void nav16_encode_lane_codes(const AaLane *lanes, int n, uint8_t out[HUD_NAV16_MAX_LANES])
 {
     for (int i = 0; i < HUD_NAV16_MAX_LANES; ++i) {
         out[i] = (lanes && i < n)
-                     ? (uint8_t)(lanes[i].highlight_mask ? HUD_LANE_MARKED
-                                                         : HUD_LANE_UNMARKED)
-                     : HUD_LANE_HIDDEN;
+                     ? (uint8_t)oem_lane_code_for_aa(lanes[i].present_mask,
+                                                     lanes[i].highlight_mask)
+                     : (uint8_t)OEM_LANE_NONE;   // 0 = hidden
     }
-}
-
-// Per-transport lane adapters: encode the decoded AA lanes to the 8-slot Mazda
-// byte array for THIS backend, then hand the bytes to its setter. Same seam as
-// the next_turn adapters — today both encode identically (canonical hidden 0;
-// vbs remaps to 0xFF at its own wire), but each could diverge.
-void svcnavi_lanes_adapter(const AaLane *lanes, uint8_t n)
-{
-    uint8_t lane_bytes[HUD_NAV16_MAX_LANES];
-    nav16_encode_lanes(lanes, n, lane_bytes);
-    svcnavi_tx_lanes(lane_bytes);
-}
-void vbs_lanes_adapter(const AaLane *lanes, uint8_t n)
-{
-    uint8_t lane_bytes[HUD_NAV16_MAX_LANES];
-    nav16_encode_lanes(lanes, n, lane_bytes);
-    vbs_tx_lanes(lane_bytes);
 }
 
 const HudTransportOps kSvcnaviOps = {
     &svcnavi_tx_start, &svcnavi_tx_stop, &svcnavi_tx_status,
-    &svcnavi_next_turn_adapter, &svcnavi_tx_distance, &svcnavi_lanes_adapter,
+    &svcnavi_next_turn_adapter, &svcnavi_tx_distance, &svcnavi_tx_lanes,
 };
 const HudTransportOps kVbsOps = {
     &vbs_tx_start, &vbs_tx_stop, &vbs_tx_status,
-    &vbs_next_turn_adapter, &vbs_tx_distance, &vbs_lanes_adapter,
+    &vbs_next_turn_adapter, &vbs_tx_distance, &vbs_tx_lanes,
 };
 
 // The active backend. Bound once in hud_tx_start() (the first transport
@@ -627,12 +612,15 @@ static void nav16_emit_if_changed()
     AaNav16HudState &acc = g_nav16_acc;
     if (g_nav16_have_last && memcmp(&acc, &g_nav16_last, sizeof(acc)) == 0) return;
     // acc holds Mazda-domain values (resolved glyph, folded road, value*10
-    // distance in the Mazda unit) plus the decoded lanes; the per-transport lane
-    // adapter encodes them to HUD bytes. The rx thread is the sole writer under
-    // v1.6, so the transport's snapshot merge is race-free.
+    // distance in the Mazda unit) plus the decoded lanes; we encode the lanes to
+    // OEM codes here (each transport maps code->glyph on its own wire as needed).
+    // The rx thread is the sole writer under v1.6, so the transport's snapshot
+    // merge is race-free.
+    uint8_t lane_codes[HUD_NAV16_MAX_LANES];
+    nav16_encode_lane_codes(acc.lanes, acc.n_lanes, lane_codes);
     g_tx->next_turn(acc.road, acc.glyph);
     g_tx->distance(acc.dist_dec, acc.dist_unit);
-    g_tx->lanes(acc.lanes, acc.n_lanes);
+    g_tx->lanes(lane_codes);
     g_nav16_last      = acc;
     g_nav16_have_last = true;
 }

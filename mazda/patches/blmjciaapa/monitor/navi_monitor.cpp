@@ -20,6 +20,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "common/thread_util.h"
+
 namespace {
 
 // On-device dbus-monitor (confirmed present in the 74.00.324A
@@ -149,9 +151,9 @@ void navi_monitor_post_aap_create_session(void)
     g_pid     = pid;
     g_read_fd = pipefd[0];
 
-    if (pthread_create(&g_reader, nullptr, reader_main,
-                       reinterpret_cast<void *>(
-                           static_cast<intptr_t>(pipefd[0]))) != 0) {
+    if (preload_thread_create(&g_reader, reader_main,
+                              reinterpret_cast<void *>(
+                                  static_cast<intptr_t>(pipefd[0]))) != 0) {
         LOGE("pthread_create(reader) failed: %s", strerror(errno));
         // Can't drain the child — tear it back down.
         kill(g_pid, SIGTERM);
