@@ -37,6 +37,7 @@
 #include "mute.h"
 #include "../oem/blmjciaapa.h"   // AAP_KeyEvent, keycodes, OEM thunks
 #include "../oem/libdbus.h"      // raw libdbus-1 receive path
+#include "common/thread_util.h"  // preload_thread_create (bounded stack)
 
 #include <atomic>
 #include <chrono>
@@ -320,7 +321,7 @@ void mute_post_aap_create_session(void)
     g_stop.store(false, std::memory_order_release);
     g_we_paused = false;
 
-    if (pthread_create(&g_thread, nullptr, watcher_main, nullptr) != 0) {
+    if (preload_thread_create(&g_thread, watcher_main, nullptr) != 0) {
         LOGC("failed to spawn mute watcher thread");
         return;
     }
