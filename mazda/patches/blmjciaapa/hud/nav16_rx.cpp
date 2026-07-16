@@ -23,6 +23,7 @@
 #include "nav16_rx.h"
 #include "hud_nav16.h"
 #include "common/aa_nav16_msg.h"
+#include "common/thread_util.h"
 
 #include <atomic>
 #include <cstring>
@@ -148,7 +149,7 @@ void hud_nav16_rx_start(HudNav16GuidanceFn on_guidance,
         LOGW("hud_nav16_rx_start: eventfd failed (%s) — rx falls back to 200 ms poll",
              strerror(errno));
     }
-    if (pthread_create(&g_thread, nullptr, rx_main, nullptr) != 0) {
+    if (preload_thread_create(&g_thread, rx_main, nullptr) != 0) {
         LOGC("hud_nav16_rx_start: pthread_create failed — no 1.6 HUD this session");
         hud_nav16_set_sink(nullptr, nullptr, nullptr);   // no feeder will run — drop them
         if (g_stop_fd >= 0) {

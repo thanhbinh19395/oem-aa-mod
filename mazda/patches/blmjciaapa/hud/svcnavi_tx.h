@@ -73,8 +73,9 @@ void svcnavi_tx_next_turn(const char *road_name, uint32_t dir_icon);
 void svcnavi_tx_distance(int32_t dist_dec, uint8_t dist_unit);
 
 // Recommended-lane array (GAL 1.6 only; the 1.5 path never sends lanes). Exactly
-// 8 Mazda lane bytes, LEFT to RIGHT (0=hidden, 1=unmarked, 22=marked; hud.cpp
-// encodes them), forwarded to lane0..7 of GuidanceChangedForHUD.
+// 8 OEM lane CODES (0..70; 0=hidden), LEFT to RIGHT — hud.cpp encodes them and
+// svcjcinavi maps each code to a cluster glyph itself. Forwarded verbatim to
+// lane0..7 of GuidanceChangedForHUD.
 void svcnavi_tx_lanes(const uint8_t *lanes);
   
 #endif // LIBPATCH_BLMJCIAAPA_HUD_SVCNAVI_TX_H

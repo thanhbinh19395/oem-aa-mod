@@ -9,6 +9,7 @@
 
 #include "common/config.h"        // libpatch_config::use_protocol_v1_6()
 #include "../oem/blmjciaapa.h"    // AapConnectionManager_* accessors
+#include "common/thread_util.h"
 
 #include <pthread.h>
 #include <string.h>
@@ -158,7 +159,7 @@ void spawn_activator_once(void)
     }
 
     pthread_t t;
-    if (pthread_create(&t, nullptr, activator_thread, nullptr) == 0) {
+    if (preload_thread_create(&t, activator_thread, nullptr) == 0) {
         pthread_detach(t);
         LOGD("bt16pair: spawned deferred pairing-bypass activator");
     } else {

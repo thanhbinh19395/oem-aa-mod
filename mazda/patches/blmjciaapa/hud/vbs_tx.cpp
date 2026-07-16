@@ -40,7 +40,9 @@
 #include "../log.h"
 #include "vbs_tx.h"
 #include "hud_nav.h"
+#include "hud_lane.h"   // oem_lane_glyph — OEM lane code -> cluster glyph (mapped on this wire)
 #include "../oem/libjcivbsnaviclient.h"
+#include "common/thread_util.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -66,6 +68,11 @@ namespace {
 // oem/libjcivbsnaviclient.{h,cpp}.
 constexpr const char *kBusName = "com.jci.aapa.hud";
 
+// Empty-slot sentinel for VBS_NAVI_SetRecommLaneReq's (ay) lane array: the OEM
+// method hides a slot with this byte on the wire. VBS-only — the canonical
+// snapshot hidden value is OEM_LANE_NONE (0); we remap 0 -> this at emit.
+constexpr uint8_t kVbsLaneHidden = 0xFF;
+
 // map_distance_unit() (distance-unit enum) comes from hud_nav.h, shared with
 // the svcnavi transport. The turn-icon mapping (kTurnIcons / compute_turn_icon)
 // now lives in hud.cpp — this transport receives an already-resolved glyph.
@@ -81,7 +88,7 @@ struct NaviSnapshot {
     uint32_t dir_icon;           // Mazda HUD maneuver glyph (resolved by hud.cpp)
     int32_t  distance_dec;       // value * 10 (one decimal place)
     uint8_t  distance_unit;      // ALREADY mapped to Mazda enum
-    uint8_t  lanes[8];           // Mazda lane bytes: 0=hidden, 1=unmarked, 22=marked
+    uint8_t  lanes[8];           // OEM lane codes: 0=hidden, 1..70 (mapped to glyphs at emit)
 };
 
 NaviSnapshot           g_snapshot   = {};
@@ -203,7 +210,7 @@ void send_one(const NaviSnapshot &cur,
     // shown->hidden transitions are already covered by lanes_changed.
     bool cur_lanes_visible = false;
     for (size_t i = 0; i < sizeof(cur.lanes); ++i) {
-        if (cur.lanes[i] != HUD_LANE_HIDDEN) { cur_lanes_visible = true; break; }
+        if (cur.lanes[i] != OEM_LANE_NONE) { cur_lanes_visible = true; break; }
     }
     bool send_lanes = lanes_changed || (send_msg2 && cur_lanes_visible);
 
@@ -250,14 +257,19 @@ void send_one(const NaviSnapshot &cur,
     if (send_lanes) {
         // Same sync generation as the disp/msg2 just sent (send_msg2 is forced
         // true whenever lanes go out, so sync was bumped above). The HUD ties the
-        // lane array to that generation. SetRecommLaneReq hides a slot with 0xFF,
-        // so remap our canonical hidden (0) to it; the marked/unmarked codes go on
-        // the wire unchanged. The OEM setter dereferences both middle args (see
-        // libjcivbsnaviclient.h), so it gets pointers to the data pointer and the
-        // count.
+        // lane array to that generation. This transport bypasses svcjcinavi, so it
+        // maps each OEM lane code to its cluster glyph here (Table A for now —
+        // svcjcinavi's own static default, which renders on any cluster), then hides
+        // empty slots with kVbsLaneHidden (0xFF), SetRecommLaneReq's per-slot hide
+        // code. The OEM setter dereferences both middle args (see
+        // libjcivbsnaviclient.h), so it gets pointers to the data pointer and the count.
         uint8_t wire[8];
-        for (int i = 0; i < 8; ++i)
-            wire[i] = (cur.lanes[i] == HUD_LANE_HIDDEN) ? 0xFF : cur.lanes[i];
+        for (int i = 0; i < 8; ++i) {
+            uint8_t code = cur.lanes[i];   // OEM lane code, 0 = hidden
+            wire[i] = (code == OEM_LANE_NONE)
+                          ? kVbsLaneHidden
+                          : oem_lane_glyph((OemLaneCode)code, OEM_LANE_TABLE_A);
+        }
         const uint8_t *lane_data  = wire;
         const uint32_t lane_count = sizeof(wire);
         int rc = VBS_NAVI_SetRecommLaneReq(g_conn, &lane_data, &lane_count,
@@ -350,11 +362,11 @@ void sender_teardown()
         } else {
             LOGD("hud sender: sent HUD clear frame");
         }
-        // Hide any lanes a 1.6 session left on the HUD (all slots hidden). 0xFF
-        // is SetRecommLaneReq's per-slot hide code.
+        // Hide any lanes a 1.6 session left on the HUD (all slots hidden).
+        // kVbsLaneHidden (0xFF) is SetRecommLaneReq's per-slot hide code.
         {
             uint8_t clear_lanes[8];
-            std::memset(clear_lanes, 0xFF, sizeof(clear_lanes));
+            std::memset(clear_lanes, kVbsLaneHidden, sizeof(clear_lanes));
             const uint8_t *lane_data  = clear_lanes;
             const uint32_t lane_count = sizeof(clear_lanes);
             VBS_NAVI_SetRecommLaneReq(g_conn, &lane_data, &lane_count,
@@ -481,8 +493,7 @@ void vbs_tx_start(void)
     g_stop.store(false, std::memory_order_release);
     g_active.store(false, std::memory_order_release);
 
-    if (pthread_create(&g_sender_thread, nullptr,
-                       sender_main, nullptr) != 0) {
+    if (preload_thread_create(&g_sender_thread, sender_main, nullptr) != 0) {
         LOGC("vbs_tx_start: failed to spawn sender thread");
         return;
     }
@@ -582,7 +593,7 @@ void vbs_tx_lanes(const uint8_t *lanes)
     if (lanes) {
         std::memcpy(g_snapshot.lanes, lanes, sizeof(g_snapshot.lanes));
     } else {
-        std::memset(g_snapshot.lanes, HUD_LANE_HIDDEN, sizeof(g_snapshot.lanes));
+        std::memset(g_snapshot.lanes, OEM_LANE_NONE, sizeof(g_snapshot.lanes));
     }
     seqlock_end();
 }

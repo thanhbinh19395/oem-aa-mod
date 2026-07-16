@@ -20,6 +20,7 @@
 #include "../log.h"
 #include "touch.h"
 #include "touch_send.h"
+#include "common/thread_util.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -277,7 +278,7 @@ void touch_post_aap_create_session(void)
     // The reader thread opens the evdev node itself (with retries) so
     // that session start stays cheap and a momentarily-absent device
     // doesn't block or break session bring-up.
-    int rc = pthread_create(&g_thread, nullptr, reader_main, nullptr);
+    int rc = preload_thread_create(&g_thread, reader_main, nullptr);
     if (rc != 0) {
         LOGE("touch reader: pthread_create failed: %d", rc);
         close(g_stop_fd);
