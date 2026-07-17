@@ -28,6 +28,7 @@ Refer the Configuration Parameters in the Appendix section of API documentation 
            <key_codes>
                 <value>AAP_KEYCODE_SEARCH</value>
                 <value>AAP_KEYCODE_MEDIA_PLAY</value>
+                <value>AAP_KEYCODE_MEDIA_PAUSE</value>
                 <value>AAP_KEYCODE_MEDIA_PREVIOUS</value>
                 <value>AAP_KEYCODE_MEDIA_NEXT</value>
                 <value>AAP_KEYCODE_NAVIGATION</value>

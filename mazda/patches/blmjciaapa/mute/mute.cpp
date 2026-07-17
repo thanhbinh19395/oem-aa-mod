@@ -6,16 +6,29 @@
 // keeps streaming, so you miss podcast/audiobook/music content while muted.
 // The OEM AA projection key path (HMIEventHandler::InputKey ->
 // RaceAap::SendKeyInput) can send KEYCODE_MEDIA_PLAY but has NO pause
-// keycode, so stock Android Auto is never paused on mute. This module fills
-// that gap:
+// keycode, and the head unit never advertises one, so stock Android Auto is
+// never paused on mute. This module fills that gap:
 //
 //   user mute   -> KEYCODE_MEDIA_PAUSE (0x7f)  (only if AA media has focus)
 //   user unmute -> KEYCODE_MEDIA_PLAY  (0x7e)  (only if WE paused on mute)
 //
-// Trigger: the OEM audio manager broadcasts the user-visible mute state on
-// the JCI service bus as com.jci.vbs.am / EntertainmentMuteStatus, a single
-// byte (1 = muted, 0 = unmuted). That is the OEM's own high-level mute — the
-// same signal libjciuiasystem.so uses to raise the on-screen mute wink.
+// IMPORTANT: the PAUSE half only reaches the phone because this mod ALSO adds
+// AAP_KEYCODE_MEDIA_PAUSE to the head unit's advertised key_codes in
+// /etc/aap_system_attributes*.xml (see resources/ in this repo). That XML is
+// read at session start to build the AAP InputSourceService descriptor, which
+// tells the phone which keycodes the head unit can emit; Android silently
+// drops key events for keycodes it was never told about. The stock XML lists
+// only ...MEDIA_PLAY (so the OEM can resume but never pause) — without the XML
+// change, SendKeyInput(0x7f) is discarded phone-side and the mute does nothing.
+//
+// Trigger: the OEM audio manager (com.jci.vbs.am) broadcasts the user-visible
+// mute state as EntertainmentMuteStatus, a single byte (1 = muted, 0 =
+// unmuted). The am server emits it on its HMI D-Bus connection (its own error
+// strings name it "gs_amHMIConn"/"AM HMI connection"), i.e. the JCI *HMI* bus
+// ($JCI_HMI_BUS, unix:path=/tmp/dbus_hmi_socket) — NOT the service bus. It is
+// the same high-level mute libjciuiasystem.so uses to raise the on-screen mute
+// wink. An earlier revision subscribed on the service bus and so never saw the
+// signal (mute did nothing); the watcher MUST connect to the HMI bus.
 // Transient anti-pop / source-switch mutes travel on the separate
 // MuteStatus(muteType) signals and do NOT set EntertainmentMuteStatus, so
 // keying off it gives exactly the deliberate mute the user perceives.
@@ -51,10 +64,13 @@
 
 namespace {
 
-// Service-bus address. The OEM exports it in $JCI_SERVICE_BUS; the shipped
-// value is unix:path=/tmp/dbus_service_socket, our fallback if it is unset
-// in this PID (same fallback the HUD sender uses).
-constexpr const char *kServiceBusFallback = "unix:path=/tmp/dbus_service_socket";
+// HMI-bus address. EntertainmentMuteStatus is emitted on the am server's HMI
+// connection, so we subscribe on the HMI bus, not the service bus. The OEM
+// exports the address in $JCI_HMI_BUS (see /usr/bin/dbus, which launches the
+// HMI daemon and exports the var to every process, e.g. via dbus.env); the
+// shipped socket is unix:path=/tmp/dbus_hmi_socket, our fallback if the var is
+// unset in this PID.
+constexpr const char *kHmiBusFallback = "unix:path=/tmp/dbus_hmi_socket";
 
 // com.jci.vbs.am EntertainmentMuteStatus — signal member + a subscribe
 // match rule. Verified against the server module's introspection XML
@@ -70,9 +86,9 @@ constexpr const char *kMatchRule =
 // path is not latency-critical, so a few hundred ms is fine.
 constexpr int kDispatchTimeoutMs = 250;
 
-// Backoff before re-opening the bus connection after a disconnect. The
-// service bus is stable during an AA session (blmjciaapa itself depends on
-// it), so this is purely defensive; the wait is interruptible by stop.
+// Backoff before re-opening the bus connection after a disconnect. The HMI
+// bus is stable during an AA session (blmjciaapa itself holds an HMI dbus
+// connection), so this is purely defensive; the wait is interruptible by stop.
 constexpr int kReconnectDelayMs = 1000;
 
 // SDK "session not connected yet" — expected briefly after create until the
@@ -243,14 +259,14 @@ void handle_message(void *msg)
     on_mute_changed(val != 0);
 }
 
-// Open a private service-bus connection and subscribe to the mute signal.
+// Open a private HMI-bus connection and subscribe to the mute signal.
 // Returns true on success; on any failure the connection is released.
 bool setup_connection()
 {
-    const char *addr = getenv("JCI_SERVICE_BUS");
+    const char *addr = getenv("JCI_HMI_BUS");
     if (addr == nullptr || addr[0] == '\0') {
-        addr = kServiceBusFallback;
-        LOGW("$JCI_SERVICE_BUS unset — falling back to %s", addr);
+        addr = kHmiBusFallback;
+        LOGW("$JCI_HMI_BUS unset — falling back to %s", addr);
     }
 
     g_conn = dbus_connection_open_private(addr, nullptr);
@@ -308,7 +324,7 @@ void *watcher_main(void *)
         while (!stop_requested()) {
             // Block up to kDispatchTimeoutMs for I/O. FALSE => disconnected.
             if (dbus_connection_read_write(g_conn, kDispatchTimeoutMs) == 0) {
-                LOGW("service bus disconnected — will reconnect");
+                LOGW("HMI bus disconnected — will reconnect");
                 break;
             }
             void *msg;
