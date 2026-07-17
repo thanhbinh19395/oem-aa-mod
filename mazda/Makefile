@@ -200,8 +200,8 @@ $(SPLIM_BIN): $(SPLIM_SRC)
 # --- USB installer package -------------------------------------------------
 # `make installer` builds the release libs and stages a self-contained,
 # ready-to-copy USB payload under $(USB_DIR). It gathers three things:
-#   1. the CMU installer harness (run.sh + the js/mp3/mp3title.txt autorun
-#      trigger) from installer/
+#   1. the CMU installer harness (combined/AA/CarPlay scripts plus the
+#      js/mp3/mp3title.txt autorun trigger) from installer/
 #   2. the OEM config files run.sh installs, from ../resources
 #   3. the freshly built release libpatch-*.so shims, flattened alongside them
 # so the .so files land right next to the installer exactly as run.sh expects.
@@ -213,7 +213,8 @@ USB_DIR       := $(BUILD_DIR)/installer
 installer: release splim_udpd
 	rm -rf $(USB_DIR)
 	mkdir -p $(USB_DIR)
-	cp $(INSTALLER_SRC)/run.sh $(INSTALLER_SRC)/mp3title.txt $(USB_DIR)/
+	cp $(INSTALLER_SRC)/run.sh $(INSTALLER_SRC)/run-aa.sh \
+	   $(INSTALLER_SRC)/run-carplay.sh $(INSTALLER_SRC)/mp3title.txt $(USB_DIR)/
 	cp -r $(INSTALLER_SRC)/js $(INSTALLER_SRC)/mp3 $(USB_DIR)/
 	cp -r $(RESOURCES_SRC) $(USB_DIR)/resources
 	cp $(RELEASE_LIBS) $(USB_DIR)/
