@@ -39,14 +39,15 @@
 #include "../oem/libdbus.h"      // raw libdbus-1 receive path
 #include "common/thread_util.h"  // preload_thread_create (bounded stack)
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
+#include <errno.h>
+#include <poll.h>
 #include <pthread.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 namespace {
 
@@ -81,9 +82,17 @@ constexpr int kAapSessionNotConnected = 0x108;
 pthread_t g_thread;
 bool      g_thread_up = false;
 
-std::atomic<bool>       g_stop{false};
-std::mutex              g_stop_mu;
-std::condition_variable g_stop_cv;
+// Stop signal: a single eventfd shared between the lifecycle thread (writer)
+// and the watcher thread (poller), exactly like the touch reader. One write
+// makes it permanently readable, waking the watcher whether it is in the
+// reconnect backoff or between dispatch iterations. Using a POSIX eventfd +
+// poll (not std::condition_variable::wait_for) also keeps this TU off
+// std::chrono::system_clock::now(), whose libstdc++ symbol is versioned
+// GLIBCXX_3.4.19 — ABSENT from the device's libstdc++.so.6.0.14. Linking it
+// in makes ld.so refuse to map the whole preload shim, so sm_svclauncher
+// never brings up jciAAPA and Android Auto disappears from the menu. -1 when
+// no watcher is running.
+int g_stop_fd = -1;
 
 void *g_conn = nullptr;
 
@@ -91,13 +100,20 @@ void *g_conn = nullptr;
 // (PLAY) what we paused. Touched only on the watcher thread.
 bool g_we_paused = false;
 
-// Interruptible sleep: wait up to `ms`, returning true if a stop was
-// requested (caller should bail), false on timeout.
+// True if the stop eventfd has been signalled (non-blocking peek).
+bool stop_requested()
+{
+    struct pollfd pfd = { g_stop_fd, POLLIN, 0 };
+    return poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN);
+}
+
+// Interruptible sleep: wait up to `ms` for the stop eventfd, returning true if
+// a stop was requested (caller should bail), false on timeout.
 bool wait_stop(int ms)
 {
-    std::unique_lock<std::mutex> lk(g_stop_mu);
-    return g_stop_cv.wait_for(lk, std::chrono::milliseconds(ms),
-                              [] { return g_stop.load(std::memory_order_relaxed); });
+    struct pollfd pfd = { g_stop_fd, POLLIN, 0 };
+    int pr = poll(&pfd, 1, ms);
+    return pr > 0 && (pfd.revents & POLLIN);
 }
 
 // Return true if AA media is the active/focused audio source right now.
@@ -280,7 +296,7 @@ void *watcher_main(void *)
     // clear the "we paused it" latch on every connect. That prefers "mute
     // always silences" over "always auto-resume": worst case we miss one resume
     // right after a (rare) reconnect, instead of a mute becoming a silent no-op.
-    while (!g_stop.load(std::memory_order_relaxed)) {
+    while (!stop_requested()) {
         g_we_paused = false;
 
         if (!setup_connection()) {
@@ -289,7 +305,7 @@ void *watcher_main(void *)
             continue;
         }
 
-        while (!g_stop.load(std::memory_order_relaxed)) {
+        while (!stop_requested()) {
             // Block up to kDispatchTimeoutMs for I/O. FALSE => disconnected.
             if (dbus_connection_read_write(g_conn, kDispatchTimeoutMs) == 0) {
                 LOGW("service bus disconnected — will reconnect");
@@ -303,7 +319,7 @@ void *watcher_main(void *)
         }
 
         teardown_connection();
-        if (g_stop.load(std::memory_order_relaxed)) break;
+        if (stop_requested()) break;
         if (wait_stop(kReconnectDelayMs)) break;
     }
 
@@ -318,11 +334,21 @@ void mute_post_aap_create_session(void)
     if (g_thread_up)
         return;
 
-    g_stop.store(false, std::memory_order_release);
     g_we_paused = false;
+
+    // The stop eventfd must exist before the watcher starts so its very first
+    // stop check / backoff is interruptible. EFD_NONBLOCK keeps the
+    // stop_requested() peek from ever blocking.
+    g_stop_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (g_stop_fd < 0) {
+        LOGC("mute watcher: eventfd() failed: %s", strerror(errno));
+        return;
+    }
 
     if (preload_thread_create(&g_thread, watcher_main, nullptr) != 0) {
         LOGC("failed to spawn mute watcher thread");
+        close(g_stop_fd);
+        g_stop_fd = -1;
         return;
     }
     g_thread_up = true;
@@ -334,14 +360,17 @@ void mute_pre_aap_destroy_session(void)
     if (!g_thread_up)
         return;
 
-    g_stop.store(true, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lk(g_stop_mu);
-    }
-    g_stop_cv.notify_all();
+    // One write makes the eventfd permanently readable, instantly waking the
+    // watcher whether it's in the reconnect backoff or between dispatch reads.
+    uint64_t one = 1;
+    if (write(g_stop_fd, &one, sizeof(one)) != (ssize_t)sizeof(one))
+        LOGE("mute watcher: write(stop eventfd) failed: %s", strerror(errno));
 
     pthread_join(g_thread, nullptr);
     g_thread_up = false;
     g_we_paused = false;
+
+    close(g_stop_fd);
+    g_stop_fd = -1;
     LOGD("mute watcher thread stopped");
 }
