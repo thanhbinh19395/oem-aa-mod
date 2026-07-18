@@ -22,16 +22,20 @@
 // change, SendKeyInput(0x7f) is discarded phone-side and the mute does nothing.
 //
 // Trigger: the OEM audio manager (com.jci.vbs.am) broadcasts the user-visible
-// mute state as EntertainmentMuteStatus, a single byte (1 = muted, 0 =
-// unmuted). The am server emits it on its HMI D-Bus connection (its own error
-// strings name it "gs_amHMIConn"/"AM HMI connection"), i.e. the JCI *HMI* bus
-// ($JCI_HMI_BUS, unix:path=/tmp/dbus_hmi_socket) — NOT the service bus. It is
-// the same high-level mute libjciuiasystem.so uses to raise the on-screen mute
-// wink. An earlier revision subscribed on the service bus and so never saw the
-// signal (mute did nothing); the watcher MUST connect to the HMI bus.
+// mute state as EntertainmentMuteStatus, a single byte enum. Confirmed on
+// device with dbus-monitor: it is emitted as a BROADCAST (dest=(null)) on BOTH
+// the HMI bus ($JCI_HMI_BUS, unix:path=/tmp/dbus_hmi_socket) and the service
+// bus, carrying values 2 = muted and 1 = unmuted (0 = uninitialised, never
+// seen in normal use) — NOT the 1/0 the server's introspection hints at.
+// Because it is broadcast, a passive dbus_bus_add_match on either bus receives
+// it; we use the HMI bus, where the mute-wink consumer libjciuiasystem.so also
+// lives. NOTE: an earlier revision decoded this as `muted = (val != 0)`, which
+// treated BOTH real values (1 and 2) as "muted" and so NEVER resumed on unmute
+// — that, not the choice of bus, is why the feature did nothing.
 // Transient anti-pop / source-switch mutes travel on the separate
-// MuteStatus(muteType) signals and do NOT set EntertainmentMuteStatus, so
-// keying off it gives exactly the deliberate mute the user perceives.
+// MuteStatus / UnMuteStatus(muteType) signals and do NOT drive
+// EntertainmentMuteStatus, so keying off it gives exactly the deliberate mute
+// the user perceives.
 //
 // Action: RaceAap::SendKeyInput with the same AAP_KeyEvent the OEM builds
 // (eType = 0xe00, an Android keycode, a press then a release). We only PAUSE
@@ -73,13 +77,21 @@ namespace {
 constexpr const char *kHmiBusFallback = "unix:path=/tmp/dbus_hmi_socket";
 
 // com.jci.vbs.am EntertainmentMuteStatus — signal member + a subscribe
-// match rule. Verified against the server module's introspection XML
-// (jci/vbs/modules/libjcimod_am.so): one arg of D-Bus type 'y' (byte),
-// 1 = EntertainmentMuteON, 0 = EntertainmentMuteOFF.
+// match rule. One arg of D-Bus type 'y' (byte). The runtime enum, verified
+// via on-device dbus-monitor, is 2 = muted (ON) and 1 = unmuted (OFF); 0 is
+// uninitialised and never seen in normal use. See kEntMuteOn/kEntMuteOff.
 constexpr const char *kAmIface     = "com.jci.vbs.am";
 constexpr const char *kMuteMember  = "EntertainmentMuteStatus";
 constexpr const char *kMatchRule =
     "type='signal',interface='com.jci.vbs.am',member='EntertainmentMuteStatus'";
+
+// EntertainmentMuteStatus byte values, confirmed by on-device dbus-monitor
+// (byte 2 on mute, byte 1 on unmute; 0 never observed). The introspection XML
+// is silent on the mapping, so decode strictly against these two constants and
+// ignore anything else — acting on an unknown value could pause/resume out of
+// sync with the real mute state.
+constexpr uint8_t kEntMuteOn  = 2;   // muted   -> pause the phone
+constexpr uint8_t kEntMuteOff = 1;   // unmuted -> resume the phone
 
 // How long dbus_connection_read_write blocks per iteration before we
 // re-check the stop flag. Bounds the stop/join latency; the session teardown
@@ -255,8 +267,18 @@ void handle_message(void *msg)
     dbus_message_iter_get_basic(&it, &bv);
     uint8_t val = bv.y;
 
-    LOGD("EntertainmentMuteStatus = %u (%s)", val, val ? "muted" : "unmuted");
-    on_mute_changed(val != 0);
+    // Decode strictly against the confirmed enum (2 = muted, 1 = unmuted).
+    // Any other value (notably 0 = uninitialised) is ignored so we never act
+    // on an ambiguous state.
+    if (val == kEntMuteOn) {
+        LOGD("EntertainmentMuteStatus = %u (muted)", val);
+        on_mute_changed(true);
+    } else if (val == kEntMuteOff) {
+        LOGD("EntertainmentMuteStatus = %u (unmuted)", val);
+        on_mute_changed(false);
+    } else {
+        LOGD("EntertainmentMuteStatus = %u (ignored: not muted/unmuted)", val);
+    }
 }
 
 // Open a private HMI-bus connection and subscribe to the mute signal.
