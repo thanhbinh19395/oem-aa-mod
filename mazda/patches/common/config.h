@@ -27,6 +27,9 @@
 //                                     1.6 navigation protocol (maneuver / lanes / distance)
 //                                     instead of the 1.5 turn events; read by aap_service
 //                                     (default false = stock 1.5)
+//   mute_pauses_phone = true|false    on a user mute, send Android Auto a media PAUSE (and a
+//                                     media PLAY on unmute) so the phone stops streaming while
+//                                     muted instead of only silencing the amp (default false)
 //
 // Booleans are lenient (true/1/yes/on, false/0/no/off). hud_transport
 // also accepts "svcjcinavi" as an alias for "svcnavi".
@@ -207,6 +210,7 @@ struct Settings {
     bool         force_street_name = false;
     bool         hud_fold_latin    = true;
     bool         use_protocol_v1_6 = false;
+    bool         mute_pauses_phone = false;
     bool         loaded            = false;
 };
 
@@ -249,6 +253,8 @@ inline void apply_kv(const char *key, const char *val, void *ud)
         s.hud_fold_latin = parse_bool(val, s.hud_fold_latin);
     } else if (strcasecmp(key, "use_protocol_v1_6") == 0) {
         s.use_protocol_v1_6 = parse_bool(val, s.use_protocol_v1_6);
+    } else if (strcasecmp(key, "mute_pauses_phone") == 0) {
+        s.mute_pauses_phone = parse_bool(val, s.mute_pauses_phone);
     } else {
         // Common schema: a key this library doesn't act on is not an
         // error, just informational.
@@ -260,14 +266,15 @@ inline void log_effective(const char *prefix)
 {
     const Settings &s = settings();
     LOGD("config: %s touch=%s hud=%s hud_transport=%s force_street_name=%s "
-         "hud_fold_latin=%s use_protocol_v1_6=%s",
+         "hud_fold_latin=%s use_protocol_v1_6=%s mute_pauses_phone=%s",
          prefix,
          s.touch ? "true" : "false",
          s.hud   ? "true" : "false",
          transport_name(s.hud_transport),
          s.force_street_name ? "true" : "false",
          s.hud_fold_latin ? "true" : "false",
-         s.use_protocol_v1_6 ? "true" : "false");
+         s.use_protocol_v1_6 ? "true" : "false",
+         s.mute_pauses_phone ? "true" : "false");
 }
 
 // === Public API ===============================================
@@ -309,6 +316,7 @@ inline HudTransport hud_transport()  { return settings().hud_transport; }
 inline bool         force_street_name() { return settings().force_street_name; }
 inline bool         hud_fold_latin() { return settings().hud_fold_latin; }
 inline bool         use_protocol_v1_6() { return settings().use_protocol_v1_6; }
+inline bool         mute_pauses_phone() { return settings().mute_pauses_phone; }
 
 } // namespace libpatch_config
 

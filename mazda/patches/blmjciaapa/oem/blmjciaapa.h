@@ -53,6 +53,27 @@ enum AAPTouchAction : uint32_t {
     kAAPTouchActionPointerUp   = 5,  // one of several lifted (n: k -> k-1, k>=2)
 };
 
+// Wire-format AAP_KeyEvent (12 bytes) for RaceAap::SendKeyInput. Mirrors the
+// three consecutive stack words HMIEventHandler::InputKey builds before every
+// SendKeyInput call: an event type (the OEM always uses 0xe00 for key input),
+// an Android keycode, and a down/up flag. A key "press" is two calls — bDown
+// 1 (press) then bDown 0 (release) — exactly as the OEM does.
+struct AAP_KeyEvent {
+    uint32_t eType;      // +0x00  event type; OEM key input uses kAAPKeyEventType
+    uint32_t eKeyCode;   // +0x04  Android KEYCODE_* value
+    uint32_t bDown;      // +0x08  1 = key down (press), 0 = key up (release)
+};
+static_assert(sizeof(AAP_KeyEvent) == 0xc, "AAP_KeyEvent must be 12 bytes");
+
+// eType the OEM stamps on every key event it feeds to SendKeyInput.
+constexpr uint32_t kAAPKeyEventType = 0xe00;
+
+// Android media keycodes we inject. KEYCODE_MEDIA_PLAY is the very code the
+// OEM's own InputKey case 0xe emits; KEYCODE_MEDIA_PAUSE has no OEM AA path
+// (the projection key map has no pause), which is the gap the mute bridge fills.
+constexpr uint32_t kAAPKeyMediaPlay  = 0x7e;  // 126 KEYCODE_MEDIA_PLAY
+constexpr uint32_t kAAPKeyMediaPause = 0x7f;  // 127 KEYCODE_MEDIA_PAUSE
+
 // OEM functions/methods inside blmjciaapa.so. The OEM declares the
 // methods as non-static C++ members; ARM EABI passes the implicit
 // `this` in r0 like a normal first argument, so they are modelled as
@@ -60,13 +81,21 @@ enum AAPTouchAction : uint32_t {
 //   Singleton<AapProc>::GetInstance()      -> AapProc *
 //   AapProc::GetVideoManager()             -> VideoManager *
 //   AapProc::GetRaceAap()                  -> RaceAap *
+//   AapProc::GetAudioManager()             -> AudioManager *
 //   VideoManager::IsAAVideoInFocus()       -> int (bool)
+//   AudioManager::IsAAMediaInFocus()       -> int (bool)  AA media is the active/focused source
+//   AudioManager::IsAAMediaInPlaying()     -> int (bool)  AA media is actively PLAYING (not paused)
 //   RaceAap::SendTouchInput(AAP_TouchEvent*) -> int (0 = ok)
+//   RaceAap::SendKeyInput(AAP_KeyEvent*)     -> int (0 = ok)
 void *Singleton_AapProc_GetInstance(void);
 void *AapProc_GetVideoManager(void *self);
 void *AapProc_GetRaceAap(void *self);
+void *AapProc_GetAudioManager(void *self);
 int   VideoManager_IsAAVideoInFocus(void *self);
+int   AudioManager_IsAAMediaInFocus(void *self);
+int   AudioManager_IsAAMediaInPlaying(void *self);
 int   RaceAap_SendTouchInput(void *self, AAP_TouchEvent *evt);
+int   RaceAap_SendKeyInput(void *self, AAP_KeyEvent *evt);
 
 // AapConnectionManager access, used by the wireless GAL-1.6 BT-pairing
 // bypass (bt16pair/). The AapConnectionManager is a subobject of the

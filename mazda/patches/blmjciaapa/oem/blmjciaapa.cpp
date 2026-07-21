@@ -29,12 +29,20 @@ constexpr uintptr_t Singleton_AapProc_GetInstance = 0x00062670;
 constexpr uintptr_t AapProc_GetVideoManager       = 0x0007f664;
 //   _ZN7AapProc10GetRaceAapEv
 constexpr uintptr_t AapProc_GetRaceAap            = 0x0007f614;
+//   _ZN7AapProc15GetAudioManagerEv
+constexpr uintptr_t AapProc_GetAudioManager       = 0x0007f63c;
 //   _ZN7AapProc22GetAapConnectionManagerEv
 constexpr uintptr_t AapProc_GetAapConnectionManager = 0x000872fc;
 //   _ZN12VideoManager16IsAAVideoInFocusEv
 constexpr uintptr_t VideoManager_IsAAVideoInFocus = 0x000b3af4;
+//   _ZN12AudioManager16IsAAMediaInFocusEv
+constexpr uintptr_t AudioManager_IsAAMediaInFocus = 0x000ac3b0;
+//   _ZN12AudioManager18IsAAMediaInPlayingEv
+constexpr uintptr_t AudioManager_IsAAMediaInPlaying = 0x000ac3f8;
 //   _ZN7RaceAap14SendTouchInputEP14AAP_TouchEvent
 constexpr uintptr_t RaceAap_SendTouchInput        = 0x0008e3a8;
+//   _ZN7RaceAap12SendKeyInputEP12AAP_KeyEvent
+constexpr uintptr_t RaceAap_SendKeyInput          = 0x0008e534;
 //   _ZN20AapConnectionManager21NotifyBtPairingResultE12true_false_t
 constexpr uintptr_t AapConnectionManager_NotifyBtPairingResult = 0x0007c820;
 //   _ZN20AapConnectionManager18ActivateAapSessionEv
@@ -152,10 +160,15 @@ void *blm_addr(uintptr_t target_offset)
 BLM_THUNK(void *, Singleton_AapProc_GetInstance, (void), (), nullptr)
 BLM_THUNK(void *, AapProc_GetVideoManager, (void *self), (self), nullptr)
 BLM_THUNK(void *, AapProc_GetRaceAap, (void *self), (self), nullptr)
+BLM_THUNK(void *, AapProc_GetAudioManager, (void *self), (self), nullptr)
 BLM_THUNK(void *, AapProc_GetAapConnectionManager, (void *self), (self), nullptr)
 BLM_THUNK(int,    VideoManager_IsAAVideoInFocus, (void *self), (self), 0)
+BLM_THUNK(int,    AudioManager_IsAAMediaInFocus, (void *self), (self), 0)
+BLM_THUNK(int,    AudioManager_IsAAMediaInPlaying, (void *self), (self), 0)
 BLM_THUNK(int,    RaceAap_SendTouchInput,
           (void *self, AAP_TouchEvent *evt), (self, evt), -1)
+BLM_THUNK(int,    RaceAap_SendKeyInput,
+          (void *self, AAP_KeyEvent *evt), (self, evt), -1)
 BLM_THUNK_VOID(AapConnectionManager_NotifyBtPairingResult,
                (void *self, int result), (self, result))
 BLM_THUNK_VOID(AapConnectionManager_ActivateAapSession,

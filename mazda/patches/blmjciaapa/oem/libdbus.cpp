@@ -49,3 +49,18 @@ OEM_THUNK(int, dbus_connection_send,
           (void *conn, void *msg, uint32_t *serial), (conn, msg, serial), 0)
 OEM_THUNK_VOID(dbus_connection_flush, (void *conn), (conn))
 OEM_THUNK_VOID(dbus_message_unref, (void *msg), (msg))
+
+OEM_THUNK_VOID(dbus_bus_add_match,
+               (void *conn, const char *rule, void *error), (conn, rule, error))
+OEM_THUNK(int, dbus_connection_read_write,
+          (void *conn, int timeout_milliseconds), (conn, timeout_milliseconds), 0)
+OEM_THUNK(void *, dbus_connection_pop_message, (void *conn), (conn), nullptr)
+OEM_THUNK(int, dbus_message_is_signal,
+          (void *msg, const char *iface, const char *member),
+          (msg, iface, member), 0)
+OEM_THUNK(int, dbus_message_iter_init,
+          (void *msg, DBusMessageIter *iter), (msg, iter), 0)
+OEM_THUNK(int, dbus_message_iter_get_arg_type,
+          (DBusMessageIter *iter), (iter), 0)
+OEM_THUNK_VOID(dbus_message_iter_get_basic,
+               (DBusMessageIter *iter, void *value), (iter, value))

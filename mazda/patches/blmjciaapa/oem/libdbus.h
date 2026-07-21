@@ -25,7 +25,8 @@
 
 #include <stdint.h>
 
-// D-Bus basic type codes (dbus-protocol.h). Only the two we marshal.
+// D-Bus basic type codes (dbus-protocol.h). Only the ones we marshal.
+#define DBUS_TYPE_BYTE   ((int)'y')   // 121
 #define DBUS_TYPE_INT32  ((int)'i')   // 105
 #define DBUS_TYPE_STRING ((int)'s')   // 115
 
@@ -74,5 +75,18 @@ int   dbus_message_iter_append_basic(DBusMessageIter *iter, int type,
 int   dbus_connection_send(void *conn, void *msg, uint32_t *serial);
 void  dbus_connection_flush(void *conn);
 void  dbus_message_unref(void *msg);
+
+// Signal receive (no main loop): the mute bridge subscribes with add_match,
+// then loops read_write + pop_message, checking each popped message with
+// is_signal and reading its args with the iter API. All are stable
+// libdbus-1.so.3 dynamic exports. dbus_bus_add_match sends the AddMatch to
+// the bus; read_write returns FALSE when the connection has disconnected.
+void dbus_bus_add_match(void *conn, const char *rule, void *error);
+int  dbus_connection_read_write(void *conn, int timeout_milliseconds);
+void *dbus_connection_pop_message(void *conn);
+int  dbus_message_is_signal(void *msg, const char *iface, const char *member);
+int  dbus_message_iter_init(void *msg, DBusMessageIter *iter);
+int  dbus_message_iter_get_arg_type(DBusMessageIter *iter);
+void dbus_message_iter_get_basic(DBusMessageIter *iter, void *value);
 
 #endif  // LIBPATCH_BLMJCIAAPA_LIBDBUS_H
