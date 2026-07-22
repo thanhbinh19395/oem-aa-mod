@@ -185,4 +185,5 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" installer-dist/*
+          gh release upload "$TAG" installer-dist/* \
+            --repo "${{ github.repository }}"
