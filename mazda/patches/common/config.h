@@ -27,6 +27,9 @@
 //                                     1.6 navigation protocol (maneuver / lanes / distance)
 //                                     instead of the 1.5 turn events; read by aap_service
 //                                     (default false = stock 1.5)
+//   aa_audio_low_latency = true|false lower Android Auto playback's ALSA start threshold
+//                                     from the full buffer to one negotiated period;
+//                                     read by aap_service (default false)
 //   mute_pauses_phone = true|false    on a user mute, send Android Auto a media PAUSE (and a
 //                                     media PLAY on unmute) so the phone stops streaming while
 //                                     muted instead of only silencing the amp (default true)
@@ -213,6 +216,7 @@ struct Settings {
     bool         force_street_name = false;
     bool         hud_fold_latin    = true;
     bool         use_protocol_v1_6 = false;
+    bool         aa_audio_low_latency = false;
     bool         mute_pauses_phone = true;
     bool         block_headunit_media_play = false;
     bool         loaded            = false;
@@ -257,6 +261,8 @@ inline void apply_kv(const char *key, const char *val, void *ud)
         s.hud_fold_latin = parse_bool(val, s.hud_fold_latin);
     } else if (strcasecmp(key, "use_protocol_v1_6") == 0) {
         s.use_protocol_v1_6 = parse_bool(val, s.use_protocol_v1_6);
+    } else if (strcasecmp(key, "aa_audio_low_latency") == 0) {
+        s.aa_audio_low_latency = parse_bool(val, s.aa_audio_low_latency);
     } else if (strcasecmp(key, "mute_pauses_phone") == 0) {
         s.mute_pauses_phone = parse_bool(val, s.mute_pauses_phone);
     } else if (strcasecmp(key, "block_headunit_media_play") == 0) {
@@ -273,7 +279,8 @@ inline void log_effective(const char *prefix)
 {
     const Settings &s = settings();
     LOGD("config: %s touch=%s hud=%s hud_transport=%s force_street_name=%s "
-         "hud_fold_latin=%s use_protocol_v1_6=%s mute_pauses_phone=%s "
+            "hud_fold_latin=%s use_protocol_v1_6=%s aa_audio_low_latency=%s "
+            "mute_pauses_phone=%s "
          "block_headunit_media_play=%s",
          prefix,
          s.touch ? "true" : "false",
@@ -282,6 +289,7 @@ inline void log_effective(const char *prefix)
          s.force_street_name ? "true" : "false",
          s.hud_fold_latin ? "true" : "false",
          s.use_protocol_v1_6 ? "true" : "false",
+         s.aa_audio_low_latency ? "true" : "false",
          s.mute_pauses_phone ? "true" : "false",
          s.block_headunit_media_play ? "true" : "false");
 }
@@ -325,6 +333,7 @@ inline HudTransport hud_transport()  { return settings().hud_transport; }
 inline bool         force_street_name() { return settings().force_street_name; }
 inline bool         hud_fold_latin() { return settings().hud_fold_latin; }
 inline bool         use_protocol_v1_6() { return settings().use_protocol_v1_6; }
+inline bool         aa_audio_low_latency() { return settings().aa_audio_low_latency; }
 inline bool         mute_pauses_phone() { return settings().mute_pauses_phone; }
 inline bool         block_headunit_media_play() { return settings().block_headunit_media_play; }
 
