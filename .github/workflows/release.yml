@@ -124,7 +124,7 @@ jobs:
             unzip -l "$archive"
           done
 
-      - name: Create draft GitHub release
+      - name: Publish GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -138,11 +138,8 @@ jobs:
             echo "::error::Release $TAG already exists — refusing to overwrite. Delete it manually to re-release."
             exit 1
           fi
-          # Keep the release hidden until the installer workflow has
-          # successfully built and attached its assets.
           gh release create "$TAG" dist/*.zip dist/SHA256SUMS \
             --title "$TAG" \
-            --draft \
             --prerelease \
             --generate-notes
 
@@ -182,11 +179,10 @@ jobs:
           test -f "installer-dist/${INSTALLER_ZIP%.zip}.SHA256SUMS"
           ( cd installer-dist && sha256sum -c "${INSTALLER_ZIP%.zip}.SHA256SUMS" )
 
-      - name: Attach installer and publish release
+      - name: Attach installer to release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           gh release upload "$TAG" installer-dist/*
-          gh release edit "$TAG" --draft=false
