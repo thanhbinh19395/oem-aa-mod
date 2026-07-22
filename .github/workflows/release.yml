@@ -1,7 +1,8 @@
 name: Release
 
-# Build the default (release) shim and publish a GitHub Release on
-# every pushed tag (the project tags as X.Y.Z, e.g. 0.3.0).
+# Build the release assets, assemble an installer through the reusable
+# installer workflow, then publish a complete GitHub Release on every
+# pushed tag (the project tags as X.Y.Z, e.g. 0.3.0).
 #
 # The cross compile is a plain `make -C mazda` driven by the in-repo
 # m3-toolchain submodule. Its binaries are x86_64 ELF, so they run
@@ -123,7 +124,7 @@ jobs:
             unzip -l "$archive"
           done
 
-      - name: Publish GitHub release
+      - name: Create draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -137,7 +138,53 @@ jobs:
             echo "::error::Release $TAG already exists — refusing to overwrite. Delete it manually to re-release."
             exit 1
           fi
+          # Keep the release hidden until the installer workflow has
+          # successfully built and attached its assets.
           gh release create "$TAG" dist/*.zip dist/SHA256SUMS \
             --title "$TAG" \
+            --draft \
             --prerelease \
             --generate-notes
+
+  build-installer:
+    needs: release
+    permissions:
+      contents: read
+    uses: Bijan-A/oem-aa-mod-installer/.github/workflows/build-installer.yml@5915bd65b66355458d301e3c274f316d5152e369
+    with:
+      upstream_tag: ${{ github.ref_name }}
+      upstream_repo: ${{ github.repository }}
+      installer_repo: Bijan-A/oem-aa-mod-installer
+      installer_ref: 5915bd65b66355458d301e3c274f316d5152e369
+
+  publish:
+    needs: build-installer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-installer.outputs.artifact_name }}
+          path: installer-dist
+
+      - name: Verify installer artifact
+        env:
+          INSTALLER_ZIP: ${{ needs.build-installer.outputs.installer_zip }}
+        run: |
+          set -euo pipefail
+          test -f "installer-dist/$INSTALLER_ZIP"
+          test -f "installer-dist/${INSTALLER_ZIP%.zip}.SHA256SUMS"
+          ( cd installer-dist && sha256sum -c "${INSTALLER_ZIP%.zip}.SHA256SUMS" )
+
+      - name: Attach installer and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" installer-dist/*
+          gh release edit "$TAG" --draft=false
