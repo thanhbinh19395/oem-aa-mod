@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Mute -> Android Auto media pause/resume bridge.
+// Mute -> Android Auto media play/pause bridge.
 //
 // The stock head unit only mutes the AMPLIFIER on a user mute — the phone
 // keeps streaming, so you miss podcast/audiobook/music content while muted.
@@ -49,9 +49,9 @@
 // bracketed by aap_create_session / aap_destroy_session, so exactly one
 // watcher thread is alive per AA session.
 
-#define LOG_TAG "MUTE"
+#define LOG_TAG "PLAYPAUSE"
 #include "../log.h"
-#include "mute.h"
+#include "playpause.h"
 #include "../oem/blmjciaapa.h"   // AAP_KeyEvent, keycodes, OEM thunks
 #include "../oem/libdbus.h"      // raw libdbus-1 receive path
 #include "common/thread_util.h"  // preload_thread_create (bounded stack)
@@ -93,11 +93,6 @@ constexpr const char *kMatchRule =
 constexpr uint8_t kEntMuteOn  = 2;   // muted   -> pause the phone
 constexpr uint8_t kEntMuteOff = 1;   // unmuted -> resume the phone
 
-// How long dbus_connection_read_write blocks per iteration before we
-// re-check the stop flag. Bounds the stop/join latency; the session teardown
-// path is not latency-critical, so a few hundred ms is fine.
-constexpr int kDispatchTimeoutMs = 250;
-
 // Backoff before re-opening the bus connection after a disconnect. The HMI
 // bus is stable during an AA session (blmjciaapa itself holds an HMI dbus
 // connection), so this is purely defensive; the wait is interruptible by stop.
@@ -124,6 +119,15 @@ int g_stop_fd = -1;
 
 void *g_conn = nullptr;
 
+// A Unix libdbus transport uses a small fixed set of read/write watches for
+// its socket. Four slots leave margin while avoiding heap work in callbacks,
+// which libdbus invokes with the connection lock held.
+constexpr int kMaxDbusWatches = 4;
+struct DbusWatchSet {
+    void *items[kMaxDbusWatches];
+};
+DbusWatchSet g_dbus_watches = {{nullptr, nullptr, nullptr, nullptr}};
+
 // True once WE issued a media PAUSE in response to a mute, so we only resume
 // (PLAY) what we paused. Touched only on the watcher thread.
 bool g_we_paused = false;
@@ -142,6 +146,51 @@ bool wait_stop(int ms)
     struct pollfd pfd = { g_stop_fd, POLLIN, 0 };
     int pr = poll(&pfd, 1, ms);
     return pr > 0 && (pfd.revents & POLLIN);
+}
+
+void clear_dbus_watches()
+{
+    for (int i = 0; i < kMaxDbusWatches; ++i)
+        g_dbus_watches.items[i] = nullptr;
+}
+
+bool dbus_watch_is_registered(void *watch)
+{
+    for (int i = 0; i < kMaxDbusWatches; ++i) {
+        if (g_dbus_watches.items[i] == watch)
+            return true;
+    }
+    return false;
+}
+
+// Watch callbacks must not call DBusConnection APIs: libdbus invokes them
+// while holding the connection lock. The watcher thread re-queries enabled
+// state and flags whenever it rebuilds its poll set, so toggles need no work.
+DBusBool add_dbus_watch(void *watch, void *)
+{
+    if (dbus_watch_is_registered(watch))
+        return 1;
+    for (int i = 0; i < kMaxDbusWatches; ++i) {
+        if (g_dbus_watches.items[i] == nullptr) {
+            g_dbus_watches.items[i] = watch;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void remove_dbus_watch(void *watch, void *)
+{
+    for (int i = 0; i < kMaxDbusWatches; ++i) {
+        if (g_dbus_watches.items[i] == watch) {
+            g_dbus_watches.items[i] = nullptr;
+            return;
+        }
+    }
+}
+
+void toggle_dbus_watch(void *, void *)
+{
 }
 
 // Return true if AA media is the active/focused audio source right now.
@@ -281,10 +330,21 @@ void handle_message(void *msg)
     }
 }
 
+void drain_messages()
+{
+    void *msg;
+    while ((msg = dbus_connection_pop_message(g_conn)) != nullptr) {
+        handle_message(msg);
+        dbus_message_unref(msg);
+    }
+}
+
 // Open a private HMI-bus connection and subscribe to the mute signal.
 // Returns true on success; on any failure the connection is released.
 bool setup_connection()
 {
+    clear_dbus_watches();
+
     const char *addr = getenv("JCI_HMI_BUS");
     if (addr == nullptr || addr[0] == '\0') {
         addr = kHmiBusFallback;
@@ -293,7 +353,7 @@ bool setup_connection()
 
     g_conn = dbus_connection_open_private(addr, nullptr);
     if (g_conn == nullptr) {
-        LOGC("dbus_connection_open_private(%s) failed — mute bridge inactive", addr);
+        LOGC("dbus_connection_open_private(%s) failed — play/pause bridge inactive", addr);
         return false;
     }
 
@@ -302,16 +362,29 @@ bool setup_connection()
     dbus_connection_set_exit_on_disconnect(g_conn, 0);
 
     if (dbus_bus_register(g_conn, nullptr) == 0) {
-        LOGE("dbus_bus_register failed — mute bridge inactive");
+        LOGE("dbus_bus_register failed — play/pause bridge inactive");
         dbus_connection_close(g_conn);
         dbus_connection_unref(g_conn);
         g_conn = nullptr;
         return false;
     }
 
+    if (dbus_connection_set_watch_functions(
+            g_conn, add_dbus_watch, remove_dbus_watch, toggle_dbus_watch,
+            nullptr, nullptr) == 0) {
+        LOGE("dbus_connection_set_watch_functions failed — play/pause bridge inactive");
+        dbus_connection_close(g_conn);
+        dbus_connection_unref(g_conn);
+        g_conn = nullptr;
+        clear_dbus_watches();
+        return false;
+    }
+
+    // With a NULL DBusError this queues AddMatch without blocking. The write
+    // watch will become enabled and the event loop below will transmit it; no
+    // blocking dbus_connection_flush is needed.
     dbus_bus_add_match(g_conn, kMatchRule, nullptr);
-    dbus_connection_flush(g_conn);
-    LOGD("subscribed to %s.%s on %s", kAmIface, kMuteMember, addr);
+    LOGD("subscription requested for %s.%s on %s", kAmIface, kMuteMember, addr);
     return true;
 }
 
@@ -323,6 +396,99 @@ void teardown_connection()
     dbus_connection_close(g_conn);
     dbus_connection_unref(g_conn);
     g_conn = nullptr;
+    clear_dbus_watches();
+}
+
+// Block until either libdbus has socket work or session teardown signals the
+// stop eventfd. There is deliberately no timeout: an idle play/pause watcher causes
+// no periodic wakeups.
+void run_watch_loop()
+{
+    // Registration may have queued bus-control messages before watch setup.
+    drain_messages();
+
+    while (!stop_requested()) {
+        struct pollfd pfds[kMaxDbusWatches + 1];
+        void *poll_watches[kMaxDbusWatches + 1] = {};
+        nfds_t nfds = 1;
+
+        pfds[0].fd = g_stop_fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+
+        for (int i = 0; i < kMaxDbusWatches; ++i) {
+            void *watch = g_dbus_watches.items[i];
+            if (watch == nullptr || dbus_watch_get_enabled(watch) == 0)
+                continue;
+
+            int fd = dbus_watch_get_unix_fd(watch);
+            if (fd < 0)
+                continue;
+
+            unsigned int flags = dbus_watch_get_flags(watch);
+            short events = 0;
+            if (flags & DBUS_WATCH_READABLE) events |= POLLIN;
+            if (flags & DBUS_WATCH_WRITABLE) events |= POLLOUT;
+
+            pfds[nfds].fd = fd;
+            pfds[nfds].events = events;
+            pfds[nfds].revents = 0;
+            poll_watches[nfds] = watch;
+            ++nfds;
+        }
+
+        if (nfds == 1) {
+            LOGE("HMI bus has no enabled D-Bus watches — reconnecting");
+            return;
+        }
+
+        int pr;
+        do {
+            pr = poll(pfds, nfds, -1);
+        } while (pr < 0 && errno == EINTR);
+
+        if (pr < 0) {
+            LOGE("play/pause watcher: poll() failed: %s", strerror(errno));
+            return;
+        }
+
+        if (pfds[0].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))
+            return;
+
+        for (nfds_t i = 1; i < nfds; ++i) {
+            short revents = pfds[i].revents;
+            void *watch = poll_watches[i];
+            if (revents == 0 || !dbus_watch_is_registered(watch) ||
+                dbus_watch_get_enabled(watch) == 0)
+                continue;
+
+            unsigned int requested_flags = dbus_watch_get_flags(watch);
+            unsigned int flags = 0;
+            if ((revents & POLLIN) &&
+                (requested_flags & DBUS_WATCH_READABLE))
+                flags |= DBUS_WATCH_READABLE;
+            if ((revents & POLLOUT) &&
+                (requested_flags & DBUS_WATCH_WRITABLE))
+                flags |= DBUS_WATCH_WRITABLE;
+            if (revents & (POLLERR | POLLNVAL))
+                flags |= DBUS_WATCH_ERROR;
+            if (revents & POLLHUP)
+                flags |= DBUS_WATCH_HANGUP;
+
+            if (flags != 0 && dbus_watch_handle(watch, flags) == 0) {
+                LOGE("dbus_watch_handle failed — reconnecting");
+                return;
+            }
+        }
+
+        // Drain before checking connected state: libdbus may retain messages
+        // received immediately before the transport disconnected.
+        drain_messages();
+        if (dbus_connection_get_is_connected(g_conn) == 0) {
+            LOGW("HMI bus disconnected — will reconnect");
+            return;
+        }
+    }
 }
 
 void *watcher_main(void *)
@@ -343,31 +509,20 @@ void *watcher_main(void *)
             continue;
         }
 
-        while (!stop_requested()) {
-            // Block up to kDispatchTimeoutMs for I/O. FALSE => disconnected.
-            if (dbus_connection_read_write(g_conn, kDispatchTimeoutMs) == 0) {
-                LOGW("HMI bus disconnected — will reconnect");
-                break;
-            }
-            void *msg;
-            while ((msg = dbus_connection_pop_message(g_conn)) != nullptr) {
-                handle_message(msg);
-                dbus_message_unref(msg);
-            }
-        }
+        run_watch_loop();
 
         teardown_connection();
         if (stop_requested()) break;
         if (wait_stop(kReconnectDelayMs)) break;
     }
 
-    LOGD("mute watcher thread exiting");
+    LOGD("play/pause watcher thread exiting");
     return nullptr;
 }
 
 } // namespace
 
-void mute_post_aap_create_session(void)
+void playpause_post_aap_create_session(void)
 {
     if (g_thread_up)
         return;
@@ -379,30 +534,30 @@ void mute_post_aap_create_session(void)
     // stop_requested() peek from ever blocking.
     g_stop_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (g_stop_fd < 0) {
-        LOGC("mute watcher: eventfd() failed: %s", strerror(errno));
+        LOGC("play/pause watcher: eventfd() failed: %s", strerror(errno));
         return;
     }
 
     if (preload_thread_create(&g_thread, watcher_main, nullptr) != 0) {
-        LOGC("failed to spawn mute watcher thread");
+        LOGC("failed to spawn play/pause watcher thread");
         close(g_stop_fd);
         g_stop_fd = -1;
         return;
     }
     g_thread_up = true;
-    LOGD("mute watcher thread started");
+    LOGD("play/pause watcher thread started");
 }
 
-void mute_pre_aap_destroy_session(void)
+void playpause_pre_aap_destroy_session(void)
 {
     if (!g_thread_up)
         return;
 
     // One write makes the eventfd permanently readable, instantly waking the
-    // watcher whether it's in the reconnect backoff or between dispatch reads.
+    // watcher whether it's polling bus I/O or in the reconnect backoff.
     uint64_t one = 1;
     if (write(g_stop_fd, &one, sizeof(one)) != (ssize_t)sizeof(one))
-        LOGE("mute watcher: write(stop eventfd) failed: %s", strerror(errno));
+        LOGE("play/pause watcher: write(stop eventfd) failed: %s", strerror(errno));
 
     pthread_join(g_thread, nullptr);
     g_thread_up = false;
@@ -410,5 +565,5 @@ void mute_pre_aap_destroy_session(void)
 
     close(g_stop_fd);
     g_stop_fd = -1;
-    LOGD("mute watcher thread stopped");
+    LOGD("play/pause watcher thread stopped");
 }

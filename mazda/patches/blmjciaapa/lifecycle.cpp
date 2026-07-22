@@ -8,9 +8,9 @@
 // of these names to OUR exported symbols.
 //
 // We use them as a pure lifecycle bracket for every per-session
-// shim thread (currently: the touch reader and the HUD sender):
-// session up   -> install nav cb, start the touch reader + HUD sender
-// session down -> stop the HUD sender + touch reader, chain through
+// shim thread (touch, HUD, Bluetooth pairing, and play/pause):
+// session up   -> install callbacks and start configured workers
+// session down -> stop configured workers, then chain through
 //
 // These are the only cleanly preload-shadowable lifecycle anchors.
 // Resolving HMIEventHandler::Init/UnInit via dlsym(RTLD_NEXT) does NOT work
@@ -23,7 +23,7 @@
 #include "hud/hud.h"
 #include "bt16pair/bt16pair.h"
 #include "monitor/navi_monitor.h"
-#include "mute/mute.h"
+#include "playpause/playpause.h"
 #include "oem/blmjciaapa.h"
 #include "touch/touch.h"
 #include "common/preload.h"   // PRELOAD_EXPORT + resolve_real_symbol
@@ -233,18 +233,18 @@ int aap_create_session(const char *cfg, void *unknown_r1,
             LOGD("aap_create_session: HUD disabled by config — skipping sender");
         }
 
-        // Mute -> phone media bridge: watch the OEM audio manager's user-mute
+        // Play/pause bridge: watch the OEM audio manager's user-mute
         // signal (com.jci.vbs.am / EntertainmentMuteStatus) and pause/resume
         // the phone's AA media accordingly. Same once-per-process gate; the
         // watcher thread owns its own service-bus connection and tolerates the
         // session not being fully connected yet.
         if (libpatch_config::mute_pauses_phone()) {
-            LOGD("aap_create_session: spawning mute watcher");
-            mute_post_aap_create_session();
-            LOGD("mute watcher hook completed");
+            LOGD("aap_create_session: spawning play/pause watcher");
+            playpause_post_aap_create_session();
+            LOGD("play/pause watcher hook completed");
         } else {
             LOGD("aap_create_session: mute_pauses_phone disabled by config — "
-                 "skipping mute watcher");
+                  "skipping play/pause watcher");
         }
 
 #if defined(DEBUG) && BLMJCIAAPA_ENABLE_NAVI_MONITOR
@@ -291,9 +291,9 @@ int aap_destroy_session(void *handle)
             }
 
             if (libpatch_config::mute_pauses_phone()) {
-                LOGD("aap_destroy_session: stopping mute watcher");
-                mute_pre_aap_destroy_session();
-                LOGD("mute watcher stopped");
+                LOGD("aap_destroy_session: stopping play/pause watcher");
+                playpause_pre_aap_destroy_session();
+                LOGD("play/pause watcher stopped");
             }
 
 #if defined(DEBUG) && BLMJCIAAPA_ENABLE_NAVI_MONITOR

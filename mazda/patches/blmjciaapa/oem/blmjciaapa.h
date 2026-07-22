@@ -70,7 +70,7 @@ constexpr uint32_t kAAPKeyEventType = 0xe00;
 
 // Android media keycodes we inject. KEYCODE_MEDIA_PLAY is the very code the
 // OEM's own InputKey case 0xe emits; KEYCODE_MEDIA_PAUSE has no OEM AA path
-// (the projection key map has no pause), which is the gap the mute bridge fills.
+// (the projection key map has no pause), which the play/pause bridge fills.
 constexpr uint32_t kAAPKeyMediaPlay  = 0x7e;  // 126 KEYCODE_MEDIA_PLAY
 constexpr uint32_t kAAPKeyMediaPause = 0x7f;  // 127 KEYCODE_MEDIA_PAUSE
 

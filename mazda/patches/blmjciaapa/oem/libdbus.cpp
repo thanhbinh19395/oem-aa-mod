@@ -31,9 +31,12 @@ void *oem_sym(const char *name)
 
 OEM_THUNK(void *, dbus_connection_open_private,
           (const char *address, void *error), (address, error), nullptr)
-OEM_THUNK(int, dbus_bus_register, (void *conn, void *error), (conn, error), 0)
+OEM_THUNK(DBusBool, dbus_bus_register,
+        (void *conn, void *error), (conn, error), 0)
 OEM_THUNK_VOID(dbus_connection_set_exit_on_disconnect,
-               (void *conn, int enabled), (conn, enabled))
+            (void *conn, DBusBool enabled), (conn, enabled))
+OEM_THUNK(DBusBool, dbus_connection_get_is_connected,
+          (void *conn), (conn), 0)
 OEM_THUNK_VOID(dbus_connection_close, (void *conn), (conn))
 OEM_THUNK_VOID(dbus_connection_unref, (void *conn), (conn))
 
@@ -42,23 +45,34 @@ OEM_THUNK(void *, dbus_message_new_signal,
           (path, iface, member), nullptr)
 OEM_THUNK_VOID(dbus_message_iter_init_append,
                (void *msg, DBusMessageIter *iter), (msg, iter))
-OEM_THUNK(int, dbus_message_iter_append_basic,
+OEM_THUNK(DBusBool, dbus_message_iter_append_basic,
           (DBusMessageIter *iter, int type, const void *value),
           (iter, type, value), 0)
-OEM_THUNK(int, dbus_connection_send,
+OEM_THUNK(DBusBool, dbus_connection_send,
           (void *conn, void *msg, uint32_t *serial), (conn, msg, serial), 0)
 OEM_THUNK_VOID(dbus_connection_flush, (void *conn), (conn))
 OEM_THUNK_VOID(dbus_message_unref, (void *msg), (msg))
 
 OEM_THUNK_VOID(dbus_bus_add_match,
                (void *conn, const char *rule, void *error), (conn, rule, error))
-OEM_THUNK(int, dbus_connection_read_write,
-          (void *conn, int timeout_milliseconds), (conn, timeout_milliseconds), 0)
+OEM_THUNK(DBusBool, dbus_connection_set_watch_functions,
+          (void *conn, DBusAddWatchFunction add_function,
+           DBusRemoveWatchFunction remove_function,
+           DBusWatchToggledFunction toggled_function, void *data,
+           DBusFreeFunction free_data_function),
+          (conn, add_function, remove_function, toggled_function, data,
+           free_data_function), 0)
+OEM_THUNK(int, dbus_watch_get_unix_fd, (void *watch), (watch), -1)
+OEM_THUNK(unsigned int, dbus_watch_get_flags,
+          (void *watch), (watch), 0)
+OEM_THUNK(DBusBool, dbus_watch_get_enabled, (void *watch), (watch), 0)
+OEM_THUNK(DBusBool, dbus_watch_handle,
+          (void *watch, unsigned int flags), (watch, flags), 0)
 OEM_THUNK(void *, dbus_connection_pop_message, (void *conn), (conn), nullptr)
-OEM_THUNK(int, dbus_message_is_signal,
+OEM_THUNK(DBusBool, dbus_message_is_signal,
           (void *msg, const char *iface, const char *member),
           (msg, iface, member), 0)
-OEM_THUNK(int, dbus_message_iter_init,
+OEM_THUNK(DBusBool, dbus_message_iter_init,
           (void *msg, DBusMessageIter *iter), (msg, iter), 0)
 OEM_THUNK(int, dbus_message_iter_get_arg_type,
           (DBusMessageIter *iter), (iter), 0)
