@@ -12,6 +12,13 @@
 //   user mute   -> KEYCODE_MEDIA_PAUSE (0x7f)  (only if AA media has focus)
 //   user unmute -> KEYCODE_MEDIA_PLAY  (0x7e)  (only if WE paused on mute)
 //
+// It can also suppress stock CMU-generated resume attempts. jciAAPA reloads
+// a per-phone `lastAudio` flag from SerialID_AA, while MMUI sends
+// KEYCODE_MEDIA_PLAY when restoring or reactivating Android Auto audio.
+// Clearing the initial loaded flags disables jciAAPA's own retry path, and an
+// aap_send_key_input interposer filters later CMU-generated MEDIA_PLAY events.
+// The PLAY deliberately emitted above on unmute has a thread-local exemption.
+//
 // IMPORTANT: the PAUSE half only reaches the phone because this mod ALSO adds
 // AAP_KEYCODE_MEDIA_PAUSE to the head unit's advertised key_codes in
 // /etc/aap_system_attributes*.xml (see resources/ in this repo). That XML is
@@ -45,15 +52,18 @@
 // a key is actually delivered, means we only ever resume what we paused; a
 // source change while muted (AA loses focus) can't spuriously resume AA.
 //
-// Gated by libpatch.conf `mute_pauses_phone` (default off). Lifecycle-
-// bracketed by aap_create_session / aap_destroy_session, so exactly one
-// watcher thread is alive per AA session.
+// Configured independently in libpatch.conf: `mute_pauses_phone` controls the
+// session-lifecycle-bracketed mute watcher, while
+// `block_headunit_media_play` controls the process-wide preload hooks. Both
+// default off in code.
 
 #define LOG_TAG "PLAYPAUSE"
 #include "../log.h"
 #include "playpause.h"
 #include "../oem/blmjciaapa.h"   // AAP_KeyEvent, keycodes, OEM thunks
 #include "../oem/libdbus.h"      // raw libdbus-1 receive path
+#include "common/config.h"
+#include "common/preload.h"
 #include "common/thread_util.h"  // preload_thread_create (bounded stack)
 
 #include <cstdint>
@@ -102,6 +112,34 @@ constexpr int kReconnectDelayMs = 1000;
 // session reaches CONNECTED; do not log it at error level.
 constexpr int kAapSessionNotConnected = 0x108;
 
+// SerialID_AA stores up to ten remembered phones. Only the initial ten
+// successful reads are startup restoration records; later reads must retain
+// their real lastAudio values.
+constexpr unsigned kSavedDeviceCount = 10;
+
+using SerialIdBufGetFn = char *(*)(char *, char *, uint32_t *, uint32_t *,
+                                    uint32_t *, uint32_t *);
+using SendKeyInputFn = int (*)(void *, const void *);
+
+SerialIdBufGetFn g_real_serial_id_buf_get = nullptr;
+SendKeyInputFn g_real_send_key_input = nullptr;
+
+void *g_settings_handle = nullptr;
+void *g_aap_handle = nullptr;
+
+pthread_mutex_t g_resume_state_mu = PTHREAD_MUTEX_INITIALIZER;
+unsigned g_initial_records_seen = 0;
+
+// The lower-level aap_send_key_input hook also sees PLAY events sent through
+// RaceAap::SendKeyInput. Exempt only this thread while the watcher delivers
+// its deliberate unmute PLAY; stock PLAY events on every other thread remain
+// filtered. POD TLS avoids any libstdc++ runtime dependency.
+__thread bool g_allow_module_media_play = false;
+
+extern "C" char *SerialID_BufGet(char *, char *, uint32_t *, uint32_t *,
+                                  uint32_t *, uint32_t *);
+extern "C" int aap_send_key_input(void *, const void *);
+
 pthread_t g_thread;
 bool      g_thread_up = false;
 
@@ -146,6 +184,56 @@ bool wait_stop(int ms)
     struct pollfd pfd = { g_stop_fd, POLLIN, 0 };
     int pr = poll(&pfd, 1, ms);
     return pr > 0 && (pfd.revents & POLLIN);
+}
+
+bool observe_initial_record(unsigned &initial_records_seen,
+                            uint32_t &last_audio)
+{
+    if (initial_records_seen >= kSavedDeviceCount)
+        return false;
+
+    ++initial_records_seen;
+    if (last_audio == 0)
+        return false;
+
+    last_audio = 0;
+    return true;
+}
+
+void resolve_real_serial_id_buf_get()
+{
+    if (g_real_serial_id_buf_get)
+        return;
+
+    g_real_serial_id_buf_get = reinterpret_cast<SerialIdBufGetFn>(
+        resolve_real_symbol("SerialID_BufGet",
+                            "libjcisettings_client.so",
+                            "/jci/lib/libjcisettings_client.so",
+                            reinterpret_cast<void *>(&SerialID_BufGet),
+                            &g_settings_handle));
+}
+
+void resolve_real_send_key_input()
+{
+    if (g_real_send_key_input)
+        return;
+
+    g_real_send_key_input = reinterpret_cast<SendKeyInputFn>(
+        resolve_real_symbol("aap_send_key_input",
+                            "libaap_interface.so",
+                            "/usr/lib/libaap_interface.so",
+                            reinterpret_cast<void *>(&aap_send_key_input),
+                            &g_aap_handle));
+}
+
+bool should_filter_media_play(const void *event)
+{
+    if (!event)
+        return false;
+
+    const AAP_KeyEvent *key = static_cast<const AAP_KeyEvent *>(event);
+    return key->eType == kAAPKeyEventType &&
+           key->eKeyCode == kAAPKeyMediaPlay;
 }
 
 void clear_dbus_watches()
@@ -237,6 +325,11 @@ bool send_media_key(uint32_t keycode)
     evt.eType    = kAAPKeyEventType;   // 0xe00, exactly as the OEM does
     evt.eKeyCode = keycode;
 
+    const bool exempt_play = keycode == kAAPKeyMediaPlay;
+    const bool previous_exemption = g_allow_module_media_play;
+    if (exempt_play)
+        g_allow_module_media_play = true;
+
     evt.bDown = 1;                      // press
     int rc_down = RaceAap_SendKeyInput(race, &evt);
     if (rc_down != 0 && rc_down != kAapSessionNotConnected)
@@ -244,6 +337,7 @@ bool send_media_key(uint32_t keycode)
 
     evt.bDown = 0;                      // release
     int rc_up = RaceAap_SendKeyInput(race, &evt);
+    g_allow_module_media_play = previous_exemption;
     if (rc_up != 0 && rc_up != kAapSessionNotConnected)
         LOGE("SendKeyInput(up key=0x%x) -> %d", keycode, rc_up);
 
@@ -521,6 +615,52 @@ void *watcher_main(void *)
 }
 
 } // namespace
+
+extern "C" PRELOAD_EXPORT
+char *SerialID_BufGet(char *serialized, char *serial_id,
+                      uint32_t *serial_id_size, uint32_t *connect_mode,
+                      uint32_t *last_video, uint32_t *last_audio)
+{
+    resolve_real_serial_id_buf_get();
+    if (!g_real_serial_id_buf_get) {
+        LOGC("SerialID_BufGet real implementation unresolved");
+        return nullptr;
+    }
+
+    char *next = g_real_serial_id_buf_get(serialized, serial_id,
+                                          serial_id_size, connect_mode,
+                                          last_video, last_audio);
+    if (next && libpatch_config::block_headunit_media_play() && last_audio) {
+        uint32_t saved_last_audio = *last_audio;
+        pthread_mutex_lock(&g_resume_state_mu);
+        bool cleared = observe_initial_record(g_initial_records_seen,
+                                              *last_audio);
+        unsigned records_seen = g_initial_records_seen;
+        pthread_mutex_unlock(&g_resume_state_mu);
+        if (cleared) {
+            LOGD("cleared startup AA lastAudio=%u in record %u",
+                 static_cast<unsigned>(saved_last_audio), records_seen);
+        }
+    }
+    return next;
+}
+
+extern "C" PRELOAD_EXPORT
+int aap_send_key_input(void *handle, const void *event)
+{
+    if (libpatch_config::block_headunit_media_play() &&
+        !g_allow_module_media_play && should_filter_media_play(event)) {
+        LOGD("filtered CMU KEYCODE_MEDIA_PLAY");
+        return 0;
+    }
+
+    resolve_real_send_key_input();
+    if (!g_real_send_key_input) {
+        LOGC("aap_send_key_input real implementation unresolved");
+        return 0x103;
+    }
+    return g_real_send_key_input(handle, event);
+}
 
 void playpause_post_aap_create_session(void)
 {

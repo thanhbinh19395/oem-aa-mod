@@ -29,7 +29,10 @@
 //                                     (default false = stock 1.5)
 //   mute_pauses_phone = true|false    on a user mute, send Android Auto a media PAUSE (and a
 //                                     media PLAY on unmute) so the phone stops streaming while
-//                                     muted instead of only silencing the amp (default false)
+//                                     muted instead of only silencing the amp (default true)
+//   block_headunit_media_play = true|false
+//                                     block head-unit-generated Android Auto MEDIA_PLAY events
+//                                     and startup audio restoration (default false)
 //
 // Booleans are lenient (true/1/yes/on, false/0/no/off). hud_transport
 // also accepts "svcjcinavi" as an alias for "svcnavi".
@@ -210,7 +213,8 @@ struct Settings {
     bool         force_street_name = false;
     bool         hud_fold_latin    = true;
     bool         use_protocol_v1_6 = false;
-    bool         mute_pauses_phone = false;
+    bool         mute_pauses_phone = true;
+    bool         block_headunit_media_play = false;
     bool         loaded            = false;
 };
 
@@ -255,6 +259,9 @@ inline void apply_kv(const char *key, const char *val, void *ud)
         s.use_protocol_v1_6 = parse_bool(val, s.use_protocol_v1_6);
     } else if (strcasecmp(key, "mute_pauses_phone") == 0) {
         s.mute_pauses_phone = parse_bool(val, s.mute_pauses_phone);
+    } else if (strcasecmp(key, "block_headunit_media_play") == 0) {
+        s.block_headunit_media_play =
+            parse_bool(val, s.block_headunit_media_play);
     } else {
         // Common schema: a key this library doesn't act on is not an
         // error, just informational.
@@ -266,7 +273,8 @@ inline void log_effective(const char *prefix)
 {
     const Settings &s = settings();
     LOGD("config: %s touch=%s hud=%s hud_transport=%s force_street_name=%s "
-         "hud_fold_latin=%s use_protocol_v1_6=%s mute_pauses_phone=%s",
+         "hud_fold_latin=%s use_protocol_v1_6=%s mute_pauses_phone=%s "
+         "block_headunit_media_play=%s",
          prefix,
          s.touch ? "true" : "false",
          s.hud   ? "true" : "false",
@@ -274,7 +282,8 @@ inline void log_effective(const char *prefix)
          s.force_street_name ? "true" : "false",
          s.hud_fold_latin ? "true" : "false",
          s.use_protocol_v1_6 ? "true" : "false",
-         s.mute_pauses_phone ? "true" : "false");
+         s.mute_pauses_phone ? "true" : "false",
+         s.block_headunit_media_play ? "true" : "false");
 }
 
 // === Public API ===============================================
@@ -317,6 +326,7 @@ inline bool         force_street_name() { return settings().force_street_name; }
 inline bool         hud_fold_latin() { return settings().hud_fold_latin; }
 inline bool         use_protocol_v1_6() { return settings().use_protocol_v1_6; }
 inline bool         mute_pauses_phone() { return settings().mute_pauses_phone; }
+inline bool         block_headunit_media_play() { return settings().block_headunit_media_play; }
 
 } // namespace libpatch_config
 
