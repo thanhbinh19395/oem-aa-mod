@@ -1,9 +1,11 @@
 name: CI
 
 # Catches breakage before a release tag is cut: runs the host self-tests
-# (test/nav16_test), then builds both configs and packages the same two
-# tarballs the release workflow ships (versioned by short SHA instead of
-# a tag), so what CI produces matches a real release.
+# (test/nav16_test), then builds both configs and packages the same
+# release/debug zip artifacts the release workflow ships, plus a
+# matching installer zip assembled from the release payload. The CI
+# archives are versioned by short SHA instead of a tag, so what CI
+# produces matches a real release.
 # Tag pushes are intentionally NOT built here — release.yml owns those.
 on:
   # Only main on push; PR branches are covered by pull_request below.
@@ -99,6 +101,7 @@ jobs:
           set -euo pipefail
           VERSION="$(git rev-parse --short HEAD)"
           mkdir -p dist
+
           # Same packaging as release.yml: one zip per config, .so
           # keeps its canonical name in both, resources/ bundled in both.
           # Normal (release) archive has no suffix; debug gets -debug.
@@ -120,6 +123,24 @@ jobs:
             # Wrapper dir inside the archive avoids a zip-bomb on extract.
             ( cd staging && zip -r "../dist/${name}.zip" "$name" )
           done
+
+          # Reuse the repo's own installer staging target; it assembles
+          # the ready-to-copy USB payload under mazda/build/installer/.
+          make -C mazda installer
+
+          installer_name="oem-aa-mod-${VERSION}-installer"
+          installer_stage="staging/${installer_name}"
+          mkdir -p "$installer_stage"
+          cp -r mazda/build/installer/. "$installer_stage/"
+
+          # Verify the staged payload contains the expected ARM shims.
+          for so in "$installer_stage"/libpatch-*.so; do
+            file "$so"
+            file "$so" | grep -q 'ELF 32-bit.*ARM' || {
+              echo "::error::$so is not an ARM shared object"; exit 1; }
+          done
+          ( cd staging && zip -r "../dist/${installer_name}.zip" "$installer_name" )
+
           ( cd dist && sha256sum ./*.zip > SHA256SUMS )
           echo "--- dist ---"
           ls -la dist
