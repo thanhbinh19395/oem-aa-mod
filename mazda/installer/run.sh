@@ -217,6 +217,11 @@ then
   if includes_carplay
   then
     cp "${MYDIR}/libpatch-blmjcicarplay.so" "${MOD_DIR}/" && echo "libpatch-blmjcicarplay.so has been copied"
+    if [ -f "${MYDIR}/libpatch-carplayd.so" ]; then
+      cp "${MYDIR}/libpatch-carplayd.so" "${MOD_DIR}/" && echo "libpatch-carplayd.so has been copied"
+    else
+      echo "libpatch-carplayd.so not in payload, skipping (OCR disabled)"
+    fi
     cp "${MYDIR}/resources/libpatch-carplay.conf" "${MOD_DIR}/" && echo "libpatch-carplay.conf has been copied"
   fi
   # Audio Off fallback (svcjcimmui) applies to both AA and CarPlay disconnect
@@ -253,6 +258,12 @@ then
     echo "--- patching CarPlay ---"
     patch_service jciCARPLAY "${MOD_DIR}/libpatch-blmjcicarplay.so" \
       '            <environ_var env_name="LD_LIBRARY_PATH" env_value="/jci/lib:/usr/lib"/>'
+    # carplayd owns the GStreamer video plane (VietMap badge OCR). Separate
+    # process from jciCARPLAY — patch independently so a shim fault in one
+    # does not take down the other.
+    if [ -f "${MOD_DIR}/libpatch-carplayd.so" ]; then
+      patch_service carplayd "${MOD_DIR}/libpatch-carplayd.so"
+    fi
   fi
 
   # jciMMUI hosts libjciuiasystem.so (source fallback / Audio Off).
@@ -318,6 +329,7 @@ else
         unpatch_service jciAAPA    libpatch-blmjciaapa.so
         unpatch_service jcinavi    libpatch-svcjcinavi.so
         unpatch_service jciCARPLAY libpatch-blmjcicarplay.so
+        unpatch_service carplayd   libpatch-carplayd.so
         unpatch_service jciMMUI    libpatch-svcjcimmui.so
         # the CarPlay LD_LIBRARY_PATH line has no .so token; strip it explicitly
         grep -v 'LD_LIBRARY_PATH.*jci/lib:/usr/lib' "$conf" > /tmp/oaam.clean && cp /tmp/oaam.clean "$conf"
@@ -335,6 +347,7 @@ else
     if includes_carplay
     then
       unpatch_service jciCARPLAY libpatch-blmjcicarplay.so
+      unpatch_service carplayd   libpatch-carplayd.so
       for conf in /jci/sm/sm.conf /jci/sm/sm_WCP.conf
       do
         [ -f "$conf" ] || continue
@@ -353,6 +366,7 @@ else
       if includes_carplay
       then
         sed -i '/name="jciCARPLAY"/ s/reset_board="no"/reset_board="yes"/' "$conf"
+        sed -i '/name="carplayd"/ s/reset_board="no"/reset_board="yes"/' "$conf"
       fi
     done
   fi
@@ -387,7 +401,7 @@ else
   fi
   if includes_carplay
   then
-    for file in libpatch-blmjcicarplay.so libpatch-carplay.conf
+    for file in libpatch-blmjcicarplay.so libpatch-carplayd.so libpatch-carplay.conf
     do
       rm -f "${MOD_DIR}/${file}" && echo "Removed ${file}"
     done
@@ -406,7 +420,8 @@ else
   cp_gone=0
   [ ! -e "${MOD_DIR}/libpatch-blmjciaapa.so" ] &&
     [ ! -e "${MOD_DIR}/libpatch-svcjcinavi.so" ] && aa_gone=1
-  [ ! -e "${MOD_DIR}/libpatch-blmjcicarplay.so" ] && cp_gone=1
+  [ ! -e "${MOD_DIR}/libpatch-blmjcicarplay.so" ] &&
+    [ ! -e "${MOD_DIR}/libpatch-carplayd.so" ] && cp_gone=1
   if [ "$aa_gone" -eq 1 ] && [ "$cp_gone" -eq 1 ]
   then
     unpatch_service jciMMUI libpatch-svcjcimmui.so
@@ -425,6 +440,7 @@ else
      [ ! -e "${MOD_DIR}/libpatch-blmjciaapa.so" ] &&
      [ ! -e "${MOD_DIR}/libpatch-svcjcinavi.so" ] &&
      [ ! -e "${MOD_DIR}/libpatch-blmjcicarplay.so" ] &&
+     [ ! -e "${MOD_DIR}/libpatch-carplayd.so" ] &&
      [ ! -e "${MOD_DIR}/libpatch-svcjcimmui.so" ]
   then
     for conf in /jci/sm/sm.conf /jci/sm/sm_WCP.conf

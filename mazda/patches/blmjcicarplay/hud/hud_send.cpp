@@ -264,9 +264,9 @@ extern "C" void hud_status_cb(void *conn, unsigned char status, void *user)
          static_cast<unsigned>(status), absent ? "no HUD" : "HUD present");
 }
 
-// [VN-PATCH] Speed limit OCR'd from the VietMap badge by the on-CMU Lua
-// daemon (splim.lua), which writes "<limit> <unixtime>" to /data_persist/splim
-// on each confident read. Returns km/h, or 0 if missing / stale / implausible.
+// [VN-PATCH] Speed limit written to /data_persist/splim as "<limit> <unixtime>"
+// by either libpatch-carplayd.so (VietMap badge template-match OCR) or the
+// shared splim_udpd feed. Returns km/h, or 0 if missing / stale / implausible.
 static uint16_t read_splim()
 {
     // [VARIANT] Speed-limit display is a runtime opt-in (libpatch.conf

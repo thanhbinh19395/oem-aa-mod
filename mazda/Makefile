@@ -28,7 +28,7 @@ CXX         := $(M3TOOLCHAIN)/bin/$(TRIPLE)-g++
 SYSROOT     := $(M3TOOLCHAIN)/$(TRIPLE)/sysroot
 
 # OEM libraries we patch. Order doesn't matter.
-PATCHES := blmjciaapa svcjcinavi aap_service blmjcicarplay svcjcimmui
+PATCHES := blmjciaapa svcjcinavi aap_service blmjcicarplay carplayd svcjcimmui
 
 # Per-patch extra compile flags, applied ONLY to that patch's objects (see
 # gen_patch_rules below). Leave a patch out of this list to build it with just
@@ -105,7 +105,7 @@ COMMON_CXXFLAGS := -std=c++11 \
 # correctly. We pick up libstdc++.so.6 as a DT_NEEDED instead.
 COMMON_LDFLAGS  := --sysroot=$(SYSROOT) -shared \
                    -Wl,--no-undefined \
-                   -lpthread -ldl \
+                   -lpthread -ldl -lm -lrt \
                    $(PKG_LIBS)
 
 # Debug: no optimization, full debug info, no LTO so symbols/inlining are sane.

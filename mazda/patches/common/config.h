@@ -12,7 +12,9 @@
 // on-device folder as the .so libraries):
 //   * libpatch.conf         — the Android Auto family: blmjciaapa, svcjcinavi,
 //                             aap_service, plus svcjcimmui (Audio Off fallback).
-//   * libpatch-carplay.conf — blmjcicarplay (the CarPlay -> HUD bridge).
+//   * libpatch-carplay.conf — blmjcicarplay (CarPlay -> HUD bridge) AND
+//                             carplayd (VietMap speed-limit OCR on the video
+//                             plane). Both processes read this same file.
 // Each library passes the filename it wants to load() (the AA family uses the
 // default). AA and CarPlay run in DIFFERENT processes, so each reads only its
 // own file into its own copy of the settings. This struct still defines the
@@ -63,6 +65,18 @@
 //   carplay_hud_debug    = true|false overlay raw turn codes on the HUD street strip when no
 //                                     glyph maps (developer aid; read by blmjcicarplay,
 //                                     default false)
+//   carplay_ocr          = true|false enable template-match OCR of the VietMap speed-limit
+//                                     badge inside carplayd (default false)
+//   carplay_ocr_force_linear = true|false insert mfw_ipucsc!I420 before mfw_v4lsink so the
+//                                     probe sees linear frames (needed if vpudec outputs
+//                                     tiled TNVP; read by carplayd, default false)
+//   carplay_ocr_hz       = int        OCR sample rate in Hz, clamped 1..10 (default 2)
+//   carplay_ocr_roi_x/y  = int        ROI top-left; -1 = auto (lower-left) (default -1)
+//   carplay_ocr_roi_w/h  = int        ROI size in pixels (default 160x160)
+//   carplay_ocr_min_ncc  = float      minimum normalized cross-correlation to accept a
+//                                     match, 0..1 (default 0.55)
+//   carplay_ocr_dump     = true|false write /tmp/splim_roi.pgm each sample for ROI
+//                                     calibration (read by carplayd, default false)
 //
 // Booleans are lenient (true/1/yes/on, false/0/no/off). hud_transport
 // also accepts "svcjcinavi" as an alias for "svcnavi".
@@ -92,6 +106,7 @@
 #include <limits.h>    // PATH_MAX
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>    // strtol / strtod
 #include <string.h>
 #include <strings.h>   // strcasecmp
 
@@ -242,6 +257,24 @@ inline bool parse_bool(const char *val, bool deflt)
     return deflt;
 }
 
+inline int parse_int(const char *val, int deflt)
+{
+    if (val == nullptr || *val == '\0') return deflt;
+    char *end = nullptr;
+    long v = strtol(val, &end, 10);
+    if (end == val) return deflt;
+    return static_cast<int>(v);
+}
+
+inline float parse_float(const char *val, float deflt)
+{
+    if (val == nullptr || *val == '\0') return deflt;
+    char *end = nullptr;
+    double v = strtod(val, &end);
+    if (end == val) return deflt;
+    return static_cast<float>(v);
+}
+
 // === Schema + state ===========================================
 
 struct Settings {
@@ -254,13 +287,22 @@ struct Settings {
     bool         aa_audio_low_latency  = false;
     bool         mute_pauses_phone     = true;
     bool         block_headunit_media_play = false;
-    bool         fallback_audio_off = false;    // svcjcimmui: Audio Off instead of FM on disconnect
+    bool         fallback_audio_off    = false; // svcjcimmui: radio fallback -> Audio Off
     bool         carplay_vn_normalize = true;   // blmjcicarplay: fold VN 3-byte street names for the HUD font
     bool         carplay_speed_limit  = false;  // blmjcicarplay: read + show the posted speed limit
     bool         carplay_udpd_launch  = true;   // blmjcicarplay: auto-launch splim_udpd (only when speed_limit)
     bool         carplay_nav_diag     = false;  // blmjcicarplay: dump nav payloads to disk (RE aid; location data)
     bool         carplay_msgtype_diag = false;  // blmjcicarplay: dump devmgr msg types to disk (RE aid; location data)
     bool         carplay_hud_debug    = false;  // blmjcicarplay: overlay raw turn codes on the HUD street strip
+    bool         carplay_ocr               = false; // carplayd: template-match VietMap badge -> /data_persist/splim
+    bool         carplay_ocr_force_linear  = false; // carplayd: insert mfw_ipucsc!I420 before V4L sink
+    int          carplay_ocr_hz            = 2;     // carplayd: sample rate
+    int          carplay_ocr_roi_x         = -1;    // carplayd: ROI; -1 = auto
+    int          carplay_ocr_roi_y         = -1;
+    int          carplay_ocr_roi_w         = 160;
+    int          carplay_ocr_roi_h         = 160;
+    float        carplay_ocr_min_ncc       = 0.55f;
+    bool         carplay_ocr_dump          = false; // carplayd: write /tmp/splim_roi.pgm
     bool         loaded               = false;
 };
 
@@ -324,6 +366,33 @@ inline void apply_kv(const char *key, const char *val, void *ud)
         s.carplay_msgtype_diag = parse_bool(val, s.carplay_msgtype_diag);
     } else if (strcasecmp(key, "carplay_hud_debug") == 0) {
         s.carplay_hud_debug = parse_bool(val, s.carplay_hud_debug);
+    } else if (strcasecmp(key, "carplay_ocr") == 0) {
+        s.carplay_ocr = parse_bool(val, s.carplay_ocr);
+    } else if (strcasecmp(key, "carplay_ocr_force_linear") == 0) {
+        s.carplay_ocr_force_linear =
+            parse_bool(val, s.carplay_ocr_force_linear);
+    } else if (strcasecmp(key, "carplay_ocr_hz") == 0) {
+        int hz = parse_int(val, s.carplay_ocr_hz);
+        if (hz < 1) hz = 1;
+        if (hz > 10) hz = 10;
+        s.carplay_ocr_hz = hz;
+    } else if (strcasecmp(key, "carplay_ocr_roi_x") == 0) {
+        s.carplay_ocr_roi_x = parse_int(val, s.carplay_ocr_roi_x);
+    } else if (strcasecmp(key, "carplay_ocr_roi_y") == 0) {
+        s.carplay_ocr_roi_y = parse_int(val, s.carplay_ocr_roi_y);
+    } else if (strcasecmp(key, "carplay_ocr_roi_w") == 0) {
+        int w = parse_int(val, s.carplay_ocr_roi_w);
+        s.carplay_ocr_roi_w = w > 0 ? w : s.carplay_ocr_roi_w;
+    } else if (strcasecmp(key, "carplay_ocr_roi_h") == 0) {
+        int h = parse_int(val, s.carplay_ocr_roi_h);
+        s.carplay_ocr_roi_h = h > 0 ? h : s.carplay_ocr_roi_h;
+    } else if (strcasecmp(key, "carplay_ocr_min_ncc") == 0) {
+        float n = parse_float(val, s.carplay_ocr_min_ncc);
+        if (n < 0.0f) n = 0.0f;
+        if (n > 1.0f) n = 1.0f;
+        s.carplay_ocr_min_ncc = n;
+    } else if (strcasecmp(key, "carplay_ocr_dump") == 0) {
+        s.carplay_ocr_dump = parse_bool(val, s.carplay_ocr_dump);
     } else {
         // Common schema: a key this library doesn't act on is not an
         // error, just informational.
@@ -339,7 +408,9 @@ inline void log_effective(const char *prefix)
          "mute_pauses_phone=%s block_headunit_media_play=%s "
          "fallback_audio_off=%s "
          "carplay_vn_normalize=%s carplay_speed_limit=%s carplay_udpd_launch=%s "
-         "carplay_nav_diag=%s carplay_msgtype_diag=%s carplay_hud_debug=%s",
+         "carplay_nav_diag=%s carplay_msgtype_diag=%s carplay_hud_debug=%s "
+         "carplay_ocr=%s force_linear=%s hz=%d roi=(%d,%d %dx%d) min_ncc=%.2f "
+         "dump=%s",
          prefix,
          s.touch ? "true" : "false",
          s.hud   ? "true" : "false",
@@ -356,7 +427,14 @@ inline void log_effective(const char *prefix)
          s.carplay_udpd_launch ? "true" : "false",
          s.carplay_nav_diag ? "true" : "false",
          s.carplay_msgtype_diag ? "true" : "false",
-         s.carplay_hud_debug ? "true" : "false");
+         s.carplay_hud_debug ? "true" : "false",
+         s.carplay_ocr ? "true" : "false",
+         s.carplay_ocr_force_linear ? "true" : "false",
+         s.carplay_ocr_hz,
+         s.carplay_ocr_roi_x, s.carplay_ocr_roi_y,
+         s.carplay_ocr_roi_w, s.carplay_ocr_roi_h,
+         static_cast<double>(s.carplay_ocr_min_ncc),
+         s.carplay_ocr_dump ? "true" : "false");
 }
 
 // === Public API ===============================================
@@ -409,6 +487,15 @@ inline bool         carplay_udpd_launch()  { return settings().carplay_udpd_laun
 inline bool         carplay_nav_diag()     { return settings().carplay_nav_diag; }
 inline bool         carplay_msgtype_diag() { return settings().carplay_msgtype_diag; }
 inline bool         carplay_hud_debug()    { return settings().carplay_hud_debug; }
+inline bool         carplay_ocr()               { return settings().carplay_ocr; }
+inline bool         carplay_ocr_force_linear()  { return settings().carplay_ocr_force_linear; }
+inline int          carplay_ocr_hz()            { return settings().carplay_ocr_hz; }
+inline int          carplay_ocr_roi_x()         { return settings().carplay_ocr_roi_x; }
+inline int          carplay_ocr_roi_y()         { return settings().carplay_ocr_roi_y; }
+inline int          carplay_ocr_roi_w()         { return settings().carplay_ocr_roi_w; }
+inline int          carplay_ocr_roi_h()         { return settings().carplay_ocr_roi_h; }
+inline float        carplay_ocr_min_ncc()       { return settings().carplay_ocr_min_ncc; }
+inline bool         carplay_ocr_dump()          { return settings().carplay_ocr_dump; }
 
 } // namespace libpatch_config
 

@@ -22,6 +22,7 @@ oem-aa-mod-<version>/
   libpatch-svcjcinavi.so              # -> /data_persist/oem-aa-mod/ (optional; HUD merge)
   libpatch-aap_service.so             # -> /data_persist/oem-aa-mod/ (optional; protocol v1.6)
   libpatch-blmjcicarplay.so           # -> /data_persist/oem-aa-mod/ (optional; CarPlay HUD nav)
+  libpatch-carplayd.so                # -> /data_persist/oem-aa-mod/ (optional; VietMap speed-limit OCR)
   libpatch-svcjcimmui.so              # -> /data_persist/oem-aa-mod/ (optional; Audio Off fallback)
   resources/
     aap_system_attributes.xml         # -> /etc/
@@ -192,6 +193,19 @@ block in `sm.conf` and add both env vars inside it:
 > also wise to set `reset_board="no"` on the `jciCARPLAY` service so a
 > shim fault restarts only CarPlay instead of rebooting the unit.
 
+**Optional — VietMap speed-limit OCR.** The badge lives on the CarPlay
+video plane inside `carplayd`, not in iAP2. Preload `libpatch-carplayd.so`
+for the `carplayd` process (same WCP one-conf rule as above), then enable
+`carplay_ocr` in `libpatch-carplay.conf`. Full bring-up notes:
+[carplay-ocr.md](carplay-ocr.md).
+
+```xml
+<service type="process" name="carplayd" path="/usr/bin/carplayd" …>
+    <environ_var env_name="LD_PRELOAD"
+                 env_value="/data_persist/oem-aa-mod/libpatch-carplayd.so"/>
+</service>
+```
+
 **`jciMMUI`** (optional — Audio Off fallback when CP/AA disconnect would
 otherwise land on FM). Needs `fallback_audio_off = true` in
 `libpatch.conf` (default off in code; on in the shipped sample conf):
@@ -261,8 +275,14 @@ case-insensitive.
 | Key | Values | Default | Effect |
 | --- | --- | --- | --- |
 | `carplay_vn_normalize` | `true` / `false` | `true` | Fold HUD-unrenderable Vietnamese street-name letters to the nearest renderable form (see the note below). |
-| `carplay_speed_limit` | `true` / `false` | `false` | Show the posted speed limit on the HUD. Requires the shared speed-limit feed; off = navigation-only (see the note below). |
-| `carplay_udpd_launch` | `true` / `false` | `true` | Auto-launch the shared `splim_udpd` listener. Only acts when `carplay_speed_limit = true`; set `false` if the Android Auto mod already runs it (see the note below). |
+| `carplay_speed_limit` | `true` / `false` | `false` | Show the posted speed limit on the HUD. Requires a `/data_persist/splim` writer (OCR or `splim_udpd`); off = navigation-only (see the note below). |
+| `carplay_udpd_launch` | `true` / `false` | `true` | Auto-launch the shared `splim_udpd` listener. Only acts when `carplay_speed_limit = true`; set `false` if AA already runs it **or** `carplay_ocr` is the writer (see the note below). |
+| `carplay_ocr` | `true` / `false` | `false` | Enable VietMap badge template-match OCR inside `carplayd` (requires `libpatch-carplayd.so`). See [carplay-ocr.md](carplay-ocr.md). |
+| `carplay_ocr_force_linear` | `true` / `false` | `false` | Insert `mfw_ipucsc!I420` before the V4L sink so the probe sees linear frames. |
+| `carplay_ocr_hz` | `1`–`10` | `2` | OCR sample rate. |
+| `carplay_ocr_roi_x/y/w/h` | int | `-1/-1/160/160` | Badge ROI; `-1` x/y = auto lower-left. |
+| `carplay_ocr_min_ncc` | `0`–`1` | `0.55` | Minimum NCC score to accept a match. |
+| `carplay_ocr_dump` | `true` / `false` | `false` | Write `/tmp/splim_roi.pgm` each sample for ROI calibration. |
 | `carplay_nav_diag` | `true` / `false` | `false` | **Developer/RE aid** — dump decoded nav payloads to `/data_persist/nav_diag.log`. Writes location data; leave off (see the note below). |
 | `carplay_msgtype_diag` | `true` / `false` | `false` | **Developer/RE aid** — dump devmgr message types to `/data_persist/msgtype_diag.log`. Writes location data; leave off (see the note below). |
 | `carplay_hud_debug` | `true` / `false` | `false` | **Developer aid** — overlay raw turn codes on the HUD street strip when no glyph maps (see the note below). |
@@ -338,17 +358,19 @@ The `carplay_*` keys live in **`libpatch-carplay.conf`** and are read by the
   Set `false` to send names unchanged (a HUD with a full Vietnamese font, or a
   non-Vietnamese locale).
 
-- **`carplay_speed_limit`** shows the posted speed limit on the HUD. It needs the
-  shared speed-limit feed — the OCR daemon writing `/data_persist/splim`, plus
-  `carspeed_d` for the over-speed blink. Default `false` gives the navigation-only
-  HUD (maneuver + distance + road name). When `true`, the speed-limit sign stays
-  live after in-app navigation ends, mirroring the Android Auto behaviour.
+- **`carplay_speed_limit`** shows the posted speed limit on the HUD. It needs a
+  writer of `/data_persist/splim` — either `libpatch-carplayd.so` (VietMap badge
+  OCR) or `splim_udpd` — plus `carspeed_d` for the over-speed blink. Default
+  `false` gives the navigation-only HUD (maneuver + distance + road name).
 
 - **`carplay_udpd_launch`** lets the CarPlay shim auto-start the shared
   `splim_udpd` UDP listener. It only acts when `carplay_speed_limit = true`. Set it
-  `false` on a unit where the Android Auto mod already runs `splim_udpd`, so CarPlay
-  stays a pure reader of `/data_persist/splim` and never starts a second,
-  competing daemon.
+  `false` when the Android Auto mod already runs `splim_udpd`, **or** when
+  `carplay_ocr = true` is the sole writer, so CarPlay stays a pure reader of
+  `/data_persist/splim`.
+
+- **`carplay_ocr`** (and the related `carplay_ocr_*` keys) are read by
+  `libpatch-carplayd.so`. See [carplay-ocr.md](carplay-ocr.md).
 
 - **`carplay_nav_diag`** / **`carplay_msgtype_diag`** are reverse-engineering aids
   that append raw navigation payloads / message metadata to
