@@ -401,10 +401,10 @@ bool send_one(const NaviSnapshot &cur,
             icon = kTurnIcons[cur.turn_event][side_idx];
         }
 
-        // Debug aid (libpatch-carplay.conf carplay_hud_debug, default false): when our
-        // mapping produced no glyph, hijack the street strip to show the raw codes so an
-        // observer can record + extend the table later.
-        if (libpatch_config::carplay_hud_debug() && icon == 0) {
+#ifdef DEBUG
+        // Debug aid: in debug builds, when our mapping produced no glyph, hijack the
+        // street strip to show the raw codes so an observer can record + extend the table.
+        if (icon == 0) {
             char dbg_label[33];
             snprintf(dbg_label, sizeof(dbg_label), "EV=%u S=%u A=%d",
                      static_cast<unsigned>(cur.turn_event),
@@ -421,6 +421,7 @@ bool send_one(const NaviSnapshot &cur,
             icon = MazdaIcon::HUD_STRAIGHT;
             // Msg2 is sent below on (distance_changed || splim_changed || force), already true here.
         }
+#endif
 
         // [4.3] never emit unit=0 with a live maneuver. [4.5] clamp distance to
         // uint16 so a far maneuver (>65535) can't wrap to a tiny value.
@@ -573,23 +574,14 @@ void *sender_main(void *)
         LOGC("hud sender: failed to spawn splim ticker (HUD still works on CarPlay changes)");
     }
 
-    // [SHARE-AA-SPLIM] When a unit shares the AA mod's /data_persist/splim (the AA mod's
-    // splim_udpd already writes it), CarPlay must be a PURE READER and MUST NOT spin up its own
-    // splim_udpd — a second/competing UDP daemon is exactly the data-path "nhầm lẫn" to avoid
-    // (one daemon + one file, shared by AA + CarPlay). So the launcher is gated off by
-    // carplay_udpd_launch = false. It is also implicitly off whenever carplay_speed_limit is off
-    // (nav-only), since there is no limit to read.
-    if (libpatch_config::carplay_speed_limit() &&
-        libpatch_config::carplay_udpd_launch()) {
-        // Ensure the speed-limit UDP listener (splim_udpd) is running. The CMU's
-        // stage_vr boot hook is unreliable — it runs several times concurrently in an
-        // early-boot phase that reaps freshly-spawned daemons, so a daemon launched
-        // there routinely gets killed. This .so is LD_PRELOAD'd into jciCARPLAY, which sm
-        // starts reliably at boot (and restarts on crash), giving a dependable,
-        // self-healing trigger. The launcher pgrep-guards and the daemon's bind() to
-        // UDP:50505 is the exclusivity backstop, so this is safe to call every start.
-        system("pgrep splim_udpd >/dev/null 2>&1 || "
-               "setsid sh /data_persist/splim_udpd_start.sh >/dev/null 2>&1 &");
+    // [VIETMAP-SPLIM] When carplay_speed_limit is enabled, auto-launch splim_seriald
+    // (ESP32 CDC "SPLIM <km/h>" → /data_persist/splim).
+    // The CMU's stage_vr boot hook is unreliable, but this .so is LD_PRELOAD'd into
+    // jciCARPLAY, which sm starts reliably at boot and restarts on crash, giving a dependable,
+    // self-healing trigger. Exclusivity via flock on /data_persist/splim_seriald.lock.
+    if (libpatch_config::carplay_speed_limit()) {
+        system("pgrep splim_seriald >/dev/null 2>&1 || "
+               "setsid sh /data_persist/splim_seriald_start.sh >/dev/null 2>&1 &");
     }
 
     NaviSnapshot prev = {};
