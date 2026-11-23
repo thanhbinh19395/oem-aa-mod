@@ -75,18 +75,25 @@ void displayUpdate(const DisplayState &st, bool force) {
 
   // --- Top Bar (Y: 2..24) ---
   g_tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  g_tft.drawString("VIETMAP HUD", 4, 4, 2);
+  g_tft.drawString("VM-HUD", 4, 4, 2);
 
-  const uint16_t dot = st.bleConnected ? TFT_GREEN : TFT_RED;
-  g_tft.fillCircle(200, 12, 5, dot);
+  const uint16_t cmuDot = st.cmuConnected ? TFT_GREEN : TFT_RED;
+  g_tft.fillCircle(78, 12, 5, cmuDot);
+
+  g_tft.setTextColor(st.cmuConnected ? TFT_GREEN : TFT_RED, TFT_BLACK);
+  g_tft.setTextPadding(75);
+  g_tft.drawString(st.cmuConnected ? "CMU: OK" : "CMU: NO", 88, 4, 2);
+
+  const uint16_t bleDot = st.bleConnected ? TFT_GREEN : TFT_RED;
+  g_tft.fillCircle(175, 12, 5, bleDot);
 
   g_tft.setTextColor(st.bleConnected ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-  g_tft.setTextPadding(80);
-  g_tft.drawString(st.bleConnected ? "BLE: OK" : "BLE: ADV", 212, 4, 2);
+  g_tft.setTextPadding(85);
+  g_tft.drawString(st.bleConnected ? "BLE: OK" : "BLE: ADV", 185, 4, 2);
 
   g_tft.setTextColor(st.hudInfoOk ? TFT_CYAN : TFT_DARKGREY, TFT_BLACK);
-  g_tft.setTextPadding(45);
-  g_tft.drawString(st.hudInfoOk ? "H50" : "---", 285, 4, 2);
+  g_tft.setTextPadding(38);
+  g_tft.drawString(st.hudInfoOk ? "H50" : "---", 280, 4, 2);
 
   // --- Speed Limit Section (Y: 28..90, Left) ---
   g_tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
@@ -140,14 +147,17 @@ void displayUpdate(const DisplayState &st, bool force) {
 
   // --- CMU Sync & Diagnostics (Y: 122..168) ---
   g_tft.setTextPadding(310);
-  if (st.lastEmittedLimit >= 5 && st.lastEmittedLimit <= 200) {
+  if (!st.cmuConnected) {
+    g_tft.setTextColor(TFT_RED, TFT_BLACK);
+    g_tft.drawString("CMU SPLIM: CHUA KET NOI (DISCONNECTED)", 4, 122, 2);
+  } else if (st.lastEmittedLimit >= 5 && st.lastEmittedLimit <= 200) {
     g_tft.setTextColor(TFT_GREEN, TFT_BLACK);
     char cmuLine[64];
-    snprintf(cmuLine, sizeof(cmuLine), "CMU TX: SPLIM %u (#%u)", (unsigned)st.lastEmittedLimit, (unsigned)st.splimTxCount);
+    snprintf(cmuLine, sizeof(cmuLine), "CMU SPLIM: CONNECTED | SPLIM %u (#%u)", (unsigned)st.lastEmittedLimit, (unsigned)st.splimTxCount);
     g_tft.drawString(cmuLine, 4, 122, 2);
   } else {
-    g_tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    g_tft.drawString("CMU TX: SPLIM -- (Waiting)", 4, 122, 2);
+    g_tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    g_tft.drawString("CMU SPLIM: CONNECTED (Waiting data...)", 4, 122, 2);
   }
 
   g_tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
@@ -183,10 +193,11 @@ void displayUpdate(const DisplayState &st, bool /*force*/) {
 
   g_u8g2.clearBuffer();
 
-  // Line 1: Header + BLE Status
+  // Line 1: Header + CMU Status + BLE Status
   g_u8g2.setFont(u8g2_font_6x10_tr);
-  g_u8g2.drawStr(0, 9, "VM-HUD");
-  g_u8g2.drawStr(46, 9, st.bleConnected ? "[BLE:OK]" : "[BLE:ADV]");
+  g_u8g2.drawStr(0, 9, "VM");
+  g_u8g2.drawStr(18, 9, st.cmuConnected ? "[C:OK]" : "[C:NO]");
+  g_u8g2.drawStr(58, 9, st.bleConnected ? "[B:OK]" : "[B:ADV]");
   if (st.hudInfoOk) {
     g_u8g2.drawStr(104, 9, "H50");
   }
@@ -220,10 +231,12 @@ void displayUpdate(const DisplayState &st, bool /*force*/) {
   // Line 4: CMU UART Status & Packet count
   g_u8g2.drawHLine(0, 50, 128);
   char cmuBuf[32];
-  if (st.lastEmittedLimit >= 5 && st.lastEmittedLimit <= 200) {
+  if (!st.cmuConnected) {
+    snprintf(cmuBuf, sizeof(cmuBuf), "CMU SPLIM: NO CONN");
+  } else if (st.lastEmittedLimit >= 5 && st.lastEmittedLimit <= 200) {
     snprintf(cmuBuf, sizeof(cmuBuf), "CMU: %u (#%u)", st.lastEmittedLimit, (unsigned)st.splimTxCount);
   } else {
-    snprintf(cmuBuf, sizeof(cmuBuf), "CMU: waiting...");
+    snprintf(cmuBuf, sizeof(cmuBuf), "CMU: CONNECTED");
   }
   g_u8g2.drawStr(0, 61, cmuBuf);
 

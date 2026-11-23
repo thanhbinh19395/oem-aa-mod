@@ -6,6 +6,7 @@ struct DisplayState {
   bool bleConnected = false;
   bool hudInfoOk = false;
   bool notifySubscribed = false;
+  bool cmuConnected = false;
   uint8_t postedLimit = 0;
   uint16_t camDist = 0;
   uint8_t camType = 0;

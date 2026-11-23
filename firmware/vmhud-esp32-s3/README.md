@@ -34,15 +34,15 @@ Avoid CH340/CP210 USB-UART boards — CMU rootfs may lack matching drivers.
 
 When compiled with a screen (`lilygo-t-display-s3` or `esp32-s3-oled`), the display shows:
 
-1. **BLE Status**: Connection state indicator (Green = `BLE: OK`, Red = `BLE: ADV`), and HUDInfo handshake state (`H50`).
-2. **Speed Limit**: Posted speed limit in km/h (`GIOI HAN: 60 km/h` or `--`).
-3. **Camera Warning**: Distance to upcoming camera (`Dist: 350m`) and alert type.
-4. **GPS Speed**: Current vehicle GPS speed received from VietMap nav/heartbeat (`GPS: 55 km/h`).
-5. **Current Road**: Current street name decoded from VietMap nav packet (`Duong: Nguyen Van Linh`).
-6. **CMU USB Sync (Crucial for Debugging)**:
-   - Real-time USB CDC output: `CMU TX: SPLIM 60 (#42)` (green when pumping data to CMU).
-   - Packet statistics: `PKTS: C:12 N:85 H:34` (Camera, Navigation, Heartbeat).
-   - System uptime: `UP: HH:MM:SS`.
+1. **CMU SPLIM Service Status**: Real-time handshake with Mazda CMU `splim_seriald`:
+   - Top bar: Green dot + `CMU: OK` when connected to CMU splim service; Red dot + `CMU: NO` when disconnected/not running.
+   - Status line: Bright green `CMU SPLIM: CONNECTED` (or cyan waiting data) / Bright red `CMU SPLIM: CHUA KET NOI (DISCONNECTED)`.
+2. **BLE Status**: Connection state indicator (Green = `BLE: OK`, Red = `BLE: ADV`), and HUDInfo handshake state (`H50`).
+3. **Speed Limit**: Posted speed limit in km/h (`GIOI HAN: 60 km/h` or `--`).
+4. **Camera Warning**: Distance to upcoming camera (`Dist: 350m`) and alert type.
+5. **GPS Speed**: Current vehicle GPS speed received from VietMap nav/heartbeat (`GPS: 55 km/h`).
+6. **Current Road**: Current street name decoded from VietMap nav packet (`Duong: Nguyen Van Linh`).
+7. **Diagnostics**: Packet counts (`PKTS: C:12 N:85 H:34`) and uptime (`UP: HH:MM:SS`).
 
 If speed limits do not appear on the Mazda HUD, check the ESP32 screen:
 - If `CMU TX: SPLIM 60` is incrementing, the VietMap ↔ ESP32 link is 100% working, and you should check the CMU side (`splim_seriald` or config).

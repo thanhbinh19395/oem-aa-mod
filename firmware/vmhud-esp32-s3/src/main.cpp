@@ -42,6 +42,11 @@ static std::atomic<uint32_t> g_hbPktCount{0};
 static std::atomic<uint32_t> g_splimTxCount{0};
 static std::atomic<uint32_t> g_lastSplimMs{0};
 
+static std::atomic<bool> g_cmuConnected{false};
+static std::atomic<uint32_t> g_lastCmuRxMs{0};
+static char g_cmuRxBuf[64];
+static size_t g_cmuRxLen = 0;
+
 static uint8_t g_lastEmittedLimit = 0;
 static uint32_t g_lastKeepaliveMs = 0;
 static volatile bool g_displayDirty = true;
@@ -362,14 +367,60 @@ void setup() {
   applyAdvertising();
 }
 
+static void processCmuSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      g_cmuRxBuf[g_cmuRxLen] = '\0';
+      if (g_cmuRxLen > 0) {
+        // Any handshake/ACK message from CMU splim service: CMU:OK, CMU:ACK, CMU:HB, CMU:PONG
+        if (strncmp(g_cmuRxBuf, "CMU:", 4) == 0) {
+          g_lastCmuRxMs = millis();
+          if (!g_cmuConnected.load()) {
+            g_cmuConnected = true;
+            g_displayDirty = true;
+            Serial.printf("[CMU] splim service connected: %s\n", g_cmuRxBuf);
+          }
+        }
+      }
+      g_cmuRxLen = 0;
+    } else if (g_cmuRxLen + 1 < sizeof(g_cmuRxBuf)) {
+      g_cmuRxBuf[g_cmuRxLen++] = c;
+    } else {
+      g_cmuRxLen = 0;
+    }
+  }
+}
+
 void loop() {
   const uint32_t now = millis();
   const uint8_t lim = g_postedLimit.load();
 
-  // SPLIM USB serial keepalive emission to CMU
+  // Read incoming serial packets from CMU splim service
+  processCmuSerial();
+
+  // Check timeout: if no heartbeat/ACK from CMU service for > 4.5 seconds
+  if (g_cmuConnected.load()) {
+    if (now - g_lastCmuRxMs.load() > 4500) {
+      g_cmuConnected = false;
+      g_displayDirty = true;
+      Serial.println("[CMU] splim service disconnected (timeout)");
+    }
+  }
+
+  // SPLIM USB serial keepalive / probe emission to CMU
   if (lim >= 5 && lim <= 200) {
     if (lim != g_lastEmittedLimit || (now - g_lastKeepaliveMs) >= kKeepaliveMs) {
       emitSplim(lim);
+    }
+  } else {
+    // When no limit is held from VietMap, poll CMU service every 2 s
+    if ((now - g_lastKeepaliveMs) >= kKeepaliveMs) {
+      g_lastKeepaliveMs = now;
+      Serial.println("PING");
     }
   }
 
@@ -383,6 +434,7 @@ void loop() {
     st.bleConnected = g_connected.load();
     st.hudInfoOk = g_hudInfoOk.load();
     st.notifySubscribed = g_subH1 || g_subH50;
+    st.cmuConnected = g_cmuConnected.load();
     st.postedLimit = lim;
     st.camDist = g_camDist.load();
     st.camType = g_camType.load();

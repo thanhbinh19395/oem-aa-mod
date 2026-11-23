@@ -112,7 +112,9 @@ static int configure_tty(int fd)
 
 static int open_device(const char *path)
 {
-    int fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+    int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0)
+        fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK);
     if (fd < 0)
         return -1;
     // Drop O_NONBLOCK after open so VTIME-based reads work.
@@ -125,6 +127,9 @@ static int open_device(const char *path)
     }
     // Discard stale boot chatter.
     tcflush(fd, TCIFLUSH);
+    // Greet ESP32 that CMU splim service is ready
+    const char *hello = "CMU:OK\n";
+    (void)write(fd, hello, strlen(hello));
     return fd;
 }
 
@@ -186,7 +191,7 @@ static int parse_line(const char *line, int *out_limit)
     return 0;
 }
 
-static void feed_byte(char *buf, size_t *len, unsigned char c, int *last_limit)
+static void feed_byte(int fd, char *buf, size_t *len, unsigned char c, int *last_limit)
 {
     static time_t last_write = 0;
     if (c == '\r')
@@ -194,18 +199,32 @@ static void feed_byte(char *buf, size_t *len, unsigned char c, int *last_limit)
     if (c == '\n') {
         buf[*len] = '\0';
         int limit = 0;
-        if (*len > 0 && parse_line(buf, &limit) == 0) {
-            time_t now = time(NULL);
-            // Rewrite on change, or to refresh the timestamp. now < last_write
-            // means the wall clock stepped back, so refresh immediately.
-            if (limit != *last_limit || now < last_write ||
-                now - last_write >= REFRESH_SEC) {
-                if (write_splim(limit) == 0) {
-                    last_write = now;
-                    if (limit != *last_limit) {
-                        fprintf(stderr, LOG_TAG "splim=%d km/h\n", limit);
-                        *last_limit = limit;
+        if (*len > 0) {
+            if (parse_line(buf, &limit) == 0) {
+                time_t now = time(NULL);
+                // Rewrite on change, or to refresh the timestamp. now < last_write
+                // means the wall clock stepped back, so refresh immediately.
+                if (limit != *last_limit || now < last_write ||
+                    now - last_write >= REFRESH_SEC) {
+                    if (write_splim(limit) == 0) {
+                        last_write = now;
+                        if (limit != *last_limit) {
+                            fprintf(stderr, LOG_TAG "splim=%d km/h\n", limit);
+                            *last_limit = limit;
+                        }
                     }
+                }
+                // Send ACK back to ESP32 so ESP32 knows the splim service wrote the limit
+                if (fd >= 0) {
+                    char ack[32];
+                    snprintf(ack, sizeof(ack), "CMU:ACK %d\n", limit);
+                    (void)write(fd, ack, strlen(ack));
+                }
+            } else if (strncmp(buf, "PING", 4) == 0 || strncmp(buf, "#", 1) == 0) {
+                // Reply to ping/keepalive from ESP32
+                if (fd >= 0) {
+                    const char *pong = "CMU:PONG\n";
+                    (void)write(fd, pong, strlen(pong));
                 }
             }
         }
@@ -242,6 +261,7 @@ int main(int argc, char **argv)
     char path[64] = "";
     int fd = -1;
     int last_limit = -1;
+    time_t last_hb = 0;
     char line[SPLIM_LINE_MAX];
     size_t llen = 0;
 
@@ -262,6 +282,7 @@ int main(int argc, char **argv)
             }
             fprintf(stderr, LOG_TAG "opened %s\n", path);
             llen = 0;
+            last_hb = time(NULL);
         }
 
         // Wait with poll(), not a bare read(): once the ESP32 is unplugged the tty is
@@ -279,8 +300,16 @@ int main(int argc, char **argv)
             sleep(1);
             continue;
         }
-        if (pr == 0)
+        if (pr == 0) {
+            // Heartbeat to ESP32 every 2 seconds when idle
+            time_t now = time(NULL);
+            if (now - last_hb >= 2 && fd >= 0) {
+                last_hb = now;
+                const char *hb = "CMU:HB\n";
+                (void)write(fd, hb, strlen(hb));
+            }
             continue;   // idle
+        }
 
         unsigned char chunk[64];
         ssize_t n = read(fd, chunk, sizeof(chunk));
@@ -297,7 +326,7 @@ int main(int argc, char **argv)
             continue;
         }
         for (ssize_t i = 0; i < n; i++)
-            feed_byte(line, &llen, chunk[i], &last_limit);
+            feed_byte(fd, line, &llen, chunk[i], &last_limit);
     }
 
     if (fd >= 0)
