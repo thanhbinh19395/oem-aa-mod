@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Host self-test for CarPlay / VietMap iAP2 nav decoder (nav.cpp).
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+std::FILE *g_logf = nullptr;
+
+static int g_fail = 0;
+
+static uint32_t g_last_status = 0;
+static char     g_last_turn_road[256] = {0};
+static uint32_t g_last_turn_side = 0;
+static uint32_t g_last_turn_event = 0;
+static int32_t  g_last_turn_angle = 0;
+static int32_t  g_last_turn_number = 0;
+static int32_t  g_last_dist_m = -1;
+static uint32_t g_last_dist_unit = 0;
+
+void hud_on_status(uint32_t status)
+{
+    g_last_status = status;
+}
+
+void hud_on_next_turn(const char *road_name,
+                      uint32_t    turn_side,
+                      uint32_t    turn_event,
+                      int32_t     turn_angle,
+                      int32_t     turn_number)
+{
+    if (road_name) {
+        strncpy(g_last_turn_road, road_name, sizeof(g_last_turn_road) - 1);
+        g_last_turn_road[sizeof(g_last_turn_road) - 1] = '\0';
+    } else {
+        g_last_turn_road[0] = '\0';
+    }
+    g_last_turn_side = turn_side;
+    g_last_turn_event = turn_event;
+    g_last_turn_angle = turn_angle;
+    g_last_turn_number = turn_number;
+}
+
+void hud_on_distance(int32_t  distance_meters,
+                     int32_t  /*time_until_seconds*/,
+                     int32_t  /*display_distance*/,
+                     uint32_t display_distance_unit)
+{
+    g_last_dist_m = distance_meters;
+    g_last_dist_unit = display_distance_unit;
+}
+
+// Declarations from nav.cpp
+extern "C" void nav_on_devmgr_msg(const void *msgp, long n);
+extern "C" void nav_request_reset(void);
+
+// Helpers to build 0x8059 and 0x8058 packets
+static std::vector<uint8_t> make_maneuver(uint32_t idx, uint32_t mtype,
+                                          const char *text, const char *road,
+                                          uint32_t junction = 0, int16_t jAngle = 0,
+                                          uint32_t driveSide = 0)
+{
+    std::vector<uint8_t> b(840, 0);
+    *reinterpret_cast<uint32_t *>(b.data()) = 0x8059;
+    *reinterpret_cast<uint32_t *>(b.data() + 0x20) = (idx << 16);
+    *reinterpret_cast<uint32_t *>(b.data() + 0x128) = mtype;
+    *reinterpret_cast<uint32_t *>(b.data() + 0x33c) = driveSide;
+    *reinterpret_cast<uint32_t *>(b.data() + 0x340) = junction;
+    *reinterpret_cast<int16_t *>(b.data() + 0x346) = jAngle;
+    if (text) strncpy(reinterpret_cast<char *>(b.data() + 0x24), text, 255);
+    if (road) strncpy(reinterpret_cast<char *>(b.data() + 0x12c), road, 255);
+    return b;
+}
+
+static std::vector<uint8_t> make_guidance(int32_t dist_m, uint16_t head = 0, uint16_t count = 0)
+{
+    std::vector<uint8_t> b(1628, 0);
+    *reinterpret_cast<uint32_t *>(b.data()) = 0x8058;
+    *reinterpret_cast<uint32_t *>(b.data() + 0x34c) = (uint32_t)dist_m;
+    *reinterpret_cast<uint16_t *>(b.data() + 0x458) = head;
+    *reinterpret_cast<uint16_t *>(b.data() + 0x656) = count;
+    return b;
+}
+
+#define CHECK(cond, msg) do {                                            \
+        if (!(cond)) { printf("  FAIL: %s\n", (msg)); g_fail = 1; }      \
+        else         { printf("  ok:   %s\n", (msg)); }                  \
+    } while (0)
+
+#define CHECK_EQ_U(got, exp, msg) do {                                   \
+        unsigned long _g = (unsigned long)(got), _e = (unsigned long)(exp); \
+        if (_g != _e) { printf("  FAIL: %s (got %lu, want %lu)\n",       \
+                               (msg), _g, _e); g_fail = 1; }             \
+        else          { printf("  ok:   %s = %lu\n", (msg), _g); }       \
+    } while (0)
+
+#define CHECK_EQ_S(got, exp, msg) do {                                   \
+        if (strcmp((got), (exp)) != 0) {                                 \
+            printf("  FAIL: %s (got \"%s\", want \"%s\")\n",             \
+                   (msg), (got), (exp)); g_fail = 1; }                   \
+        else { printf("  ok:   %s = \"%s\"\n", (msg), (got)); }          \
+    } while (0)
+
+int main()
+{
+    nav_request_reset();
+
+    printf("=== Test 1: VietMap Turn Left (mtype=0, text='Rẽ trái vào Nguyễn Huệ') ===\n");
+    {
+        auto m0 = make_maneuver(0, 0, "Rẽ trái vào Nguyễn Huệ", "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 4, "event is EV_TURN");
+        CHECK_EQ_U(g_last_turn_side, 1, "side is SIDE_LEFT");
+        CHECK_EQ_S(g_last_turn_road, "Rẽ trái vào Nguyễn Huệ", "road fallback to desc");
+    }
+
+    printf("\n=== Test 2: VietMap Turn Right with road name ===\n");
+    {
+        nav_request_reset();
+        auto m0 = make_maneuver(0, 0, "Quẹo phải", "Đường Lê Lợi");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 4, "event is EV_TURN");
+        CHECK_EQ_U(g_last_turn_side, 2, "side is SIDE_RIGHT");
+        CHECK_EQ_S(g_last_turn_road, "Đường Lê Lợi", "road name preferred over desc");
+    }
+
+    printf("\n=== Test 3: VietMap U-turn ===\n");
+    {
+        nav_request_reset();
+        auto m0 = make_maneuver(0, 0, "Quay đầu tại giao lộ", "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 6, "event is EV_UTURN");
+        CHECK_EQ_U(g_last_turn_side, 1, "side is SIDE_LEFT (RHT)");
+    }
+
+    printf("\n=== Test 4: VietMap Roundabout (bùng binh lối ra thứ 2) ===\n");
+    {
+        nav_request_reset();
+        auto m0 = make_maneuver(0, 0, "Tại bùng binh, đi theo lối ra thứ 2", "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 13, "event is EV_ROUNDABOUT");
+        CHECK_EQ_U(g_last_turn_number, 2, "exit number is 2");
+        CHECK_EQ_U(g_last_turn_angle, 180, "angle is 180");
+    }
+
+    printf("\n=== Test 5: VietMap Heading/Context ignored (mtype=0, text='Đi về hướng Đông') ===\n");
+    {
+        nav_request_reset();
+        g_last_turn_event = 0;
+        auto m0 = make_maneuver(0, 0, "Đi về hướng Đông", "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 0, "heading context is ignored / not emitted");
+    }
+
+    printf("\n=== Test 6: Apple Maps regression check (mtype=1 at idx=1) ===\n");
+    {
+        nav_request_reset();
+        auto m0 = make_maneuver(0, 11, "Start", ""); // idx 0 start route
+        auto m1 = make_maneuver(1, 1, "Rẽ trái", "Võ Văn Kiệt"); // idx 1 turn left
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        nav_on_devmgr_msg(m1.data(), m1.size());
+        // Guidance with head=1
+        auto g = make_guidance(350, 1, 1);
+        nav_on_devmgr_msg(g.data(), g.size());
+        CHECK_EQ_U(g_last_turn_event, 4, "event is EV_TURN");
+        CHECK_EQ_U(g_last_turn_side, 1, "side is SIDE_LEFT");
+        CHECK_EQ_S(g_last_turn_road, "Võ Văn Kiệt", "road name is Võ Văn Kiệt");
+        CHECK_EQ_U(g_last_dist_m, 350, "distance is 350m");
+    }
+
+    printf("\n=== Test 7: VietMap Distance tick in guidance ===\n");
+    {
+        auto g = make_guidance(150, 0, 0); // count=0
+        nav_on_devmgr_msg(g.data(), g.size());
+        CHECK_EQ_U(g_last_dist_m, 150, "guidance distance updated without head");
+    }
+
+    printf("\n=== Test 8: Switch from Apple Maps to VietMap without reset ===\n");
+    {
+        // NO nav_request_reset()! g_last_head is still 1 from Test 6
+        auto m0 = make_maneuver(0, 0, "Quay đầu", "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 6, "event updated to EV_UTURN");
+    }
+
+    if (g_fail) {
+        printf("\nTEST SUITE FAILED\n");
+        return 1;
+    }
+    printf("\nALL TESTS PASSED\n");
+    return 0;
+}

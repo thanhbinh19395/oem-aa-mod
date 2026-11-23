@@ -217,7 +217,8 @@ Single writer to `splim` only (leave OCR off if present).
 | Path | Role |
 |------|------|
 | `oem-aa-mod/mazda/patches/blmjcicarplay/hud/hud_send.cpp` | HUD + `read_splim` |
-| `oem-aa-mod/mazda/patches/blmjcicarplay/nav.cpp` | iAP2 TBT (no speed limit) |
+| `oem-aa-mod/mazda/patches/blmjcicarplay/nav.cpp` | iAP2 TBT parser (Apple Maps & VietMap Live TBT) |
+| `knowledge/carplay-vietmap-tbt-handover.md` | VietMap CarPlay TBT handover & root cause |
 | `oem-aa-mod/mazda/patches/carplayd/` | VietMap badge OCR |
 | `oem-aa-mod/mazda/tools/splim_udpd/` | UDP listener (log-only today) |
 | `oem-aa-mod/mazda/tools/splim_seriald/` | USB CDC → `/data_persist/splim` |

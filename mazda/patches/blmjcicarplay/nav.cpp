@@ -111,14 +111,66 @@ std::atomic<bool> g_nav_reset_req{false};
 
 // maneuverType values that describe the CURRENT segment (heading), not a maneuver to
 // display. idx 0 is also always such an entry; this catches them at idx >= 1 too.
-//   0 NoTurn  5 FollowRoad  11 StartRoute  18 StartRouteWithUTurn
+//   5 FollowRoad  11 StartRoute  18 StartRouteWithUTurn
 // [2026-06-14] type 3 (StraightAhead) REMOVED from this filter — it IS a real displayed maneuver
 // ("Đi thẳng" / go-straight-onto-road-X), the CarPlay map shows it. Filtering it dropped ~18 real
 // straights on one drive: the HUD froze on the PREVIOUS turn while the map showed straight, AND the
 // imminent count ran one ahead ("sớm 1 nhịp"). Now buffered -> classify default = EV_STRAIGHT.
+// [2026-11-23] type 0 REMOVED: 3rd-party CarPlay apps (VietMap Live, Google Maps) use Apple's public
+// CPManeuver API which lacks a maneuverType setter, so iAP2 receives mtype=0 for ALL turns. Handled
+// via classify_from_text() below.
 bool is_context_type(uint32_t m)
 {
-    return m == 0 || m == 5 || m == 11 || m == 18;
+    return m == 5 || m == 11 || m == 18;
+}
+
+// Convert UTF-8 string to lowercase ASCII, stripping Vietnamese diacritics and symbols.
+void to_ascii_lower(const char *in, char *out, size_t outsz)
+{
+    if (!in || !out || outsz == 0) return;
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(in);
+    size_t o = 0;
+    while (*p && o + 1 < outsz) {
+        unsigned char c = *p;
+        if (c < 0x80) {
+            if (c >= 'A' && c <= 'Z') out[o++] = (char)(c + 32);
+            else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == ' ') out[o++] = (char)c;
+            else out[o++] = ' ';
+            p++;
+        } else if ((c & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+            uint32_t cp = ((c & 0x1F) << 6) | (p[1] & 0x3F);
+            p += 2;
+            char ch = ' ';
+            if ((cp >= 0xC0 && cp <= 0xC3) || (cp >= 0xE0 && cp <= 0xE3) || cp == 0x102 || cp == 0x103) ch = 'a';
+            else if ((cp >= 0xC8 && cp <= 0xCA) || (cp >= 0xE8 && cp <= 0xEA)) ch = 'e';
+            else if ((cp >= 0xCC && cp <= 0xCD) || (cp >= 0xEC && cp <= 0xED)) ch = 'i';
+            else if ((cp >= 0xD2 && cp <= 0xD5) || (cp >= 0xF2 && cp <= 0xF5) || cp == 0x1A0 || cp == 0x1A1) ch = 'o';
+            else if ((cp >= 0xD9 && cp <= 0xDA) || (cp >= 0xF9 && cp <= 0xFA) || cp == 0x1AF || cp == 0x1B0) ch = 'u';
+            else if (cp == 0xDD || cp == 0xFD) ch = 'y';
+            else if (cp == 0x110 || cp == 0x111) ch = 'd';
+            out[o++] = ch;
+        } else if ((c & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+            uint32_t cp = ((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+            p += 3;
+            char ch = ' ';
+            if (cp >= 0x1EA0 && cp <= 0x1EF9) {
+                if (cp <= 0x1EB7) ch = 'a';
+                else if (cp <= 0x1EC7) ch = 'e';
+                else if (cp <= 0x1ECB) ch = 'i';
+                else if (cp <= 0x1EE3) ch = 'o';
+                else if (cp <= 0x1EF1) ch = 'u';
+                else ch = 'y';
+            }
+            out[o++] = ch;
+        } else if ((c & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+            p += 4;
+            out[o++] = ' ';
+        } else {
+            p++;
+            out[o++] = ' ';
+        }
+    }
+    out[o] = '\0';
 }
 
 struct Maneuver {
@@ -127,6 +179,100 @@ struct Maneuver {
     int32_t  angle;    // roundabout exit angle, normalized [0,360); else 0
     int32_t  number;   // roundabout exit number (1..19); else 0
 };
+
+// [VIETMAP/3RD-PARTY] Classify maneuvers from instruction text when mtype == 0
+bool classify_from_text(const char *raw_text, uint32_t driveSide, Maneuver &m)
+{
+    if (!raw_text || !raw_text[0]) return false;
+    char text[kManeuverTextMax + 1];
+    to_ascii_lower(raw_text, text, sizeof(text));
+
+    m.event = EV_STRAIGHT;
+    m.side = SIDE_NONE;
+    m.angle = 0;
+    m.number = 0;
+
+    // 1. U-turn
+    if (strstr(text, "quay dau") || strstr(text, "vong nguoc lai") ||
+        strstr(text, "u turn") || strstr(text, "uturn")) {
+        m.event = EV_UTURN;
+        m.side = (driveSide == 1) ? SIDE_RIGHT : SIDE_LEFT;
+        return true;
+    }
+
+    // 2. Roundabout
+    if (strstr(text, "vong xuyen") || strstr(text, "vong xoay") ||
+        strstr(text, "bung binh") || strstr(text, "roundabout")) {
+        m.event = EV_ROUNDABOUT;
+        m.side = (driveSide == 1) ? SIDE_LEFT : SIDE_RIGHT;
+        for (int i = 1; i <= 9; ++i) {
+            char p1[32], p2[32], p3[32];
+            snprintf(p1, sizeof(p1), "loi ra thu %d", i);
+            snprintf(p2, sizeof(p2), "loi ra %d", i);
+            snprintf(p3, sizeof(p3), "%d exit", i);
+            if (strstr(text, p1) || strstr(text, p2) || strstr(text, p3)) {
+                m.number = i;
+                break;
+            }
+        }
+        if (m.number == 0) {
+            if (strstr(text, "thu nhat") || strstr(text, "1st")) m.number = 1;
+            else if (strstr(text, "thu hai") || strstr(text, "thu nhi") || strstr(text, "2nd")) m.number = 2;
+            else if (strstr(text, "thu ba") || strstr(text, "3rd")) m.number = 3;
+            else if (strstr(text, "thu tu") || strstr(text, "4th")) m.number = 4;
+        }
+        m.angle = (m.number > 0) ? (m.number * 90) % 360 : 0;
+        return true;
+    }
+
+    // 3. Sharp turn
+    if (strstr(text, "re gat") || strstr(text, "re ngoat") || strstr(text, "sharp")) {
+        m.event = EV_SHARP;
+        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT : SIDE_RIGHT;
+        return true;
+    }
+
+    // 4. Slight turn
+    if (strstr(text, "chech") || strstr(text, "hoi re") || strstr(text, "slight") ||
+        strstr(text, "bear") || strstr(text, "nhap lan")) {
+        m.event = EV_SLIGHT;
+        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT : SIDE_RIGHT;
+        return true;
+    }
+
+    // 5. Normal turn
+    if (strstr(text, "re") || strstr(text, "queo") || strstr(text, "turn") ||
+        strstr(text, "sang trai") || strstr(text, "sang phai")) {
+        m.event = EV_TURN;
+        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT : SIDE_RIGHT;
+        return true;
+    }
+
+    // 6. Fork / Keep
+    if (strstr(text, "giu ben") || strstr(text, "keep") || strstr(text, "fork")) {
+        m.event = EV_FORK;
+        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT : SIDE_RIGHT;
+        return true;
+    }
+
+    // 7. Destination
+    if (strstr(text, "den noi") || strstr(text, "diem den") || strstr(text, "dich den") ||
+        strstr(text, "ban da den") || strstr(text, "arrive") || strstr(text, "destination")) {
+        m.event = EV_DEST;
+        m.side = SIDE_NONE;
+        return true;
+    }
+
+    // 8. Straight
+    if (strstr(text, "di thang") || strstr(text, "chay thang") || strstr(text, "tiep tuc") ||
+        strstr(text, "straight") || strstr(text, "continue")) {
+        m.event = EV_STRAIGHT;
+        m.side = SIDE_NONE;
+        return true;
+    }
+
+    return false;
+}
 
 // One displayable (non-context) maneuver buffered from the current burst.
 struct BufManeuver {
@@ -330,10 +476,6 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
         }
 
         uint32_t mtype     = read_u32(b, n, kManeuverTypeOff);
-        // Skip idx0 (heading) and in-list context entries — buffer only displayable turns.
-        if (idx == 0 || is_context_type(mtype)) return;
-        if (g_buf_count >= kMaxBurst) return;
-
         uint32_t validInfo = read_u32(b, n, kValidInfoOff);
         uint32_t driveSide = read_u32(b, n, kDriveSideOff);
         uint32_t junction  = read_u32(b, n, kJunctionTypeOff);
@@ -343,7 +485,17 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
         char     text[kManeuverTextMax + 1];
         read_str(b, n, kManeuverTextOff, text, sizeof(text));
 
-        Maneuver mv = classify(mtype, junction, jAngle, driveSide);
+        Maneuver mv;
+        if (mtype != 0) {
+            // Apple Maps / standard iAP2 mtype: skip idx0 (heading) and context types
+            if (idx == 0 || is_context_type(mtype)) return;
+            mv = classify(mtype, junction, jAngle, driveSide);
+        } else {
+            // mtype == 0: 3rd-party app (e.g. VietMap Live, Google Maps) using public CPManeuver.
+            // Infer maneuver from instruction text. Drop if empty or heading context.
+            if (!classify_from_text(text, driveSide, mv)) return;
+        }
+        if (g_buf_count >= kMaxBurst) return;
 
         BufManeuver &e = g_buf[g_buf_count++];
         e.mtype = mtype; e.idx = idx; e.validInfo = validInfo; e.mv = mv;
@@ -360,7 +512,14 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
         // [BUILD-19] Re-paint with the last known imminent head so a fresh burst (recalc) updates the same
         // maneuver, and a stationary re-start paints before the next guidance frame. If the head isn't
         // buffered yet (mid-rebuild) select_by_head returns -1 -> keep the current display (no flash).
-        if (g_last_head_valid) {
+        if (mtype == 0) {
+            // [VIETMAP/3RD-PARTY] upcomingManeuvers[0] is always the imminent turn.
+            // Guidance active-maneuverList is omitted by iOS, so invalidate any stale Apple Maps
+            // head pointer and emit index 0 immediately.
+            g_last_head_valid = false;
+            g_last_head = 0;
+            emit_selection(0);
+        } else if (g_last_head_valid) {
             int sel = select_by_head(g_last_head);
             if (sel >= 0) emit_selection(sel);
         } else if (g_buf_count > 0) {
@@ -389,16 +548,17 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
                 emit_selection(sel);
             }
             // sel < 0: head not buffered yet (mid-rebuild / transient ~0.2%) -> KEEP previous selection.
-        } else if (g_buf_count > 0 && !g_last_head_valid) {
+        } else if (g_buf_count > 0 && (!g_last_head_valid || g_buf[0].mtype == 0)) {
             // [VIETMAP-FALLBACK] Guidance distance ticks arrive, but maneuverList count is 0.
-            // Keep painting the first buffered turn so the HUD is not stuck blank.
+            // If the buffered turn is 3rd-party (mtype == 0) or we have no valid head, paint sel 0.
+            g_last_head_valid = false;
             LOGD("nav GUIDE bootstrap sel=0 (maneuverList cnt=0, buf=%d)", g_buf_count);
             emit_selection(0);
         }
         // Distance readout (independent of selection).
         if (n >= kGuidanceDistOff + 4) {
             int32_t dist = (int32_t)(*reinterpret_cast<const uint32_t *>(b + kGuidanceDistOff));
-            if (dist > 0 && dist <= 100000) {
+            if (dist >= 0 && dist <= 100000) {
                 int32_t  disp; uint32_t unit;
                 if (dist < 1000) { unit = 1; disp = dist * 1000; }  // meters
                 else             { unit = 3; disp = dist;        }  // km
