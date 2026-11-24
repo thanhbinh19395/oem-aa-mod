@@ -94,6 +94,9 @@
 #  define LOGD(fmt, ...) LOG_DROP(fmt, ##__VA_ARGS__)
 #endif
 
+// Convenience alias: LOGI maps to LOGD
+#define LOGI(fmt, ...) LOGD(fmt, ##__VA_ARGS__)
+
 #if LOG_LEVEL <= LOG_LEVEL_WARN
 #  define LOGW(fmt, ...) LOG_EMIT("W", fmt, ##__VA_ARGS__)
 #else

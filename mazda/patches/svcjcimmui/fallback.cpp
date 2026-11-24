@@ -198,7 +198,7 @@ bool install_trampoline(uintptr_t target_off, uint32_t p0, uint32_t p1,
     tramp[0] = target[0];
     tramp[1] = target[1];
     tramp[2] = kLdrPcM4;
-    tramp[3] = reinterpret_cast<uint32_t>(target) + 8;
+    tramp[3] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(target) + 8);
     __builtin___clear_cache(reinterpret_cast<char *>(tramp),
                             reinterpret_cast<char *>(tramp + 4));
     *out_orig_fn = reinterpret_cast<void *>(tramp);
@@ -208,7 +208,7 @@ bool install_trampoline(uintptr_t target_off, uint32_t p0, uint32_t p1,
         return false;
     }
     target[0] = kLdrPcM4;
-    target[1] = reinterpret_cast<uint32_t>(hook_fn);
+    target[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hook_fn));
     __builtin___clear_cache(reinterpret_cast<char *>(target),
                             reinterpret_cast<char *>(target + 2));
     if (!set_prot(reinterpret_cast<uintptr_t>(target), 8, PROT_READ | PROT_EXEC)) {
@@ -270,7 +270,7 @@ bool install_hook()
     }
 
     g_installed = true;
-    LOGI("fallback: all 3 Audio Off hooks successfully installed (FW 74.00.324A)");
+    LOGD("fallback: all 3 Audio Off hooks successfully installed (FW 74.00.324A)");
     return true;
 }
 
