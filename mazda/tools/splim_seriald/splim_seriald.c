@@ -13,6 +13,10 @@
 // same writer path. Prefer a single writer of splim (do not run OCR / a competing
 // UDP writer at the same time).
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,6 +31,10 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
 
 // Stored in /tmp (tmpfs RAM) instead of /data_persist (eMMC flash) so the
 // periodic 3 s timestamp refresh incurs ZERO flash wear and auto-cleans on boot.
