@@ -621,10 +621,11 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
         // [BUILD-19] Re-paint with the last known imminent head so a fresh burst (recalc) updates the same
         // maneuver, and a stationary re-start paints before the next guidance frame. If the head isn't
         // buffered yet (mid-rebuild) select_by_head returns -1 -> keep the current display (no flash).
-        if (mtype == 0) {
+        if (mtype == 0 && g_buf[0].mtype == 0) {
             // [VIETMAP/3RD-PARTY] upcomingManeuvers[0] is always the imminent turn.
-            // Guidance active-maneuverList is omitted by iOS, so invalidate any stale Apple Maps
-            // head pointer and emit index 0 immediately.
+            // Only take over when this burst itself is a 3rd-party mtype==0 burst (so a
+            // stray mtype==0 entry inside an Apple Maps mtype!=0 burst cannot corrupt
+            // g_last_head_valid or flash EV_STRAIGHT).
             g_last_head_valid = false;
             g_last_head = 0;
             emit_selection(0);

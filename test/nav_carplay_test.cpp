@@ -278,6 +278,27 @@ int main()
         CHECK_EQ_U(g_last_dist_unit, 3, "unit is KM (3)");
     }
 
+    printf("\n=== Test 16: Stray mtype=0 inside Apple Maps burst does not corrupt head ===\n");
+    {
+        nav_request_reset();
+        auto m0 = make_maneuver(0, 11, "Start", "");
+        auto m1 = make_maneuver(1, 1, "Rẽ trái", "Võ Văn Kiệt");
+        auto m2 = make_maneuver(2, 2, "Rẽ phải", "Nguyễn Văn Cừ");
+        auto g1 = make_guidance(400, 2, 1);  // head=2 (m2)
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        nav_on_devmgr_msg(m1.data(), m1.size());
+        nav_on_devmgr_msg(m2.data(), m2.size());
+        nav_on_devmgr_msg(g1.data(), g1.size());
+        CHECK_EQ_U(g_last_turn_side, 2, "initial Apple head=2 is SIDE_RIGHT");
+        CHECK_EQ_S(g_last_turn_road, "Nguyễn Văn Cừ", "initial Apple head=2 road");
+
+        // Stray mtype=0 entry at idx=3 inside same burst must NOT reset g_last_head_valid or flash sel 0
+        auto m3 = make_maneuver(3, 0, "Đi tiếp", "Hàm Nghi");
+        nav_on_devmgr_msg(m3.data(), m3.size());
+        CHECK_EQ_U(g_last_turn_side, 2, "Apple head=2 preserved (still SIDE_RIGHT)");
+        CHECK_EQ_S(g_last_turn_road, "Nguyễn Văn Cừ", "Apple head=2 road preserved");
+    }
+
     if (g_fail) {
         printf("\nTEST SUITE FAILED\n");
         return 1;

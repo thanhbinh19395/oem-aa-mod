@@ -37,9 +37,10 @@ jobs:
 
       - name: Build and run test suite (host g++)
         run: |
-          make -C test nav16_test nav_carplay_test
+          make -C test nav16_test nav_carplay_test vietmap_ble_hud_test
           ./test/build/nav16_test
           ./test/build/nav_carplay_test
+          ./test/build/vietmap_ble_hud_test
 
   build:
     runs-on: ubuntu-latest
