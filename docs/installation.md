@@ -164,7 +164,13 @@ is read once at library load.
 
 ## 3. Uninstall / Revert to Stock
 
-### Via USB Installer (Recommended)
+### Emergency Auto-Revert USB (Zero-Interaction Recovery)
+If the CMU screen is unresponsive, flickering, or in a crash-loop, you can create a dedicated Auto-Revert USB:
+- Run `./mazda/installer/make_auto_revert_usb.sh` (or `make_auto_revert_usb.bat` on Windows).
+- Plug it into **USB Port 1** on the car.
+- The unit detects the USB via CVE-2024-8359 and automatically restores stock `sm.conf` and all pristine `.orig` backups, wipes `/data_persist/oem-aa-mod/`, and cleanly reboots into stock firmware within seconds — **zero screen interaction required**.
+
+### Via USB Installer (Interactive)
 Insert the installation USB drive into the vehicle. When the on-screen prompt appears, select **Uninstall**. The installer will automatically:
 - Remove injected `LD_PRELOAD` lines from `/jci/sm/sm.conf` and `sm_WCP.conf`.
 - Restore the original `/etc/aap_system_attributes*.xml` and `/etc/devmgr_config_master.xml` from pristine `.orig` backups.

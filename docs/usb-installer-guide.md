@@ -154,3 +154,24 @@ Nếu muốn tự làm từng bước bằng tay:
 4. **Kiểm tra kết quả và xem Log:**
    - Sau khi CMU reboot xong, cắm điện thoại vào kiểm tra tính năng chỉ đường hiển thị trên HUD.
    - Mọi tiến trình cài đặt đều được ghi lại vào thư mục `logs/` trên USB (ví dụ: `logs/install.log`). Bạn có thể cắm lại vào máy tính để kiểm tra chi tiết khi cần phân tích lỗi.
+
+---
+
+## 5. USB Auto-Revert Khẩn Cấp (Emergency Auto-Revert USB)
+
+Nếu hệ thống gặp sự cố, màn hình đơ hoặc bạn muốn khôi phục xe về nguyên bản zin 100% **ngay lập tức mà không cần tương tác màn hình**:
+
+### Cách tạo USB Auto-Revert:
+- **Trên macOS / Linux:**
+  ```bash
+  ./mazda/installer/make_auto_revert_usb.sh
+  ```
+  *(Hoặc truyền trực tiếp đường dẫn USB: `./mazda/installer/make_auto_revert_usb.sh /Volumes/MZD`)*
+- **Trên Windows:**
+  Chuột phải vào file `mazda/installer/make_auto_revert_usb.bat` và chọn **Run as administrator**.
+
+### Cách sử dụng trên xe:
+1. Bật điện xe (ACC hoặc ON).
+2. Cắm USB Auto-Revert vào cổng **USB 1**.
+3. **Không cần bấm bất kỳ nút nào:** Hệ thống sẽ tự động phát hiện qua CVE-2024-8359, chạy script khôi phục toàn bộ file cấu hình `sm.conf` gốc, xóa sạch toàn bộ file patch `.so` và cấu hình trong `/data_persist/oem-aa-mod`.
+4. Màn hình hiện thông báo *"AUTO-REVERT COMPLETE! Rebooting in 5 seconds..."* và tự động khởi động lại xe về trạng thái nguyên bản xuất xưởng.
