@@ -142,7 +142,21 @@ int main()
         nav_on_devmgr_msg(m0.data(), m0.size());
         CHECK_EQ_U(g_last_turn_event, 13, "event is EV_ROUNDABOUT");
         CHECK_EQ_U(g_last_turn_number, 2, "exit number is 2");
-        CHECK_EQ_U(g_last_turn_angle, 180, "angle is 180");
+        CHECK_EQ_U(g_last_turn_angle, 0, "angle is 0 (straight ahead)");
+
+        // Test exit 1 (right = 90 deg)
+        nav_request_reset();
+        auto m1 = make_maneuver(0, 0, "Tại bùng binh, đi theo lối ra thứ 1", "");
+        nav_on_devmgr_msg(m1.data(), m1.size());
+        CHECK_EQ_U(g_last_turn_number, 1, "exit number is 1");
+        CHECK_EQ_U(g_last_turn_angle, 90, "angle is 90 (right)");
+
+        // Test exit 3 (left = 270 deg)
+        nav_request_reset();
+        auto m3 = make_maneuver(0, 0, "Tại vòng xuyến, đi theo lối ra thứ 3", "");
+        nav_on_devmgr_msg(m3.data(), m3.size());
+        CHECK_EQ_U(g_last_turn_number, 3, "exit number is 3");
+        CHECK_EQ_U(g_last_turn_angle, 270, "angle is 270 (left)");
     }
 
     printf("\n=== Test 5: VietMap Departure / Straight Cruise (mtype=0, text='Đi về hướng Đông') ===\n");

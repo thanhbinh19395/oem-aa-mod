@@ -195,7 +195,7 @@ fi
 if ls "$SCRIPT_DIR"/splim_* >/dev/null 2>&1; then
   cp -f "$SCRIPT_DIR"/splim_* "$TARGET_MOUNT/" 2>/dev/null || true
 elif [ -d "$REPO_ROOT" ]; then
-  find "$REPO_ROOT" -name "splim_*" -maxdepth 3 -type f -exec cp -f {} "$TARGET_MOUNT/" \; 2>/dev/null || true
+  find "$REPO_ROOT" -name "splim_*" -maxdepth 5 -type f -exec cp -f {} "$TARGET_MOUNT/" \; 2>/dev/null || true
 fi
 
 # -----------------------------------------------------------------------------

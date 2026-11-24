@@ -247,7 +247,22 @@ bool classify_from_text(const char *raw_text, uint32_t driveSide, Maneuver &m)
             else if (strstr(text, "thu ba") || strstr(text, "3rd")) m.number = 3;
             else if (strstr(text, "thu tu") || strstr(text, "4th")) m.number = 4;
         }
-        m.angle = (m.number > 0) ? (m.number * 90) % 360 : 0;
+        // Map exit number to bearing angle for roundabout_icon():
+        // In RHT (Vietnam): exit 1 = right (+90°), exit 2 = straight ahead (0°),
+        // exit 3 = left (270°), exit 4 = u-turn (180°). In LHT: mirror left/right.
+        if (driveSide == 1) {
+            if (m.number == 1)      m.angle = 270;
+            else if (m.number == 2) m.angle = 0;
+            else if (m.number == 3) m.angle = 90;
+            else if (m.number == 4) m.angle = 180;
+            else                    m.angle = 0;
+        } else {
+            if (m.number == 1)      m.angle = 90;
+            else if (m.number == 2) m.angle = 0;
+            else if (m.number == 3) m.angle = 270;
+            else if (m.number == 4) m.angle = 180;
+            else                    m.angle = 0;
+        }
         return true;
     }
 
