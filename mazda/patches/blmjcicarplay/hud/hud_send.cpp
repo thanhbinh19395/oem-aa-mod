@@ -402,9 +402,12 @@ bool send_one(const NaviSnapshot &cur,
         }
 
 #ifdef DEBUG
-        // Debug aid: in debug builds, when our mapping produced no glyph, hijack the
-        // street strip to show the raw codes so an observer can record + extend the table.
-        if (icon == 0) {
+        // Debug aid: in debug builds, when our mapping produced no glyph for a REAL
+        // maneuver (turn_event != 0), hijack the street strip to show the raw codes so
+        // an observer can record + extend the table.
+        // DO NOT hijack when turn_event == 0 (idle / no maneuver / blankSnap), which
+        // overwrites real road names or pollutes the display with "EV=0 S=0 A=0".
+        if (icon == 0 && cur.turn_event != 0) {
             char dbg_label[33];
             snprintf(dbg_label, sizeof(dbg_label), "EV=%u S=%u A=%d",
                      static_cast<unsigned>(cur.turn_event),

@@ -145,13 +145,14 @@ int main()
         CHECK_EQ_U(g_last_turn_angle, 180, "angle is 180");
     }
 
-    printf("\n=== Test 5: VietMap Heading/Context ignored (mtype=0, text='Đi về hướng Đông') ===\n");
+    printf("\n=== Test 5: VietMap Departure / Straight Cruise (mtype=0, text='Đi về hướng Đông') ===\n");
     {
         nav_request_reset();
-        g_last_turn_event = 0;
         auto m0 = make_maneuver(0, 0, "Đi về hướng Đông", "");
         nav_on_devmgr_msg(m0.data(), m0.size());
-        CHECK_EQ_U(g_last_turn_event, 0, "heading context is ignored / not emitted");
+        CHECK_EQ_U(g_last_turn_event, 14, "event defaults to EV_STRAIGHT (never dropped)");
+        CHECK_EQ_U(g_last_turn_side, 3, "side is SIDE_NONE");
+        CHECK_EQ_S(g_last_turn_road, "Đi về hướng Đông", "road shows departure heading");
     }
 
     printf("\n=== Test 6: Apple Maps regression check (mtype=1 at idx=1) ===\n");
@@ -183,6 +184,46 @@ int main()
         auto m0 = make_maneuver(0, 0, "Quay đầu", "");
         nav_on_devmgr_msg(m0.data(), m0.size());
         CHECK_EQ_U(g_last_turn_event, 6, "event updated to EV_UTURN");
+    }
+
+    printf("\n=== Test 9: iOS NFD (Decomposed UTF-8) Turn Left: 'R\\x65\\xcc\\x83 tr\\x61\\xcc\\x81i' ===\n");
+    {
+        nav_request_reset();
+        // "Rẽ trái" in NFD decomposed form (e + combining tilde, a + combining acute)
+        const char nfd_turn_left[] = "R\x65\xcc\x83 tr\x61\xcc\x81i";
+        auto m0 = make_maneuver(0, 0, nfd_turn_left, "Đường NFD");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 4, "NFD classified as EV_TURN");
+        CHECK_EQ_U(g_last_turn_side, 1, "NFD classified as SIDE_LEFT");
+    }
+
+    printf("\n=== Test 10: iOS NFD Turn Right: 'R\\x65\\xcc\\x83 ph\\x61\\xcc\\x89i' ===\n");
+    {
+        nav_request_reset();
+        // "Rẽ phải" in NFD decomposed form (e + combining tilde, a + combining hook above)
+        const char nfd_turn_right[] = "R\x65\xcc\x83 ph\x61\xcc\x89i";
+        auto m0 = make_maneuver(0, 0, nfd_turn_right, "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 4, "NFD classified as EV_TURN");
+        CHECK_EQ_U(g_last_turn_side, 2, "NFD classified as SIDE_RIGHT");
+    }
+
+    printf("\n=== Test 11: VietMap 'Đi tiếp' (continue) straight ===\n");
+    {
+        nav_request_reset();
+        auto m0 = make_maneuver(0, 0, "Đi tiếp 2.5 km trên Quốc lộ 1A", "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 14, "event is EV_STRAIGHT");
+        CHECK_EQ_U(g_last_turn_side, 3, "side is SIDE_NONE");
+    }
+
+    printf("\n=== Test 12: VietMap 'Nhập vào đường' (merge) ===\n");
+    {
+        nav_request_reset();
+        auto m0 = make_maneuver(0, 0, "Nhập vào đường cao tốc bên phải", "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 3, "event is EV_SLIGHT");
+        CHECK_EQ_U(g_last_turn_side, 2, "side is SIDE_RIGHT");
     }
 
     if (g_fail) {

@@ -35,11 +35,11 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Build nav16_test (host g++)
-        run: make -C test nav16_test
-
-      - name: Run nav16_test
-        run: ./test/build/nav16_test
+      - name: Build and run test suite (host g++)
+        run: |
+          make -C test nav16_test nav_carplay_test
+          ./test/build/nav16_test
+          ./test/build/nav_carplay_test
 
   build:
     runs-on: ubuntu-latest
@@ -105,7 +105,8 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(git rev-parse --short HEAD)"
-          mkdir -p dist staging
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          mkdir -p dist staging/release staging/debug
 
           # Packaging: two self-contained USB installer archives
           # (Release and Debug). After unzipping, users can run make_usb.sh
@@ -115,13 +116,14 @@ jobs:
               release)
                 name="oem-aa-mod-${VERSION}"
                 src_dir="mazda/build/installer"
+                stage="staging/release/${name}"
                 ;;
               debug)
                 name="oem-aa-mod-${VERSION}-debug"
                 src_dir="mazda/build/installer-debug"
+                stage="staging/debug/${name}"
                 ;;
             esac
-            stage="staging/${name}"
             mkdir -p "$stage"
             cp -r "$src_dir"/. "$stage/"
 
@@ -134,7 +136,7 @@ jobs:
             done
 
             # Wrapper dir inside the archive avoids a zip-bomb on extract.
-            ( cd staging && zip -r "../dist/${name}.zip" "$name" )
+            ( cd "staging/${cfg}" && zip -r "../../dist/${name}.zip" "$name" )
           done
 
           ( cd dist && sha256sum ./*.zip > SHA256SUMS )
@@ -145,12 +147,18 @@ jobs:
             unzip -l "$archive"
           done
 
-      - name: Upload archives
+      - name: Upload release installer (normal)
         uses: actions/upload-artifact@v4
         with:
-          name: oem-aa-mod-archives
-          path: |
-            dist/*.zip
-            dist/SHA256SUMS
+          name: oem-aa-mod-${{ env.VERSION }}
+          path: staging/release/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload debug installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: oem-aa-mod-${{ env.VERSION }}-debug
+          path: staging/debug/
           retention-days: 14
           if-no-files-found: error

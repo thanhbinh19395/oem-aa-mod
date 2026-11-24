@@ -86,11 +86,15 @@ constexpr int      kManListCntOff   = 0x656;  // u16 maneuverList count
 // hu.proto NAVTurnMessage.TURN_EVENT — used as the hud_send kTurnIcons index.
 // (kTurnIcons in hud_send.cpp covers 0..19; 13 = roundabout, handled there by
 // roundabout_icon(angle, side).)
-constexpr uint32_t EV_DEPART = 1, EV_NAME_CHANGE = 2, EV_SLIGHT = 3, EV_TURN = 4,
-                   EV_SHARP = 5, EV_UTURN = 6, EV_ON_RAMP = 7, EV_OFF_RAMP = 8,
-                   EV_FORK = 9, EV_MERGE = 10, EV_ROUNDABOUT = 13, EV_STRAIGHT = 14,
-                   EV_FERRY = 16, EV_DEST = 19;
-constexpr uint32_t SIDE_LEFT = 1, SIDE_RIGHT = 2, SIDE_NONE = 3;
+enum : uint32_t {
+    EV_DEPART = 1, EV_NAME_CHANGE = 2, EV_SLIGHT = 3, EV_TURN = 4,
+    EV_SHARP = 5, EV_UTURN = 6, EV_ON_RAMP = 7, EV_OFF_RAMP = 8,
+    EV_FORK = 9, EV_MERGE = 10, EV_ROUNDABOUT = 13, EV_STRAIGHT = 14,
+    EV_FERRY = 16, EV_DEST = 19
+};
+enum : uint32_t {
+    SIDE_LEFT = 1, SIDE_RIGHT = 2, SIDE_NONE = 3
+};
 
 // --- latched display state (persists between bursts; the 2Hz hud keep-alive resends it) ---
 uint32_t g_disp_event  = EV_STRAIGHT;
@@ -125,6 +129,7 @@ bool is_context_type(uint32_t m)
 }
 
 // Convert UTF-8 string to lowercase ASCII, stripping Vietnamese diacritics and symbols.
+// Supports both NFC (precomposed) and NFD (decomposed combining diacritics used natively by iOS/macOS).
 void to_ascii_lower(const char *in, char *out, size_t outsz)
 {
     if (!in || !out || outsz == 0) return;
@@ -140,6 +145,9 @@ void to_ascii_lower(const char *in, char *out, size_t outsz)
         } else if ((c & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
             uint32_t cp = ((c & 0x1F) << 6) | (p[1] & 0x3F);
             p += 2;
+            // Combining Diacritical Marks (U+0300..U+036F) in NFD (iOS): skip without output
+            if (cp >= 0x300 && cp <= 0x36F) continue;
+
             char ch = ' ';
             if ((cp >= 0xC0 && cp <= 0xC3) || (cp >= 0xE0 && cp <= 0xE3) || cp == 0x102 || cp == 0x103) ch = 'a';
             else if ((cp >= 0xC8 && cp <= 0xCA) || (cp >= 0xE8 && cp <= 0xEA)) ch = 'e';
@@ -152,6 +160,9 @@ void to_ascii_lower(const char *in, char *out, size_t outsz)
         } else if ((c & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
             uint32_t cp = ((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
             p += 3;
+            // Combining marks in 0x1DC0..0x1DFF or 0x20D0..0x20FF: skip
+            if ((cp >= 0x1DC0 && cp <= 0x1DFF) || (cp >= 0x20D0 && cp <= 0x20FF)) continue;
+
             char ch = ' ';
             if (cp >= 0x1EA0 && cp <= 0x1EF9) {
                 if (cp <= 0x1EB7) ch = 'a';
@@ -180,6 +191,21 @@ struct Maneuver {
     int32_t  number;   // roundabout exit number (1..19); else 0
 };
 
+// Match a standalone word (bounded by spaces or string boundaries)
+bool has_word(const char *text, const char *word)
+{
+    if (!text || !word) return false;
+    const char *p = text;
+    size_t wlen = strlen(word);
+    while ((p = strstr(p, word)) != nullptr) {
+        bool left_ok  = (p == text || *(p - 1) == ' ');
+        bool right_ok = (p[wlen] == '\0' || p[wlen] == ' ');
+        if (left_ok && right_ok) return true;
+        p += 1;
+    }
+    return false;
+}
+
 // [VIETMAP/3RD-PARTY] Classify maneuvers from instruction text when mtype == 0
 bool classify_from_text(const char *raw_text, uint32_t driveSide, Maneuver &m)
 {
@@ -194,7 +220,7 @@ bool classify_from_text(const char *raw_text, uint32_t driveSide, Maneuver &m)
 
     // 1. U-turn
     if (strstr(text, "quay dau") || strstr(text, "vong nguoc lai") ||
-        strstr(text, "u turn") || strstr(text, "uturn")) {
+        strstr(text, "quay xe") || strstr(text, "u turn") || strstr(text, "uturn")) {
         m.event = EV_UTURN;
         m.side = (driveSide == 1) ? SIDE_RIGHT : SIDE_LEFT;
         return true;
@@ -232,46 +258,48 @@ bool classify_from_text(const char *raw_text, uint32_t driveSide, Maneuver &m)
         return true;
     }
 
-    // 4. Slight turn
+    // 4. Slight turn / Bear / Merge
     if (strstr(text, "chech") || strstr(text, "hoi re") || strstr(text, "slight") ||
-        strstr(text, "bear") || strstr(text, "nhap lan")) {
+        strstr(text, "bear") || strstr(text, "nhap lan") || strstr(text, "nhap vao") ||
+        strstr(text, "re nhanh") || strstr(text, "nhanh re") || strstr(text, "duong nhanh") ||
+        strstr(text, "loi ra")) {
         m.event = EV_SLIGHT;
-        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT : SIDE_RIGHT;
+        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT :
+                 (strstr(text, "phai") || strstr(text, "right")) ? SIDE_RIGHT : SIDE_NONE;
         return true;
     }
 
-    // 5. Normal turn
-    if (strstr(text, "re") || strstr(text, "queo") || strstr(text, "turn") ||
+    // 5. Normal turn (use has_word to avoid false positives like "tren" matching "re")
+    if (has_word(text, "re") || has_word(text, "queo") || has_word(text, "turn") ||
         strstr(text, "sang trai") || strstr(text, "sang phai")) {
         m.event = EV_TURN;
-        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT : SIDE_RIGHT;
+        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT :
+                 (strstr(text, "phai") || strstr(text, "right")) ? SIDE_RIGHT : SIDE_NONE;
         return true;
     }
 
     // 6. Fork / Keep
-    if (strstr(text, "giu ben") || strstr(text, "keep") || strstr(text, "fork")) {
+    if (strstr(text, "giu ben") || strstr(text, "giu lan") || strstr(text, "keep") || strstr(text, "fork")) {
         m.event = EV_FORK;
-        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT : SIDE_RIGHT;
+        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT :
+                 (strstr(text, "phai") || strstr(text, "right")) ? SIDE_RIGHT : SIDE_NONE;
         return true;
     }
 
     // 7. Destination
     if (strstr(text, "den noi") || strstr(text, "diem den") || strstr(text, "dich den") ||
-        strstr(text, "ban da den") || strstr(text, "arrive") || strstr(text, "destination")) {
+        strstr(text, "ban da den") || strstr(text, "da den") || strstr(text, "arrive") || strstr(text, "destination")) {
         m.event = EV_DEST;
         m.side = SIDE_NONE;
         return true;
     }
 
-    // 8. Straight
-    if (strstr(text, "di thang") || strstr(text, "chay thang") || strstr(text, "tiep tuc") ||
-        strstr(text, "straight") || strstr(text, "continue")) {
-        m.event = EV_STRAIGHT;
-        m.side = SIDE_NONE;
-        return true;
-    }
-
-    return false;
+    // 8. Straight / Default
+    // Matches explicit straight ("di thang", "chay thang", "tiep tuc", "di tiep", "di theo", "huong", etc.)
+    // AND falls back to EV_STRAIGHT for any other active navigation text (e.g. road names, departure heading).
+    m.event = EV_STRAIGHT;
+    m.side = SIDE_NONE;
+    return true;
 }
 
 // One displayable (non-context) maneuver buffered from the current burst.
@@ -492,8 +520,18 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
             mv = classify(mtype, junction, jAngle, driveSide);
         } else {
             // mtype == 0: 3rd-party app (e.g. VietMap Live, Google Maps) using public CPManeuver.
-            // Infer maneuver from instruction text. Drop if empty or heading context.
-            if (!classify_from_text(text, driveSide, mv)) return;
+            // Infer maneuver from instruction text. If text has no turn keyword, classify_from_text
+            // defaults to EV_STRAIGHT. If text is empty but road is present, display road straight.
+            if (!classify_from_text(text, driveSide, mv)) {
+                if (road[0]) {
+                    mv.event  = EV_STRAIGHT;
+                    mv.side   = SIDE_NONE;
+                    mv.angle  = 0;
+                    mv.number = 0;
+                } else {
+                    return;
+                }
+            }
         }
         if (g_buf_count >= kMaxBurst) return;
 
