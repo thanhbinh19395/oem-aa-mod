@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// splim_seriald — USB serial → /data_persist/splim for Mazda Connect (CMU150).
+// splim_seriald — USB serial → /tmp/splim for Mazda Connect (CMU150).
 // Copyright (C) 2026 KID MIXER-MODER.
 //
 // Part of an AGPL-3.0 work — see NOTICE.md for full attribution.
 //
 // Reads line-oriented "SPLIM <km/h>" from an ESP32 USB CDC port (ttyACM*/ttyUSB*)
-// and atomically writes "/data_persist/splim" as "<limit> <unix_ts>" — the same
-// format libpatch-blmjcicarplay::read_splim() already consumes.
+// and atomically writes "/tmp/splim" (RAM tmpfs, zero eMMC flash wear) as
+// "<limit> <unix_ts>" — the format libpatch-blmjcicarplay::read_splim() consumes.
 //
-// EXCLUSIVITY: a lock file under /data_persist keeps a second instance from
-// opening the same writer path. Prefer a single writer of /data_persist/splim
-// (do not run OCR / a competing UDP writer at the same time).
+// EXCLUSIVITY: a lock file under /tmp keeps a second instance from opening the
+// same writer path. Prefer a single writer of splim (do not run OCR / a competing
+// UDP writer at the same time).
 
 #include <dirent.h>
 #include <errno.h>
@@ -23,18 +23,21 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
-#define SPLIM_PATH     "/data_persist/splim"
-#define SPLIM_TMP      "/data_persist/splim.tmp"
-#define LOCK_PATH      "/data_persist/splim_seriald.lock"
+// Stored in /tmp (tmpfs RAM) instead of /data_persist (eMMC flash) so the
+// periodic 3 s timestamp refresh incurs ZERO flash wear and auto-cleans on boot.
+#define SPLIM_PATH     "/tmp/splim"
+#define SPLIM_TMP      "/tmp/splim.tmp"
+#define LOCK_PATH      "/tmp/splim_seriald.lock"
 #define DEFAULT_BAUD   B115200
 #define SPLIM_LINE_MAX 128   // not LINE_MAX: that name collides with <limits.h>
 #define LOG_TAG        "[SPLIM-SERIAL] "
 // The HUD treats splim as stale after 8 s and the ESP32 re-sends every 2 s, so an
-// unchanged limit only needs a fresh timestamp this often. Cuts flash writes.
+// unchanged limit only needs a fresh timestamp this often.
 #define REFRESH_SEC    3
 
 static volatile sig_atomic_t g_stop = 0;
@@ -42,9 +45,19 @@ static int g_lock_fd = -1;
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
+// Monotonic seconds via Linux sysinfo() (in libc on glibc 2.11+, no -lrt needed).
+// Immune to RTC / GPS / NTP wall-clock jumps.
+static long monotonic_sec(void)
+{
+    struct sysinfo si;
+    if (sysinfo(&si) == 0)
+        return si.uptime;
+    return (long)time(NULL);
+}
+
 static int acquire_lock(void)
 {
-    g_lock_fd = open(LOCK_PATH, O_RDWR | O_CREAT, 0644);
+    g_lock_fd = open(LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (g_lock_fd < 0) {
         fprintf(stderr, LOG_TAG "open lock: %s\n", strerror(errno));
         return -1;
@@ -67,22 +80,33 @@ static void release_lock(void)
     }
 }
 
+static void serial_send(int fd, const char *msg)
+{
+    if (fd < 0 || !msg)
+        return;
+    size_t len = strlen(msg);
+    // fd is O_NONBLOCK so a stalled USB CDC endpoint can never hang the daemon.
+    (void)write(fd, msg, len);
+}
+
 static int write_splim(int limit)
 {
     if (limit < 5 || limit > 200)
         return -1;
 
-    FILE *f = fopen(SPLIM_TMP, "w");
-    if (!f) {
+    char buf[48];
+    int blen = snprintf(buf, sizeof(buf), "%d %ld\n", limit, (long)time(NULL));
+    if (blen <= 0 || (size_t)blen >= sizeof(buf))
+        return -1;
+
+    int fd = open(SPLIM_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
         fprintf(stderr, LOG_TAG "open tmp: %s\n", strerror(errno));
         return -1;
     }
-    // No fsync: the value is refreshed every few seconds and rename() keeps the
-    // swap atomic, so a power cut only loses a sample. fsync per write wears flash.
-    int ok = fprintf(f, "%d %ld\n", limit, (long)time(NULL)) > 0;
-    if (fclose(f) != 0)
-        ok = 0;
-    if (!ok) {
+    ssize_t wn = write(fd, buf, (size_t)blen);
+    int c_rc = close(fd);
+    if (wn != (ssize_t)blen || c_rc != 0) {
         fprintf(stderr, LOG_TAG "write tmp: %s\n", strerror(errno));
         unlink(SPLIM_TMP);
         return -1;
@@ -106,21 +130,19 @@ static int configure_tty(int fd)
     tio.c_cflag |= (CLOCAL | CREAD);
     tio.c_cflag &= ~CRTSCTS;
     tio.c_cc[VMIN]  = 0;
-    tio.c_cc[VTIME] = 5;   // 0.5 s read timeout → wake for signals / reopen
+    tio.c_cc[VTIME] = 0;   // O_NONBLOCK + poll() drives waiting
     return tcsetattr(fd, TCSANOW, &tio);
 }
 
 static int open_device(const char *path)
 {
-    int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    // Keep O_NONBLOCK after open: poll() handles waiting for RX, and non-blocking
+    // writes prevent a stalled/unplugged CDC endpoint from hanging the daemon.
+    int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0)
-        fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+        fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0)
         return -1;
-    // Drop O_NONBLOCK after open so VTIME-based reads work.
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0)
-        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
     if (configure_tty(fd) != 0) {
         close(fd);
         return -1;
@@ -128,8 +150,7 @@ static int open_device(const char *path)
     // Discard stale boot chatter.
     tcflush(fd, TCIFLUSH);
     // Greet ESP32 that CMU splim service is ready
-    const char *hello = "CMU:OK\n";
-    (void)write(fd, hello, strlen(hello));
+    serial_send(fd, "CMU:OK\n");
     return fd;
 }
 
@@ -191,23 +212,34 @@ static int parse_line(const char *line, int *out_limit)
     return 0;
 }
 
-static void feed_byte(int fd, char *buf, size_t *len, unsigned char c, int *last_limit)
+static void feed_byte(int fd, char *buf, size_t *len, int *discard,
+                      unsigned char c, int *last_limit)
 {
-    static time_t last_write = 0;
+    static long   last_write_mono = -100;
+    static time_t last_write_wall = 0;
+
     if (c == '\r')
         return;
     if (c == '\n') {
+        if (*discard) {
+            *discard = 0;
+            *len = 0;
+            return;
+        }
         buf[*len] = '\0';
         int limit = 0;
         if (*len > 0) {
             if (parse_line(buf, &limit) == 0) {
-                time_t now = time(NULL);
-                // Rewrite on change, or to refresh the timestamp. now < last_write
-                // means the wall clock stepped back, so refresh immediately.
-                if (limit != *last_limit || now < last_write ||
-                    now - last_write >= REFRESH_SEC) {
+                long   now_mono = monotonic_sec();
+                time_t now_wall = time(NULL);
+                // Rewrite on change, monotonic refresh cadence, or wall-clock jump.
+                if (limit != *last_limit ||
+                    now_mono - last_write_mono >= REFRESH_SEC ||
+                    now_wall < last_write_wall ||
+                    now_wall - last_write_wall >= REFRESH_SEC) {
                     if (write_splim(limit) == 0) {
-                        last_write = now;
+                        last_write_mono = now_mono;
+                        last_write_wall = now_wall;
                         if (limit != *last_limit) {
                             fprintf(stderr, LOG_TAG "splim=%d km/h\n", limit);
                             *last_limit = limit;
@@ -218,23 +250,26 @@ static void feed_byte(int fd, char *buf, size_t *len, unsigned char c, int *last
                 if (fd >= 0) {
                     char ack[32];
                     snprintf(ack, sizeof(ack), "CMU:ACK %d\n", limit);
-                    (void)write(fd, ack, strlen(ack));
+                    serial_send(fd, ack);
                 }
             } else if (strncmp(buf, "PING", 4) == 0 || strncmp(buf, "#", 1) == 0) {
                 // Reply to ping/keepalive from ESP32
-                if (fd >= 0) {
-                    const char *pong = "CMU:PONG\n";
-                    (void)write(fd, pong, strlen(pong));
-                }
+                serial_send(fd, "CMU:PONG\n");
             }
         }
         *len = 0;
         return;
     }
+    if (*discard)
+        return;
     if (*len + 1 < SPLIM_LINE_MAX)
         buf[(*len)++] = (char)c;
-    else
-        *len = 0;   // overflow → resync on next newline
+    else {
+        // Line exceeded SPLIM_LINE_MAX: ignore remaining bytes until '\n'
+        // rather than treating the tail as a new line.
+        *discard = 1;
+        *len = 0;
+    }
 }
 
 int main(int argc, char **argv)
@@ -243,10 +278,11 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
     signal(SIGINT,  on_signal);
 
-    // Launched via system() from inside jciCARPLAY, so every non-CLOEXEC fd of that
-    // process (D-Bus sockets, device nodes, logs) leaked into us. Hold none of them:
-    // a daemon pinning them would outlive jciCARPLAY and keep them open.
-    for (int fd = 3; fd < 256; fd++)
+    // Close any inherited non-CLOEXEC fds from launcher (D-Bus sockets, logs, etc.).
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    if (max_fd < 256) max_fd = 256;
+    if (max_fd > 1024) max_fd = 1024;
+    for (int fd = 3; fd < (int)max_fd; fd++)
         close(fd);
 
     if (acquire_lock() != 0)
@@ -261,9 +297,10 @@ int main(int argc, char **argv)
     char path[64] = "";
     int fd = -1;
     int last_limit = -1;
-    time_t last_hb = 0;
+    long last_hb_mono = 0;
     char line[SPLIM_LINE_MAX];
     size_t llen = 0;
+    int discard = 0;
 
     fprintf(stderr, LOG_TAG "starting (want=%s)\n",
             want ? want : "auto ttyACM*/ttyUSB*");
@@ -282,7 +319,8 @@ int main(int argc, char **argv)
             }
             fprintf(stderr, LOG_TAG "opened %s\n", path);
             llen = 0;
-            last_hb = time(NULL);
+            discard = 0;
+            last_hb_mono = monotonic_sec();
         }
 
         // Wait with poll(), not a bare read(): once the ESP32 is unplugged the tty is
@@ -300,33 +338,49 @@ int main(int argc, char **argv)
             sleep(1);
             continue;
         }
-        if (pr == 0) {
-            // Heartbeat to ESP32 every 2 seconds when idle
-            time_t now = time(NULL);
-            if (now - last_hb >= 2 && fd >= 0) {
-                last_hb = now;
-                const char *hb = "CMU:HB\n";
-                (void)write(fd, hb, strlen(hb));
-            }
-            continue;   // idle
+
+        // Periodic monotonic heartbeat every 2 s regardless of RX chatter, so
+        // ESP32 never falsely times out while receiving non-SPLIM debug lines.
+        long now_mono = monotonic_sec();
+        if (now_mono - last_hb_mono >= 2 && fd >= 0) {
+            last_hb_mono = now_mono;
+            serial_send(fd, "CMU:HB\n");
         }
 
-        unsigned char chunk[64];
-        ssize_t n = read(fd, chunk, sizeof(chunk));
-        if (n < 0 && errno == EINTR)
-            continue;
-        // n == 0 after poll() said readable is EOF (hangup); POLLHUP/ERR/NVAL with no
-        // data pending is the same thing. Either way the port is gone — reopen.
-        if (n <= 0 || (pfd.revents & (POLLERR | POLLNVAL))) {
-            fprintf(stderr, LOG_TAG "port lost (%s) — reopening\n",
-                    n < 0 ? strerror(errno) : "hangup");
+        if (pr == 0)
+            continue;   // idle
+
+        if (pfd.revents & POLLIN) {
+            unsigned char chunk[64];
+            ssize_t n = read(fd, chunk, sizeof(chunk));
+            if (n < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                    continue;
+                fprintf(stderr, LOG_TAG "read error (%s) — reopening\n", strerror(errno));
+                close(fd);
+                fd = -1;
+                sleep(1);
+                continue;
+            }
+            if (n == 0) {
+                fprintf(stderr, LOG_TAG "port lost (hangup) — reopening\n");
+                close(fd);
+                fd = -1;
+                sleep(1);
+                continue;
+            }
+            for (ssize_t i = 0; i < n; i++)
+                feed_byte(fd, line, &llen, &discard, chunk[i], &last_limit);
+        }
+
+        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            fprintf(stderr, LOG_TAG "port hangup/error (0x%x) — reopening\n",
+                    (unsigned)pfd.revents);
             close(fd);
             fd = -1;
             sleep(1);
             continue;
         }
-        for (ssize_t i = 0; i < n; i++)
-            feed_byte(fd, line, &llen, chunk[i], &last_limit);
     }
 
     if (fd >= 0)

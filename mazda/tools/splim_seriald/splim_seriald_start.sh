@@ -14,6 +14,9 @@
 export PATH="/sbin:/usr/sbin:$PATH"
 modprobe cdc-acm 2>/dev/null
 
+# Never inherit jciCARPLAY's LD_PRELOAD / LD_LIBRARY_PATH into splim_seriald.
+unset LD_PRELOAD LD_LIBRARY_PATH
+
 # Uncomment to pin a device:
 # export SPLIM_SERIAL_DEV=/dev/ttyACM0
 

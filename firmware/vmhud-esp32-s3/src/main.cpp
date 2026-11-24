@@ -20,13 +20,14 @@ static String g_adv = "BOTH";
 
 static Preferences g_store;
 static std::mutex g_cfgMutex;
+static std::mutex g_serialMutex;
 static std::atomic<bool> g_connected{false};
 static std::atomic<bool> g_hudInfoOk{false};
-static uint16_t g_conn = BLE_HS_CONN_HANDLE_NONE;
+static std::atomic<uint16_t> g_conn{BLE_HS_CONN_HANDLE_NONE};
 static NimBLECharacteristic *g_h1 = nullptr;
 static NimBLECharacteristic *g_h50 = nullptr;
-static bool g_subH1 = false;
-static bool g_subH50 = false;
+static std::atomic<bool> g_subH1{false};
+static std::atomic<bool> g_subH50{false};
 static vmhud::Receiver<4096> g_rxH1, g_rxH50;
 
 static std::atomic<uint8_t> g_postedLimit{0};
@@ -47,14 +48,36 @@ static std::atomic<uint32_t> g_lastCmuRxMs{0};
 static char g_cmuRxBuf[64];
 static size_t g_cmuRxLen = 0;
 
-static uint8_t g_lastEmittedLimit = 0;
+static std::atomic<uint8_t> g_lastEmittedLimit{0};
+static std::atomic<bool> g_splimForceEmit{false};
 static uint32_t g_lastKeepaliveMs = 0;
-static volatile bool g_displayDirty = true;
+static std::atomic<bool> g_displayDirty{true};
 static uint32_t g_lastDisplayMs = 0;
 
 // CMU read_splim() rejects entries older than 8 s — re-emit every 2 s while
 // a valid limit is held so the HUD sign does not go stale between CAM frames.
 static const uint32_t kKeepaliveMs = 2000;
+
+static void serialWriteLine(const char *line, size_t len) {
+  std::lock_guard<std::mutex> guard(g_serialMutex);
+  Serial.write(reinterpret_cast<const uint8_t *>(line), len);
+}
+
+#ifdef VMHUD_SERIAL_DEBUG
+static void debugLogf(const char *fmt, ...) {
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (n > 0) {
+    size_t len = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
+    serialWriteLine(buf, len);
+  }
+}
+#else
+#define debugLogf(...) ((void)0)
+#endif
 
 static bool sdkChecksum(const uint8_t *p, size_t n, const uint8_t *uid, uint8_t *out) {
   uint8_t digest[16];
@@ -79,23 +102,24 @@ static String textUtf8(const uint8_t *p, size_t n) {
   return value;
 }
 
-static void printHex(const uint8_t *p, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    Serial.printf("%02X", p[i]);
-  }
-  Serial.println();
-}
-
+// Called strictly from loop() so SPLIM lines are never interleaved with other tasks
+// and the NimBLE host task never stalls on USB CDC TX timeouts.
 static void emitSplim(uint8_t limit) {
   if (limit < 5 || limit > 200) {
     return;
   }
-  g_lastEmittedLimit = limit;
-  g_lastKeepaliveMs = millis();
-  g_lastSplimMs = g_lastKeepaliveMs;
-  g_splimTxCount++;
-  g_displayDirty = true;
-  Serial.printf("SPLIM %u\n", (unsigned)limit);
+  char buf[24];
+  int n = snprintf(buf, sizeof(buf), "SPLIM %u\n", (unsigned)limit);
+  if (n <= 0 || (size_t)n >= sizeof(buf)) {
+    return;
+  }
+  const uint32_t now = millis();
+  g_lastEmittedLimit.store(limit, std::memory_order_relaxed);
+  g_lastKeepaliveMs = now;
+  g_lastSplimMs.store(now, std::memory_order_relaxed);
+  g_splimTxCount.fetch_add(1, std::memory_order_relaxed);
+  g_displayDirty.store(true, std::memory_order_relaxed);
+  serialWriteLine(buf, (size_t)n);
 }
 
 static uint8_t postedLimitFromCamera(const vmhud::Frame &frame, uint16_t &outDist, uint8_t &outType) {
@@ -141,9 +165,12 @@ static uint8_t postedLimitFromCamera(const vmhud::Frame &frame, uint16_t &outDis
 }
 
 static void notifyInfo(const vmhud::Frame &request, NimBLECharacteristic *route) {
-  const bool subscribed = route == g_h1 ? g_subH1 : g_subH50;
-  if (!g_connected || !subscribed) {
-    Serial.println("[HUD] HUDInfo before notify subscribe");
+  const bool subscribed = route == g_h1 ? g_subH1.load(std::memory_order_relaxed)
+                                        : g_subH50.load(std::memory_order_relaxed);
+  const uint16_t connHandle = g_conn.load(std::memory_order_relaxed);
+  if (!g_connected.load(std::memory_order_relaxed) || !subscribed ||
+      connHandle == BLE_HS_CONN_HANDLE_NONE) {
+    debugLogf("[HUD] HUDInfo before notify subscribe\n");
     return;
   }
   String info;
@@ -152,29 +179,28 @@ static void notifyInfo(const vmhud::Frame &request, NimBLECharacteristic *route)
     info = "MODEL:" + g_model + ",HW:" + g_hw + ",FW:" + g_fw + ",PROTOCOL:" + g_protocol +
            ",OBDV:0_1.0,SID:" + g_sid;
   }
-  static uint8_t frame[512];
+  uint8_t frame[256];
   const size_t count =
       vmhud::build(0x0e, (const uint8_t *)info.c_str(), info.length(), request.timestamp, frame,
                    sizeof(frame), sdkChecksum, request.legacy);
   if (!count) {
-    Serial.println("[HUD] HUDInfo build failed");
+    debugLogf("[HUD] HUDInfo build failed\n");
     return;
   }
   for (size_t offset = 0; offset < count; offset += 20) {
     const size_t chunk = count - offset < 20 ? count - offset : 20;
-    if (!route->notify(frame + offset, chunk, g_conn)) {
-      Serial.println("[HUD] notify failed");
+    if (!route->notify(frame + offset, chunk, connHandle)) {
+      debugLogf("[HUD] notify failed\n");
       return;
     }
   }
-  g_hudInfoOk = true;
-  g_displayDirty = true;
-  Serial.printf("[HUD] HUDInfo %u bytes\n", (unsigned)count);
+  g_hudInfoOk.store(true, std::memory_order_relaxed);
+  g_displayDirty.store(true, std::memory_order_relaxed);
+  debugLogf("[HUD] HUDInfo %u bytes\n", (unsigned)count);
 }
 
 static void onFrame(const vmhud::Frame &frame, void *user) {
-  Serial.printf("[RX] CMD 0x%02X plen=%u\n", frame.command, (unsigned)frame.size);
-  printHex(frame.payload, frame.size);
+  debugLogf("[RX] CMD 0x%02X plen=%u\n", frame.command, (unsigned)frame.size);
 
   if (frame.command == 0x0e) {
     notifyInfo(frame, (NimBLECharacteristic *)user);
@@ -186,44 +212,42 @@ static void onFrame(const vmhud::Frame &frame, void *user) {
     if (!vmhud::navigation(frame, nav)) {
       return;
     }
-    g_navPktCount++;
-    g_currentSpeed = nav.speed;
+    g_navPktCount.fetch_add(1, std::memory_order_relaxed);
+    g_currentSpeed.store(nav.speed, std::memory_order_relaxed);
     const String current = textUtf8(nav.current, nav.currentSize);
     {
       std::lock_guard<std::mutex> guard(g_roadMutex);
       g_currentRoad = current;
     }
-    g_displayDirty = true;
-    Serial.printf("[NAV] speed=%u cur=\"%s\"\n", (unsigned)nav.speed, current.c_str());
+    g_displayDirty.store(true, std::memory_order_relaxed);
+    debugLogf("[NAV] speed=%u cur=\"%s\"\n", (unsigned)nav.speed, current.c_str());
     return;
   }
 
   // Camera and speed limit (CMD 0x01, multiple of 4 bytes)
   if (frame.command == 1 && frame.size >= 4 && (frame.size % 4) == 0) {
-    g_camPktCount++;
-    for (size_t i = 0; i < frame.size; i += 4) {
-      Serial.printf("[CAM] type=%u dist=%u limit=%u\n", frame.payload[i],
-                    (unsigned)vmhud::be16(frame.payload + i + 1), frame.payload[i + 3]);
-    }
+    g_camPktCount.fetch_add(1, std::memory_order_relaxed);
     uint16_t dist = 0;
     uint8_t type = 0;
     const uint8_t lim = postedLimitFromCamera(frame, dist, type);
-    g_camDist = dist;
-    g_camType = type;
-    g_postedLimit = lim;
-    g_displayDirty = true;
-    if (lim) {
-      emitSplim(lim);
+    g_camDist.store(dist, std::memory_order_relaxed);
+    g_camType.store(type, std::memory_order_relaxed);
+    g_postedLimit.store(lim, std::memory_order_release);
+    if (lim >= 5 && lim <= 200) {
+      // Request prompt USB CDC transmission from loop() (<= 20 ms latency)
+      g_splimForceEmit.store(true, std::memory_order_release);
     }
+    g_displayDirty.store(true, std::memory_order_relaxed);
+    debugLogf("[CAM] type=%u dist=%u limit=%u\n", (unsigned)type, (unsigned)dist, (unsigned)lim);
     return;
   }
 
   if (frame.command == 2 && (frame.size == 1 || frame.size == 2)) {
-    g_hbPktCount++;
+    g_hbPktCount.fetch_add(1, std::memory_order_relaxed);
     const uint16_t spd = frame.size == 1 ? frame.payload[0] : vmhud::be16(frame.payload);
-    g_currentSpeed = spd;
-    g_displayDirty = true;
-    Serial.printf("[HB] speed=%u\n", (unsigned)spd);
+    g_currentSpeed.store(spd, std::memory_order_relaxed);
+    g_displayDirty.store(true, std::memory_order_relaxed);
+    debugLogf("[HB] speed=%u\n", (unsigned)spd);
   }
 }
 
@@ -231,51 +255,54 @@ static void startConnectable() { NimBLEDevice::startAdvertising(0); }
 
 struct ServerCB : NimBLEServerCallbacks {
   void onConnect(NimBLEServer *server, NimBLEConnInfo &conn) override {
-    if (g_connected) {
+    if (g_connected.load(std::memory_order_relaxed)) {
       server->disconnect(conn.getConnHandle());
       return;
     }
-    g_conn = conn.getConnHandle();
-    g_connected = true;
-    g_hudInfoOk = false;
-    g_subH1 = g_subH50 = false;
+    g_conn.store(conn.getConnHandle(), std::memory_order_release);
+    g_connected.store(true, std::memory_order_release);
+    g_hudInfoOk.store(false, std::memory_order_relaxed);
+    g_subH1.store(false, std::memory_order_relaxed);
+    g_subH50.store(false, std::memory_order_relaxed);
     g_rxH1.reset();
     g_rxH50.reset();
-    g_displayDirty = true;
-    Serial.println("[BLE] connected");
+    g_displayDirty.store(true, std::memory_order_relaxed);
+    debugLogf("[BLE] connected\n");
   }
   void onDisconnect(NimBLEServer *, NimBLEConnInfo &conn, int reason) override {
-    if (conn.getConnHandle() != g_conn) {
+    if (conn.getConnHandle() != g_conn.load(std::memory_order_acquire)) {
       return;
     }
-    g_connected = false;
-    g_hudInfoOk = false;
-    g_conn = BLE_HS_CONN_HANDLE_NONE;
-    g_subH1 = g_subH50 = false;
+    g_connected.store(false, std::memory_order_release);
+    g_hudInfoOk.store(false, std::memory_order_relaxed);
+    g_conn.store(BLE_HS_CONN_HANDLE_NONE, std::memory_order_release);
+    g_subH1.store(false, std::memory_order_relaxed);
+    g_subH50.store(false, std::memory_order_relaxed);
     g_rxH1.reset();
     g_rxH50.reset();
-    g_postedLimit = 0;
-    g_camDist = 0;
-    g_camType = 0;
-    g_lastEmittedLimit = 0;
-    g_displayDirty = true;
-    Serial.printf("[BLE] disconnected reason=%d\n", reason);
+    g_postedLimit.store(0, std::memory_order_release);
+    g_camDist.store(0, std::memory_order_relaxed);
+    g_camType.store(0, std::memory_order_relaxed);
+    g_lastEmittedLimit.store(0, std::memory_order_relaxed);
+    g_splimForceEmit.store(false, std::memory_order_relaxed);
+    g_displayDirty.store(true, std::memory_order_relaxed);
+    debugLogf("[BLE] disconnected reason=%d\n", reason);
     startConnectable();
   }
 };
 
 struct SubscribeCB : NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic *c, NimBLEConnInfo &conn, uint16_t sub) override {
-    if (conn.getConnHandle() != g_conn) {
+    if (conn.getConnHandle() != g_conn.load(std::memory_order_acquire)) {
       return;
     }
     if (c == g_h1) {
-      g_subH1 = (sub & 1) != 0;
+      g_subH1.store((sub & 1) != 0, std::memory_order_relaxed);
     } else {
-      g_subH50 = (sub & 1) != 0;
+      g_subH50.store((sub & 1) != 0, std::memory_order_relaxed);
     }
-    g_displayDirty = true;
-    Serial.printf("[BLE] notify sub=0x%04X\n", sub);
+    g_displayDirty.store(true, std::memory_order_relaxed);
+    debugLogf("[BLE] notify sub=0x%04X\n", sub);
   }
 };
 
@@ -285,12 +312,11 @@ struct WriteCB : NimBLECharacteristicCallbacks {
   vmhud::Receiver<4096> *rx;
   WriteCB(NimBLECharacteristic *r, const char *l, vmhud::Receiver<4096> *b) : route(r), label(l), rx(b) {}
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &conn) override {
-    if (conn.getConnHandle() != g_conn) {
+    if (conn.getConnHandle() != g_conn.load(std::memory_order_acquire)) {
       return;
     }
     const std::string data = c->getValue();
-    Serial.printf("[W:%s] %u bytes: ", label, (unsigned)data.size());
-    printHex((const uint8_t *)data.data(), data.size());
+    debugLogf("[W:%s] %u bytes\n", label, (unsigned)data.size());
     rx->feed((const uint8_t *)data.data(), data.size(), sdkChecksum, onFrame, route);
   }
 };
@@ -379,10 +405,10 @@ static void processCmuSerial() {
         // Any handshake/ACK message from CMU splim service: CMU:OK, CMU:ACK, CMU:HB, CMU:PONG
         if (strncmp(g_cmuRxBuf, "CMU:", 4) == 0) {
           g_lastCmuRxMs = millis();
-          if (!g_cmuConnected.load()) {
-            g_cmuConnected = true;
-            g_displayDirty = true;
-            Serial.printf("[CMU] splim service connected: %s\n", g_cmuRxBuf);
+          if (!g_cmuConnected.load(std::memory_order_relaxed)) {
+            g_cmuConnected.store(true, std::memory_order_relaxed);
+            g_displayDirty.store(true, std::memory_order_relaxed);
+            debugLogf("[CMU] splim service connected: %s\n", g_cmuRxBuf);
           }
         }
       }
@@ -403,57 +429,60 @@ void loop() {
   processCmuSerial();
 
   // Check timeout: if no heartbeat/ACK from CMU service for > 4.5 seconds
-  if (g_cmuConnected.load()) {
-    if (now - g_lastCmuRxMs.load() > 4500) {
-      g_cmuConnected = false;
-      g_displayDirty = true;
-      Serial.println("[CMU] splim service disconnected (timeout)");
+  if (g_cmuConnected.load(std::memory_order_relaxed)) {
+    if (now - g_lastCmuRxMs.load(std::memory_order_relaxed) > 4500) {
+      g_cmuConnected.store(false, std::memory_order_relaxed);
+      g_displayDirty.store(true, std::memory_order_relaxed);
+      debugLogf("[CMU] splim service disconnected (timeout)\n");
     }
   }
 
-  // SPLIM USB serial keepalive / probe emission to CMU
+  // SPLIM USB serial keepalive / probe emission to CMU (single-task owned).
   if (lim >= 5 && lim <= 200) {
-    if (lim != g_lastEmittedLimit || (now - g_lastKeepaliveMs) >= kKeepaliveMs) {
+    const bool forceEmit = g_splimForceEmit.exchange(false, std::memory_order_acquire);
+    if (forceEmit || lim != g_lastEmittedLimit.load(std::memory_order_relaxed) ||
+        (now - g_lastKeepaliveMs) >= kKeepaliveMs) {
       emitSplim(lim);
     }
   } else {
+    g_splimForceEmit.store(false, std::memory_order_relaxed);
     // When no limit is held from VietMap, poll CMU service every 2 s
     if ((now - g_lastKeepaliveMs) >= kKeepaliveMs) {
       g_lastKeepaliveMs = now;
-      Serial.println("PING");
+      serialWriteLine("PING\n", 5);
     }
   }
 
   // Display update (refresh every 500ms or when state changes)
 #if VMHUD_HAS_DISPLAY
-  if (g_displayDirty || (now - g_lastDisplayMs >= 500)) {
-    g_displayDirty = false;
+  if (g_displayDirty.exchange(false, std::memory_order_relaxed) || (now - g_lastDisplayMs >= 500)) {
     g_lastDisplayMs = now;
 
     DisplayState st;
-    st.bleConnected = g_connected.load();
-    st.hudInfoOk = g_hudInfoOk.load();
-    st.notifySubscribed = g_subH1 || g_subH50;
-    st.cmuConnected = g_cmuConnected.load();
+    st.bleConnected = g_connected.load(std::memory_order_relaxed);
+    st.hudInfoOk = g_hudInfoOk.load(std::memory_order_relaxed);
+    st.notifySubscribed =
+        g_subH1.load(std::memory_order_relaxed) || g_subH50.load(std::memory_order_relaxed);
+    st.cmuConnected = g_cmuConnected.load(std::memory_order_relaxed);
     st.postedLimit = lim;
-    st.camDist = g_camDist.load();
-    st.camType = g_camType.load();
-    st.currentSpeed = g_currentSpeed.load();
+    st.camDist = g_camDist.load(std::memory_order_relaxed);
+    st.camType = g_camType.load(std::memory_order_relaxed);
+    st.currentSpeed = g_currentSpeed.load(std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> guard(g_roadMutex);
       st.currentRoad = g_currentRoad;
     }
-    st.lastEmittedLimit = g_lastEmittedLimit;
-    st.splimTxCount = g_splimTxCount.load();
-    st.lastSplimMs = g_lastSplimMs.load();
-    st.camPktCount = g_camPktCount.load();
-    st.navPktCount = g_navPktCount.load();
-    st.hbPktCount = g_hbPktCount.load();
+    st.lastEmittedLimit = g_lastEmittedLimit.load(std::memory_order_relaxed);
+    st.splimTxCount = g_splimTxCount.load(std::memory_order_relaxed);
+    st.lastSplimMs = g_lastSplimMs.load(std::memory_order_relaxed);
+    st.camPktCount = g_camPktCount.load(std::memory_order_relaxed);
+    st.navPktCount = g_navPktCount.load(std::memory_order_relaxed);
+    st.hbPktCount = g_hbPktCount.load(std::memory_order_relaxed);
     st.uptimeSec = now / 1000;
 
     displayUpdate(st);
   }
 #endif
 
-  delay(50);
+  delay(20);
 }

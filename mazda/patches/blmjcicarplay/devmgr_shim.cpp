@@ -24,8 +24,10 @@
 
 #include "patch.h"
 #include "oem/libjcidbus.h"
-#include "common/config.h"   // runtime libpatch-carplay.conf (carplay_*_diag keys)
+#include "common/config.h"      // runtime libpatch-carplay.conf (carplay_* keys)
+#include "common/thread_util.h" // preload_thread_create (256 KiB bounded stack)
 
+#include <atomic>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -39,18 +41,28 @@ namespace {
 
 typedef int (*pfn4)(void *, void *, void *, void *);
 
+// RouteGuidanceDisplayComponent identifier advertised by ipoddev_full_auth
+// (verified in /etc/devmgr_config_master.xml: <name>NaviCompId</name><value>0x5555</value>
+// and ipoddev_full_auth::IAP2_StartNavigationRouteGuidanceUpdate).
+constexpr uintptr_t kNaviCompId = 0x5555u;
+
 pfn4  g_real_register  = nullptr;
 pfn4  g_real_callstate = nullptr;
 pfn4  g_real_commupd   = nullptr;
 pfn4  g_real_sendloc   = nullptr;
 pfn4  g_real_startnavi = nullptr;
 
-void *g_devmgr_handle = nullptr;
-pthread_mutex_t g_mu        = PTHREAD_MUTEX_INITIALIZER;
-bool            g_navi_armed = false;
-volatile int    g_armed      = 0;   // set once a live CarPlay session has armed nav; gates the passive msgrcv tap (no tapping until a nav session is up)
-void *g_procH = nullptr;
-void *g_devH  = nullptr;
+void            *g_devmgr_handle    = nullptr;
+pthread_once_t   g_resolve_once     = PTHREAD_ONCE_INIT;
+pthread_mutex_t  g_mu               = PTHREAD_MUTEX_INITIALIZER;
+bool             g_services_started = false;
+bool             g_retry_thread_up  = false;
+bool             g_session_active   = false;
+void            *g_procH            = nullptr;
+void            *g_devH             = nullptr;
+void            *g_started_devH     = nullptr;
+std::atomic<bool> g_armed{false};       // gates the passive msgrcv tap
+std::atomic<bool> g_nav_rx_seen{false}; // true once 0x8058/0x8059 received in this session
 
 extern "C" int eDevMgrRegisterProcess(void *, void *, void *, void *);
 extern "C" int eDevMgriPodStartCallStateUpdates(void *, void *, void *, void *);
@@ -81,26 +93,66 @@ void *resolve_oem(const char *name)
     return p;
 }
 
-void resolve_all_once(void)
+void resolve_all_impl(void)
 {
-    if (!g_real_register)  g_real_register  = (pfn4)resolve_oem("eDevMgrRegisterProcess");
-    if (!g_real_callstate) g_real_callstate = (pfn4)resolve_oem("eDevMgriPodStartCallStateUpdates");
-    if (!g_real_commupd)   g_real_commupd   = (pfn4)resolve_oem("eDevMgriPodStartCommunicationUpdates");
-    if (!g_real_sendloc)   g_real_sendloc   = (pfn4)resolve_oem("eDevMgriPodSendLocationInformation");
-    if (!g_real_startnavi) g_real_startnavi = (pfn4)resolve_oem("eDevMgriPodStartNaviRouteGuidenceUpdates");
+    g_real_register  = (pfn4)resolve_oem("eDevMgrRegisterProcess");
+    g_real_callstate = (pfn4)resolve_oem("eDevMgriPodStartCallStateUpdates");
+    g_real_commupd   = (pfn4)resolve_oem("eDevMgriPodStartCommunicationUpdates");
+    g_real_sendloc   = (pfn4)resolve_oem("eDevMgriPodSendLocationInformation");
+    g_real_startnavi = (pfn4)resolve_oem("eDevMgriPodStartNaviRouteGuidenceUpdates");
 }
 
+void resolve_all_once(void)
+{
+    pthread_once(&g_resolve_once, resolve_all_impl);
+}
+
+// Retry worker: only retries StartNaviRouteGuidenceUpdates(compId=0x5555) when
+// the initial call during CarPlay bring-up returned rc != 1 (e.g. iAP2 session
+// not ready yet). Once rc == 1 or nav traffic (0x8058/0x8059) is observed, it
+// goes completely idle — zero IPC semaphore contention and zero bogus iAP2
+// packets during the drive. Automatically resumes if a new devH connects.
 void *navi_retry_thread(void *)
 {
-    int n = 0;
+    void *last_devH = nullptr;
+    int   attempts  = 0;
     for (;;) {
-        sleep(5);
-        if (!g_real_startnavi || !g_procH) continue;
-        void *p3 = (n & 1) ? (void *)0x5555 : (void *)0;
-        int rc = g_real_startnavi(g_procH, g_devH, p3, (void *)0);
-        LOGD("retry#%d StartNaviRouteGuidence(procH=%p devH=%p p3=%p) rc=%d",
-             n, g_procH, g_devH, p3, rc);
-        n++;
+        sleep(attempts >= 10 ? 15 : 3);
+
+        void *procH = nullptr;
+        void *devH  = nullptr;
+        pfn4  fn    = nullptr;
+        pthread_mutex_lock(&g_mu);
+        if (g_session_active && g_procH && g_devH &&
+            g_started_devH != g_devH &&
+            !g_nav_rx_seen.load(std::memory_order_relaxed)) {
+            procH = g_procH;
+            devH  = g_devH;
+            fn    = g_real_startnavi;
+        }
+        pthread_mutex_unlock(&g_mu);
+
+        if (!fn || !procH || !devH) {
+            attempts = 0;
+            continue;
+        }
+        if (devH != last_devH) {
+            last_devH = devH;
+            attempts  = 0;
+        }
+
+        int rc = fn(procH, devH, reinterpret_cast<void *>(kNaviCompId), nullptr);
+        attempts++;
+        LOGD("retry#%d StartNaviRouteGuidence(procH=%p devH=%p compId=0x%lx) rc=%d",
+             attempts, procH, devH, static_cast<unsigned long>(kNaviCompId), rc);
+        if (rc == 1) {
+            pthread_mutex_lock(&g_mu);
+            if (g_session_active && g_devH == devH) {
+                g_started_devH = devH;
+            }
+            pthread_mutex_unlock(&g_mu);
+            attempts = 0;
+        }
     }
     return nullptr;
 }
@@ -147,12 +199,19 @@ void cp_tbt_entity_cb(void *conn, void *p_entity, void *p_aux, void *userdata)
 }
 
 // SessionDeactiveSignal handler. Multi-field payload (clientId,type,reason,...) — we don't
-// read the fields; arrival = session gone. DEBUG: LOGD only.
+// read the fields; arrival = session gone.
 void cp_deactive_cb(void *a0, void *a1, void *a2, void *a3)
 {
     (void)a0; (void)a1; (void)a2; (void)a3;
-    LOGD("carplay SessionDeactive (session ended)");
-    hud_request_fullclear();   // CarPlay session gone (e.g. phone unplugged) -> FULL wipe incl sign (like AA teardown)
+    try {
+        LOGD("carplay SessionDeactive (session ended)");
+        pthread_mutex_lock(&g_mu);
+        g_session_active = false;
+        g_started_devH   = nullptr;
+        pthread_mutex_unlock(&g_mu);
+        g_nav_rx_seen.store(false, std::memory_order_relaxed);
+        hud_request_fullclear();   // CarPlay session gone (e.g. phone unplugged) -> FULL wipe incl sign (like AA teardown)
+    } catch (...) { LOGE("cp_deactive_cb exception swallowed (OEM dbus thread)"); }
 }
 
 void *cp_resolve(const char *name)
@@ -198,77 +257,114 @@ void carplay_status_start(void)
 void arm_navi(const char *from, void *procH, void *devH)
 {
     // Only run inside the real jciCARPLAY launcher (main.cpp's constructor gate set g_enabled).
-    if (!g_enabled) { LOGW("carplay: not enabled (%s)", from); return; }
-    g_armed = 1;
+    if (!g_enabled || !procH || !devH) return;
+
+    bool need_start = false;
+    pfn4 startnavi  = nullptr;
+
     pthread_mutex_lock(&g_mu);
-    g_procH = procH;
-    g_devH  = devH;
-    if (!g_navi_armed) {
-        g_navi_armed = true;
-        LOGD("arm_navi from %s: StartNaviRouteGuidence(procH=%p devH=%p 0)", from, procH, devH);
-        // Bring up the HUD sender (D-Bus to com.jci.vbs.navi) so nav_on_devmgr_msg
-        // has somewhere to push decoded maneuvers. Idempotent.
+    if (!g_services_started) {
+        g_services_started = true;
+        // Bring up the HUD sender (D-Bus to com.jci.vbs.navi) and subscribe to
+        // OEM CarPlay TBT-status signals on the HMI bus. Idempotent.
         hud_send_start();
-        carplay_status_start();   // [NAV-END] subscribe OEM CarPlay TBT-status (debug: LOGD only)
-        if (g_real_startnavi) {
-            int rc = g_real_startnavi(procH, devH, (void *)0, (void *)0);
-            LOGD("StartNaviRouteGuidence rc=%d; spawning retry+watch", rc);
-            pthread_t th;
-            if (pthread_create(&th, nullptr, navi_retry_thread, nullptr) == 0)
-                pthread_detach(th);
-        } else { LOGE("arm_navi: StartNavi unresolved"); g_navi_armed = false; }
+        carplay_status_start();
+    }
+    if (!g_session_active || g_devH != devH) {
+        need_start = true;
+        g_started_devH = nullptr;
+        g_nav_rx_seen.store(false, std::memory_order_relaxed);
+    }
+    g_procH          = procH;
+    g_devH           = devH;
+    g_session_active = true;
+    startnavi        = g_real_startnavi;
+    if (need_start && startnavi && !g_retry_thread_up) {
+        pthread_t th;
+        if (preload_thread_create(&th, navi_retry_thread, nullptr) == 0) {
+            pthread_detach(th);
+            g_retry_thread_up = true;
+        }
     }
     pthread_mutex_unlock(&g_mu);
+
+    g_armed.store(true, std::memory_order_release);
+
+    if (need_start) {
+        if (startnavi) {
+            LOGD("arm_navi from %s: StartNaviRouteGuidence(procH=%p devH=%p compId=0x%lx)",
+                 from, procH, devH, static_cast<unsigned long>(kNaviCompId));
+            int rc = startnavi(procH, devH, reinterpret_cast<void *>(kNaviCompId), nullptr);
+            LOGD("StartNaviRouteGuidence rc=%d", rc);
+            if (rc == 1) {
+                pthread_mutex_lock(&g_mu);
+                if (g_session_active && g_devH == devH) {
+                    g_started_devH = devH;
+                }
+                pthread_mutex_unlock(&g_mu);
+            }
+        } else {
+            LOGE("arm_navi: StartNavi unresolved");
+        }
+    }
 }
 
 // ---- msgrcv tap (passive) --------------------------------------------------
-typedef long (*pfn_msgrcv)(int, void *, unsigned, long, int);
-pfn_msgrcv      g_real_msgrcv = nullptr;
+typedef ssize_t (*pfn_msgrcv)(int, void *, size_t, long, int);
+std::atomic<pfn_msgrcv> g_real_msgrcv{nullptr};
 
 // [DIAGNOSTIC] In debug builds (DEBUG / !NDEBUG), message types and raw nav
 // payloads are automatically logged to the system log (stderr / g_logf) with
 // namespaces [CP-MSG] and [CP-NAV] for easy filtering, avoiding flash wear.
-void msg_tap(int msqid, const void *msgp, long n)
+void msg_tap(int msqid, const void *msgp, ssize_t n)
 {
     (void)msqid;
 
 #ifndef NDEBUG
     // In DEBUG mode: log every received message's (type, size) + a payload peek for small messages
     if (msgp && n >= 4) {
-        uint32_t mt = (*(const uint32_t *)msgp) & 0xffff;
+        uint32_t mt_raw = 0;
+        memcpy(&mt_raw, msgp, sizeof(mt_raw));
+        uint32_t mt = mt_raw & 0xffffu;
         char peek[128] = "";
         if (mt != 0x8058 && mt != 0x8059) {          // peek the unknown / small messages
             const unsigned char *b = (const unsigned char *)msgp;
-            long dn = (n < 20) ? n : 20;
+            ssize_t dn = (n < 20) ? n : 20;
             char *p = peek;
-            for (long i = 0; i < dn; i++) {
-                p += snprintf(p, sizeof(peek) - (p - peek), " %02x", b[i]);
+            for (ssize_t i = 0; i < dn; i++) {
+                p += snprintf(p, sizeof(peek) - (size_t)(p - peek), " %02x", b[i]);
             }
         }
-        LOGD("[CP-MSG] mt=0x%04x n=0x%lx%s", (unsigned)mt, n, peek);
+        LOGD("[CP-MSG] mt=0x%04x n=0x%lx%s", (unsigned)mt, (long)n, peek);
     }
 #endif
 
-    // Only big messages: maneuver=0x348, guidance=0x640. Skips chatty small msgs.
+    // Only big messages: maneuver=0x348, guidance=0x65c. Skips chatty small msgs.
     if (n < 0x300 || !msgp) return;
 
+    uint32_t mt_raw = 0;
+    memcpy(&mt_raw, msgp, sizeof(mt_raw));
+    uint32_t mt = mt_raw & 0xffffu;
+    if (mt == 0x8059 || mt == 0x8058) {
+        g_nav_rx_seen.store(true, std::memory_order_relaxed);
+    }
+
     // Decode maneuver -> HUD (passive read of the received buffer).
-    nav_on_devmgr_msg(msgp, n);
+    nav_on_devmgr_msg(msgp, (long)n);
 
 #ifndef NDEBUG
     // In DEBUG mode: dump raw nav payload to system log
-    long mt = (*(const long *)msgp) & 0xffff;
     if (mt == 0x8059 || mt == 0x8058) {
-        LOGD("[CP-NAV] msgrcv n=0x%lx mtype=0x%lx", n, mt);
+        LOGD("[CP-NAV] msgrcv n=0x%lx mtype=0x%x", (long)n, (unsigned)mt);
         const unsigned char *b = (const unsigned char *)msgp;
         char hex[100];
-        for (long i = 0; i < n; i += 16) {
-            long chunk = (n - i < 16) ? (n - i) : 16;
+        for (ssize_t i = 0; i < n; i += 16) {
+            ssize_t chunk = (n - i < 16) ? (n - i) : 16;
             char *p = hex;
-            for (long j = 0; j < chunk; j++) {
-                p += snprintf(p, sizeof(hex) - (p - hex), " %02x", b[i + j]);
+            for (ssize_t j = 0; j < chunk; j++) {
+                p += snprintf(p, sizeof(hex) - (size_t)(p - hex), " %02x", b[i + j]);
             }
-            LOGD("[CP-NAV] +%04lx:%s", i, hex);
+            LOGD("[CP-NAV] +%04lx:%s", (long)i, hex);
         }
     }
 #endif
@@ -279,12 +375,23 @@ void msg_tap(int msqid, const void *msgp, long n)
 #define PRELOAD_EXPORT __attribute__((visibility("default")))
 
 extern "C" PRELOAD_EXPORT
-long msgrcv(int msqid, void *msgp, unsigned msgsz, long msgtyp, int msgflg)
+ssize_t msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgflg)
 {
-    if (!g_real_msgrcv) g_real_msgrcv = (pfn_msgrcv)dlsym(RTLD_NEXT, "msgrcv");
-    long n = g_real_msgrcv ? g_real_msgrcv(msqid, msgp, msgsz, msgtyp, msgflg) : -1;
-    // Only tap once nav is armed by a live CarPlay session (g_armed set in arm_navi).
-    if (g_enabled && g_armed && n > 0) msg_tap(msqid, msgp, n);
+    pfn_msgrcv fn = g_real_msgrcv.load(std::memory_order_acquire);
+    if (!fn) {
+        fn = reinterpret_cast<pfn_msgrcv>(dlsym(RTLD_NEXT, "msgrcv"));
+        if (fn) g_real_msgrcv.store(fn, std::memory_order_release);
+    }
+    ssize_t n = fn ? fn(msqid, msgp, msgsz, msgtyp, msgflg) : -1;
+    // Only tap once nav is armed by a live CarPlay session. In release builds,
+    // fast-path skip small IPC messages without entering msg_tap.
+#ifdef NDEBUG
+    if (g_enabled && n >= 0x300 && g_armed.load(std::memory_order_relaxed))
+        msg_tap(msqid, msgp, n);
+#else
+    if (g_enabled && n > 0 && g_armed.load(std::memory_order_relaxed))
+        msg_tap(msqid, msgp, n);
+#endif
     return n;
 }
 

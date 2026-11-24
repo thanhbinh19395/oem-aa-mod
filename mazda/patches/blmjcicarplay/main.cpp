@@ -144,9 +144,10 @@ static void on_load(void)
         return;
     }
     g_enabled = true;
-    // Open the bring-up log file (stderr is swallowed by syslog-ng). Append so
-    // multiple boots accumulate; line-buffered so tail -f sees lines live.
-    g_logf = std::fopen("/tmp/carplay_bridge.log", "a");
+    // Open the bring-up log file (stderr is swallowed by syslog-ng). Append with
+    // O_CLOEXEC ("ae") so multiple boots accumulate without leaking the fd into
+    // child processes (e.g. splim_seriald); line-buffered so tail -f sees lines live.
+    g_logf = std::fopen("/tmp/carplay_bridge.log", "ae");
     if (g_logf) std::setvbuf(g_logf, nullptr, _IOLBF, 0);
     install_fatal_handler();
 

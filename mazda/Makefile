@@ -24,6 +24,7 @@
 
 M3TOOLCHAIN := ./m3-toolchain
 TRIPLE      := arm-cortexa9_neon-linux-gnueabi
+CC          := $(M3TOOLCHAIN)/bin/$(TRIPLE)-gcc
 CXX         := $(M3TOOLCHAIN)/bin/$(TRIPLE)-g++
 SYSROOT     := $(M3TOOLCHAIN)/$(TRIPLE)/sysroot
 
@@ -189,8 +190,8 @@ splim_seriald: $(SPLIM_SERIAL_BIN)
 
 $(SPLIM_SERIAL_BIN): $(SPLIM_SERIAL_SRC)
 	@mkdir -p $(@D)
-	$(CXX) --sysroot=$(SYSROOT) -march=armv7-a -mtune=cortex-a9 -mfpu=neon \
-	       -O2 -Wall -Wextra -s -o $@ $<
+	$(CC) --sysroot=$(SYSROOT) -march=armv7-a -mtune=cortex-a9 -mfpu=neon \
+	      -O2 -std=gnu11 -Wall -Wextra -s -o $@ $<
 
 # --- USB installer package -------------------------------------------------
 # `make installer` (Release) and `make installer-debug` (Debug) stage a

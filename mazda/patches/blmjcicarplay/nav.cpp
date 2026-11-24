@@ -191,19 +191,81 @@ struct Maneuver {
     int32_t  number;   // roundabout exit number (1..19); else 0
 };
 
-// Match a standalone word (bounded by spaces or string boundaries)
-bool has_word(const char *text, const char *word)
+// Find a standalone word (bounded by spaces or string boundaries); returns pointer or nullptr.
+const char *find_word(const char *text, const char *word)
 {
-    if (!text || !word) return false;
+    if (!text || !word || !*word) return nullptr;
     const char *p = text;
     size_t wlen = strlen(word);
     while ((p = strstr(p, word)) != nullptr) {
         bool left_ok  = (p == text || *(p - 1) == ' ');
         bool right_ok = (p[wlen] == '\0' || p[wlen] == ' ');
-        if (left_ok && right_ok) return true;
+        if (left_ok && right_ok) return p;
         p += 1;
     }
-    return false;
+    return nullptr;
+}
+
+// Find earliest standalone occurrence of `word` starting at `start`, skipping
+// false-positive street name "nguyen trai" when searching for "trai".
+const char *find_dir_word(const char *text, const char *start, const char *word,
+                          bool skip_nguyen_trai)
+{
+    const char *p = start ? start : text;
+    while ((p = find_word(p, word)) != nullptr) {
+        if (skip_nguyen_trai && p - text >= 7 &&
+            memcmp(p - 7, "nguyen ", 7) == 0 &&
+            (p - text == 7 || *(p - 8) == ' ')) {
+            p += 1;
+            continue;
+        }
+        return p;
+    }
+    return nullptr;
+}
+
+// Pick SIDE_LEFT / SIDE_RIGHT / default_side by comparing the earliest
+// standalone direction word ("trai"/"left" vs "phai"/"right"). Comparing
+// position avoids road names like "Nguyễn Trãi" flipping a right turn to left.
+uint32_t detect_side(const char *text, const char *anchor, uint32_t default_side)
+{
+    const char *l1 = find_dir_word(text, anchor, "trai", true);
+    const char *l2 = find_dir_word(text, anchor, "left", false);
+    const char *r1 = find_dir_word(text, anchor, "phai", false);
+    const char *r2 = find_dir_word(text, anchor, "right", false);
+
+    const char *l = (l1 && l2) ? (l1 < l2 ? l1 : l2) : (l1 ? l1 : l2);
+    const char *r = (r1 && r2) ? (r1 < r2 ? r1 : r2) : (r1 ? r1 : r2);
+
+    if (l && r) return (l < r) ? SIDE_LEFT : SIDE_RIGHT;
+    if (l)      return SIDE_LEFT;
+    if (r)      return SIDE_RIGHT;
+    return default_side;
+}
+
+// Extract roundabout exit number 1..9 without snprintf overhead.
+int parse_roundabout_exit(const char *text)
+{
+    const char *p;
+    if ((p = strstr(text, "loi ra thu ")) != nullptr) {
+        char d = p[11];
+        if (d >= '1' && d <= '9') return d - '0';
+    }
+    if ((p = strstr(text, "loi ra ")) != nullptr) {
+        char d = p[7];
+        if (d >= '1' && d <= '9') return d - '0';
+    }
+    if ((p = strstr(text, " exit")) != nullptr && p > text) {
+        char d = *(p - 1);
+        if (d >= '1' && d <= '9') return d - '0';
+    }
+    if (strstr(text, "thu nhat") || strstr(text, "1st")) return 1;
+    if (strstr(text, "thu hai") || strstr(text, "thu nhi") || strstr(text, "2nd")) return 2;
+    if (strstr(text, "thu ba") || strstr(text, "3rd")) return 3;
+    if (strstr(text, "thu tu") || strstr(text, "4th")) return 4;
+    if (strstr(text, "thu nam") || strstr(text, "5th")) return 5;
+    if (strstr(text, "thu sau") || strstr(text, "6th")) return 6;
+    return 0;
 }
 
 // [VIETMAP/3RD-PARTY] Classify maneuvers from instruction text when mtype == 0
@@ -231,22 +293,7 @@ bool classify_from_text(const char *raw_text, uint32_t driveSide, Maneuver &m)
         strstr(text, "bung binh") || strstr(text, "roundabout")) {
         m.event = EV_ROUNDABOUT;
         m.side = (driveSide == 1) ? SIDE_LEFT : SIDE_RIGHT;
-        for (int i = 1; i <= 9; ++i) {
-            char p1[32], p2[32], p3[32];
-            snprintf(p1, sizeof(p1), "loi ra thu %d", i);
-            snprintf(p2, sizeof(p2), "loi ra %d", i);
-            snprintf(p3, sizeof(p3), "%d exit", i);
-            if (strstr(text, p1) || strstr(text, p2) || strstr(text, p3)) {
-                m.number = i;
-                break;
-            }
-        }
-        if (m.number == 0) {
-            if (strstr(text, "thu nhat") || strstr(text, "1st")) m.number = 1;
-            else if (strstr(text, "thu hai") || strstr(text, "thu nhi") || strstr(text, "2nd")) m.number = 2;
-            else if (strstr(text, "thu ba") || strstr(text, "3rd")) m.number = 3;
-            else if (strstr(text, "thu tu") || strstr(text, "4th")) m.number = 4;
-        }
+        m.number = parse_roundabout_exit(text);
         // Map exit number to bearing angle for roundabout_icon():
         // In RHT (Vietnam): exit 1 = right (+90°), exit 2 = straight ahead (0°),
         // exit 3 = left (270°), exit 4 = u-turn (180°). In LHT: mirror left/right.
@@ -267,37 +314,39 @@ bool classify_from_text(const char *raw_text, uint32_t driveSide, Maneuver &m)
     }
 
     // 3. Sharp turn
-    if (strstr(text, "re gat") || strstr(text, "re ngoat") || strstr(text, "sharp")) {
+    const char *hit = nullptr;
+    if ((hit = strstr(text, "re gat")) || (hit = strstr(text, "re ngoat")) ||
+        (hit = strstr(text, "sharp"))) {
         m.event = EV_SHARP;
-        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT : SIDE_RIGHT;
+        m.side = detect_side(text, hit, SIDE_RIGHT);
         return true;
     }
 
     // 4. Slight turn / Bear / Merge
-    if (strstr(text, "chech") || strstr(text, "hoi re") || strstr(text, "slight") ||
-        strstr(text, "bear") || strstr(text, "nhap lan") || strstr(text, "nhap vao") ||
-        strstr(text, "re nhanh") || strstr(text, "nhanh re") || strstr(text, "duong nhanh") ||
-        strstr(text, "loi ra")) {
+    if ((hit = strstr(text, "chech")) || (hit = strstr(text, "hoi re")) ||
+        (hit = strstr(text, "slight")) || (hit = strstr(text, "bear")) ||
+        (hit = strstr(text, "nhap lan")) || (hit = strstr(text, "nhap vao")) ||
+        (hit = strstr(text, "re nhanh")) || (hit = strstr(text, "nhanh re")) ||
+        (hit = strstr(text, "duong nhanh")) || (hit = strstr(text, "loi ra"))) {
         m.event = EV_SLIGHT;
-        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT :
-                 (strstr(text, "phai") || strstr(text, "right")) ? SIDE_RIGHT : SIDE_NONE;
+        m.side = detect_side(text, hit, SIDE_NONE);
         return true;
     }
 
-    // 5. Normal turn (use has_word to avoid false positives like "tren" matching "re")
-    if (has_word(text, "re") || has_word(text, "queo") || has_word(text, "turn") ||
-        strstr(text, "sang trai") || strstr(text, "sang phai")) {
+    // 5. Normal turn (use find_word to avoid false positives like "tren" matching "re")
+    if ((hit = find_word(text, "re")) || (hit = find_word(text, "queo")) ||
+        (hit = find_word(text, "turn")) || (hit = strstr(text, "sang trai")) ||
+        (hit = strstr(text, "sang phai"))) {
         m.event = EV_TURN;
-        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT :
-                 (strstr(text, "phai") || strstr(text, "right")) ? SIDE_RIGHT : SIDE_NONE;
+        m.side = detect_side(text, hit, SIDE_NONE);
         return true;
     }
 
     // 6. Fork / Keep
-    if (strstr(text, "giu ben") || strstr(text, "giu lan") || strstr(text, "keep") || strstr(text, "fork")) {
+    if ((hit = strstr(text, "giu ben")) || (hit = strstr(text, "giu lan")) ||
+        (hit = strstr(text, "keep")) || (hit = strstr(text, "fork"))) {
         m.event = EV_FORK;
-        m.side = (strstr(text, "trai") || strstr(text, "left")) ? SIDE_LEFT :
-                 (strstr(text, "phai") || strstr(text, "right")) ? SIDE_RIGHT : SIDE_NONE;
+        m.side = detect_side(text, hit, SIDE_NONE);
         return true;
     }
 
@@ -408,17 +457,23 @@ const char *read_str(const uint8_t *b, long n, int off, char *out, int outsz)
 uint32_t read_u32(const uint8_t *b, long n, int off)
 {
     if (off < 0 || (long)(off + 4) > n) return 0;
-    return *reinterpret_cast<const uint32_t *>(b + off);
+    uint32_t v = 0;
+    memcpy(&v, b + off, sizeof(v));
+    return v;
 }
 int32_t read_s16(const uint8_t *b, long n, int off)
 {
     if (off < 0 || (long)(off + 2) > n) return 0;
-    return *reinterpret_cast<const int16_t *>(b + off);
+    int16_t v = 0;
+    memcpy(&v, b + off, sizeof(v));
+    return v;
 }
 uint32_t read_u16(const uint8_t *b, long n, int off)
 {
     if (off < 0 || (long)(off + 2) > n) return 0;
-    return *reinterpret_cast<const uint16_t *>(b + off);
+    uint16_t v = 0;
+    memcpy(&v, b + off, sizeof(v));
+    return v;
 }
 
 // [BUILD-19] Map the guidance maneuverList head (a FULL burst index) to a buffered entry. g_buf is
@@ -466,9 +521,11 @@ void emit_selection(int sel)
         g_emit_road[sizeof(g_emit_road) - 1] = '\0';
         LOGD("nav HUD: event=%u side=%u angle=%d number=%d road=\"%s\"",
              g_disp_event, g_disp_side, g_disp_angle, g_disp_number, g_disp_road);
-        hud_on_status(1);
+        // Push the new turn BEFORE status=1 so the sender thread never wakes
+        // with g_have_guidance=true while g_snapshot still holds a stale turn.
         hud_on_next_turn(g_disp_road[0] ? g_disp_road : " ",
                          g_disp_side, g_disp_event, g_disp_angle, g_disp_number);
+        hud_on_status(1);
     }
 }
 } // namespace
@@ -491,7 +548,7 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
     // Today's decode is non-throwing C-style code, so this is zero-behaviour future-proofing.
     try {
     const uint8_t *b = static_cast<const uint8_t *>(msgp);
-    uint32_t mt = (*reinterpret_cast<const uint32_t *>(b)) & 0xffff;
+    uint32_t mt = read_u32(b, n, 0) & 0xffffu;
 
     // [2026-06-13 #3] HUD was cleared (nav-off/unplug) -> reset selection + emit-dedup on THIS thread
     // so a re-started route always re-emits (even the same route, stationary). One-shot.
@@ -504,8 +561,7 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
     }
 
     if (mt == kMtManeuver) {
-        uint32_t idx = (n >= kBurstIdxOff + 4)
-                     ? (*reinterpret_cast<const uint32_t *>(b + kBurstIdxOff) >> 16) : 0;
+        uint32_t idx = read_u32(b, n, kBurstIdxOff) >> 16;
 
         // New burst? (index restarts at 0 or drops). Flush the now-complete previous burst
         // if a guidance message didn't already (back-to-back bursts), then start fresh.
@@ -610,8 +666,9 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
         }
         // Distance readout (independent of selection).
         if (n >= kGuidanceDistOff + 4) {
-            int32_t dist = (int32_t)(*reinterpret_cast<const uint32_t *>(b + kGuidanceDistOff));
-            if (dist >= 0 && dist <= 100000) {
+            uint32_t raw_dist = read_u32(b, n, kGuidanceDistOff);
+            if (raw_dist <= 999000u) {
+                int32_t  dist = static_cast<int32_t>(raw_dist);
                 int32_t  disp; uint32_t unit;
                 if (dist < 1000) { unit = 1; disp = dist * 1000; }  // meters
                 else             { unit = 3; disp = dist;        }  // km

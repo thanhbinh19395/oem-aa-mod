@@ -539,7 +539,8 @@ else
     killall -q splim_seriald 2>/dev/null
     rm -f "${MOD_DIR}/splim_seriald" && echo "Removed splim_seriald"
     rm -f /data_persist/splim_seriald_start.sh && echo "Removed splim_seriald_start.sh"
-    rm -f /data_persist/splim_seriald.lock
+    rm -f /data_persist/splim_seriald.lock /data_persist/splim /data_persist/splim.tmp \
+          /tmp/splim_seriald.lock /tmp/splim /tmp/splim.tmp
   fi
 
   # Shared Audio Off fallback stays while any AA/CarPlay shim remains.

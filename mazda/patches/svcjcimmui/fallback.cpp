@@ -91,8 +91,6 @@ IsAvailableFn           g_is_available              = nullptr;
 IsBroadcastFn           g_is_broadcast              = nullptr;
 InjectToNameFn          g_inject_to_name            = nullptr;
 
-bool                    g_installed                 = false;
-
 bool set_prot(uintptr_t addr, size_t len, int prot)
 {
     const uintptr_t ps   = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
@@ -187,49 +185,13 @@ int hook_ActivateLastBroadcast()
     return select_audio_off();
 }
 
-bool install_trampoline(uintptr_t target_off, uint32_t p0, uint32_t p1,
-                        void *hook_fn, void **out_orig_fn)
-{
-    uint32_t *target = reinterpret_cast<uint32_t *>(at(target_off));
-    if (target[0] != p0 || target[1] != p1) {
-        LOGE("fallback: ABORT hook @0x%08lx prologue %08x %08x (expected %08x %08x); wrong FW?",
-             static_cast<unsigned long>(target_off), target[0], target[1], p0, p1);
-        return false;
-    }
-
-    void *rx = mmap(nullptr, 16, PROT_READ | PROT_WRITE | PROT_EXEC,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (rx == MAP_FAILED) {
-        LOGE("fallback: mmap trampoline failed: %s", strerror(errno));
-        return false;
-    }
-    uint32_t *tramp = reinterpret_cast<uint32_t *>(rx);
-    tramp[0] = target[0];
-    tramp[1] = target[1];
-    tramp[2] = kLdrPcM4;
-    tramp[3] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(target) + 8);
-    __builtin___clear_cache(reinterpret_cast<char *>(tramp),
-                            reinterpret_cast<char *>(tramp + 4));
-    *out_orig_fn = reinterpret_cast<void *>(tramp);
-
-    if (!set_prot(reinterpret_cast<uintptr_t>(target), 8, PROT_READ | PROT_WRITE)) {
-        LOGE("fallback: mprotect RW failed @%p", target);
-        return false;
-    }
-    // Write target address first, barrier, then jump opcode (thread safety).
-    target[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hook_fn));
-    __sync_synchronize();
-    target[0] = kLdrPcM4;
-    __builtin___clear_cache(reinterpret_cast<char *>(target),
-                            reinterpret_cast<char *>(target + 2));
-    if (!set_prot(reinterpret_cast<uintptr_t>(target), 8, PROT_READ | PROT_EXEC)) {
-        LOGW("fallback: mprotect RX restore failed (hook is live @%p)", target);
-    }
-
-    LOGD("fallback: hooked @%p -> %p (trampoline %p)",
-         target, hook_fn, tramp);
-    return true;
-}
+struct HookSpec {
+    uintptr_t  target_off;
+    uint32_t   p0;
+    uint32_t   p1;
+    void      *hook_fn;
+    void     **out_orig_fn;
+};
 
 bool install_hook(void *h)
 {
@@ -255,28 +217,79 @@ bool install_hook(void *h)
         return false;
     }
 
-    // 1. Hook activatePrevious (disconnect fallback).
-    if (!install_trampoline(kOffActivatePrevious, kPrologue0_ap, kPrologue1_ap,
-                            reinterpret_cast<void *>(&hook_activatePrevious),
-                            reinterpret_cast<void **>(&g_real_activate))) {
+    const HookSpec hooks[3] = {
+        { kOffActivatePrevious,        kPrologue0_ap,  kPrologue1_ap,
+          reinterpret_cast<void *>(&hook_activatePrevious),
+          reinterpret_cast<void **>(&g_real_activate) },
+        { kOffGetFirstAvailableSource, kPrologue0_fas, kPrologue1_fas,
+          reinterpret_cast<void *>(&hook_getFirstAvailableSource),
+          reinterpret_cast<void **>(&g_real_first_available) },
+        { kOffActivateLastBroadcast,   kPrologue0_alb, kPrologue1_alb,
+          reinterpret_cast<void *>(&hook_ActivateLastBroadcast),
+          reinterpret_cast<void **>(&g_real_activate_last_bcast) },
+    };
+
+    // Validate ALL prologues up front so a firmware mismatch never leaves a
+    // partially-hooked library.
+    for (int i = 0; i < 3; ++i) {
+        uint32_t *target = reinterpret_cast<uint32_t *>(at(hooks[i].target_off));
+        if (target[0] != hooks[i].p0 || target[1] != hooks[i].p1) {
+            LOGE("fallback: ABORT hook @0x%08lx prologue %08x %08x (expected %08x %08x); wrong FW?",
+                 static_cast<unsigned long>(hooks[i].target_off),
+                 target[0], target[1], hooks[i].p0, hooks[i].p1);
+            return false;
+        }
+    }
+
+    // Pack all 3 trampolines (3 * 16 bytes = 48 bytes) into one page, then drop
+    // PROT_WRITE so trampoline memory is never left writable.
+    const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *rx = mmap(nullptr, ps, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (rx == MAP_FAILED) {
+        LOGE("fallback: mmap trampoline page failed: %s", strerror(errno));
         return false;
     }
 
-    // 2. Hook getFirstAvailableSource (bootup / ACC ON fallback).
-    if (!install_trampoline(kOffGetFirstAvailableSource, kPrologue0_fas, kPrologue1_fas,
-                            reinterpret_cast<void *>(&hook_getFirstAvailableSource),
-                            reinterpret_cast<void **>(&g_real_first_available))) {
+    for (int i = 0; i < 3; ++i) {
+        uint32_t *target = reinterpret_cast<uint32_t *>(at(hooks[i].target_off));
+        uint32_t *tramp  = reinterpret_cast<uint32_t *>(rx) + (i * 4);
+        tramp[0] = target[0];
+        tramp[1] = target[1];
+        tramp[2] = kLdrPcM4;
+        tramp[3] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(target) + 8);
+        *hooks[i].out_orig_fn = reinterpret_cast<void *>(tramp);
+    }
+
+    __builtin___clear_cache(reinterpret_cast<char *>(rx),
+                            reinterpret_cast<char *>(rx) + 48);
+    if (mprotect(rx, ps, PROT_READ | PROT_EXEC) != 0) {
+        LOGE("fallback: mprotect RX on trampoline page failed: %s", strerror(errno));
+        munmap(rx, ps);
         return false;
     }
 
-    // 3. Hook ActivateLastBroadcast (reconnect-timer expiry fallback).
-    if (!install_trampoline(kOffActivateLastBroadcast, kPrologue0_alb, kPrologue1_alb,
-                            reinterpret_cast<void *>(&hook_ActivateLastBroadcast),
-                            reinterpret_cast<void **>(&g_real_activate_last_bcast))) {
-        return false;
+    // Patch targets while KEEPING PROT_EXEC on the live code page so other
+    // jciMMUI threads executing functions on the same 4 KB page never fault.
+    for (int i = 0; i < 3; ++i) {
+        uint32_t *target = reinterpret_cast<uint32_t *>(at(hooks[i].target_off));
+        if (!set_prot(reinterpret_cast<uintptr_t>(target), 8,
+                      PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            LOGE("fallback: mprotect RWX failed @%p", target);
+            return false;
+        }
+        target[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hooks[i].hook_fn));
+        __sync_synchronize();
+        target[0] = kLdrPcM4;
+        __builtin___clear_cache(reinterpret_cast<char *>(target),
+                                reinterpret_cast<char *>(target + 2));
+        if (!set_prot(reinterpret_cast<uintptr_t>(target), 8, PROT_READ | PROT_EXEC)) {
+            LOGW("fallback: mprotect RX restore failed (hook is live @%p)", target);
+        }
+        LOGD("fallback: hooked @%p -> %p (trampoline %p)",
+             target, hooks[i].hook_fn, *hooks[i].out_orig_fn);
     }
 
-    g_installed = true;
     LOGD("fallback: all 3 Audio Off hooks successfully installed (FW 74.00.324A)");
     return true;
 }
@@ -290,6 +303,7 @@ void *waiter_main(void *)
             if (!install_hook(h)) {
                 LOGE("fallback: install_hook failed (unsupported FW?) — aborting");
             }
+            dlclose(h);
             return nullptr;
         }
         usleep(100 * 1000);

@@ -192,10 +192,11 @@ elif [ -d "$REPO_ROOT" ]; then
   find "$REPO_ROOT" -name "libpatch-*.so" -exec cp -f {} "$TARGET_MOUNT/" \; 2>/dev/null || true
 fi
 
-if ls "$SCRIPT_DIR"/splim_* >/dev/null 2>&1; then
-  cp -f "$SCRIPT_DIR"/splim_* "$TARGET_MOUNT/" 2>/dev/null || true
+if [ -f "$SCRIPT_DIR/splim_seriald" ] || [ -f "$SCRIPT_DIR/splim_seriald_start.sh" ]; then
+  cp -f "$SCRIPT_DIR/splim_seriald" "$SCRIPT_DIR/splim_seriald_start.sh" "$TARGET_MOUNT/" 2>/dev/null || true
 elif [ -d "$REPO_ROOT" ]; then
-  find "$REPO_ROOT" -name "splim_*" -maxdepth 5 -type f -exec cp -f {} "$TARGET_MOUNT/" \; 2>/dev/null || true
+  find "$REPO_ROOT" -maxdepth 5 -type f \( -name "splim_seriald" -o -name "splim_seriald_start.sh" \) \
+       -exec cp -f {} "$TARGET_MOUNT/" \; 2>/dev/null || true
 fi
 
 # -----------------------------------------------------------------------------

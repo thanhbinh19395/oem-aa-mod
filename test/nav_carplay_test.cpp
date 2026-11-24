@@ -240,6 +240,44 @@ int main()
         CHECK_EQ_U(g_last_turn_side, 2, "side is SIDE_RIGHT");
     }
 
+    printf("\n=== Test 13: VietMap Turn Right onto 'Đường Nguyễn Trãi' (no left false positive) ===\n");
+    {
+        nav_request_reset();
+        auto m0 = make_maneuver(0, 0, "Rẽ phải vào đường Nguyễn Trãi", "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 4, "event is EV_TURN");
+        CHECK_EQ_U(g_last_turn_side, 2, "side is SIDE_RIGHT (not flipped by 'Nguyễn Trãi')");
+    }
+
+    printf("\n=== Test 14: VietMap Sharp/Slight/Fork Right onto 'Nguyễn Trãi' ===\n");
+    {
+        nav_request_reset();
+        auto m0 = make_maneuver(0, 0, "Rẽ gắt phải vào Nguyễn Trãi", "");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        CHECK_EQ_U(g_last_turn_event, 5, "event is EV_SHARP");
+        CHECK_EQ_U(g_last_turn_side, 2, "sharp turn side is SIDE_RIGHT");
+
+        nav_request_reset();
+        auto m1 = make_maneuver(0, 0, "Chếch phải vào đường Nguyễn Trãi", "");
+        nav_on_devmgr_msg(m1.data(), m1.size());
+        CHECK_EQ_U(g_last_turn_event, 3, "event is EV_SLIGHT");
+        CHECK_EQ_U(g_last_turn_side, 2, "slight turn side is SIDE_RIGHT");
+
+        nav_request_reset();
+        auto m2 = make_maneuver(0, 0, "Giữ bên phải hướng Nguyễn Trãi", "");
+        nav_on_devmgr_msg(m2.data(), m2.size());
+        CHECK_EQ_U(g_last_turn_event, 9, "event is EV_FORK");
+        CHECK_EQ_U(g_last_turn_side, 2, "fork side is SIDE_RIGHT");
+    }
+
+    printf("\n=== Test 15: Long expressway distance (>100 km) ===\n");
+    {
+        auto g = make_guidance(150000, 0, 0);
+        nav_on_devmgr_msg(g.data(), g.size());
+        CHECK_EQ_U(g_last_dist_m, 150000, "150 km expressway distance accepted");
+        CHECK_EQ_U(g_last_dist_unit, 3, "unit is KM (3)");
+    }
+
     if (g_fail) {
         printf("\nTEST SUITE FAILED\n");
         return 1;

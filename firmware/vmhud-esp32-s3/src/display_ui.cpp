@@ -119,7 +119,8 @@ void displayUpdate(const DisplayState &st, bool force) {
   g_tft.setTextPadding(140);
   if (st.camDist > 0 && st.camDist < 60000) {
     g_tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    String cStr = "Dist: " + String(st.camDist) + "m";
+    char cStr[24];
+    snprintf(cStr, sizeof(cStr), "Dist: %um", (unsigned)st.camDist);
     g_tft.drawString(cStr, 160, 48, 4);
   } else {
     g_tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -128,17 +129,22 @@ void displayUpdate(const DisplayState &st, bool force) {
 
   g_tft.setTextColor(TFT_WHITE, TFT_BLACK);
   g_tft.setTextPadding(150);
-  String spdStr = "GPS: " + String(st.currentSpeed) + " km/h";
+  char spdStr[24];
+  snprintf(spdStr, sizeof(spdStr), "GPS: %u km/h", (unsigned)st.currentSpeed);
   g_tft.drawString(spdStr, 160, 74, 2);
 
   // --- Road Name (Y: 96..114) ---
   g_tft.setTextColor(TFT_CYAN, TFT_BLACK);
   g_tft.setTextPadding(310);
-  String roadLine = "Duong: ";
+  char roadLine[48];
   if (st.currentRoad.length() > 0) {
-    roadLine += (st.currentRoad.length() > 24 ? st.currentRoad.substring(0, 24) + "..." : st.currentRoad);
+    if (st.currentRoad.length() > 24) {
+      snprintf(roadLine, sizeof(roadLine), "Duong: %.24s...", st.currentRoad.c_str());
+    } else {
+      snprintf(roadLine, sizeof(roadLine), "Duong: %s", st.currentRoad.c_str());
+    }
   } else {
-    roadLine += "--";
+    snprintf(roadLine, sizeof(roadLine), "Duong: --");
   }
   g_tft.drawString(roadLine, 4, 98, 2);
 
@@ -223,7 +229,9 @@ void displayUpdate(const DisplayState &st, bool /*force*/) {
   g_u8g2.drawStr(0, 36, spdBuf);
 
   if (st.currentRoad.length() > 0) {
-    g_u8g2.drawStr(0, 47, st.currentRoad.substring(0, 20).c_str());
+    char roadBuf[24];
+    snprintf(roadBuf, sizeof(roadBuf), "%.20s", st.currentRoad.c_str());
+    g_u8g2.drawStr(0, 47, roadBuf);
   } else {
     g_u8g2.drawStr(0, 47, "Road: --");
   }
