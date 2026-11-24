@@ -29,7 +29,7 @@ For full details on how the USB installer works under the hood, see the [USB Ins
 3. Plug the prepared USB into **USB Port 1** (the smartphone port).
 4. **On-screen dialog:**
    - Within 15–20 seconds, a native popup dialog will appear on screen asking:
-     - **Main Action:** Choose **[Install Mod]** to manage the HUD mod, or **[Enable SSH]** to start the SSH daemon for wireless root access.
+     - **Main Action:** Choose **[Install Mod]** to manage the HUD mod, or **[Enable SSH]** to start the temporary SSH daemon for wireless root access (opens iptables, supports both Car AP `192.168.53.1` with SSID `CMU-*` and shared Wi-Fi hotspots on Port 22/36000 with credentials `root:mazda` / `cmu:jci`).
      - **If Install Mod:**
        - Select integrations: *"Which integrations would you like to manage?"* $\rightarrow$ Choose **Both** (or Android Auto / CarPlay individually).
        - Select action: *"What would you like to do?"* $\rightarrow$ Select **Install** (or **Uninstall** to cleanly revert to stock).

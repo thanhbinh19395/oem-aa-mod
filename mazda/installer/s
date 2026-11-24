@@ -1,8 +1,49 @@
 #!/bin/sh
-# Start SSH daemon for the current session only (no persistence on reboot)
-/usr/sbin/sshd 2>/dev/null
+# Start SSH daemon and network for current session only (no persistence on reboot)
+
+# 1. Disable firewall to allow incoming traffic on wlan0, eth0, eth1
+[ -f /jci/scripts/jci-fw.sh ] && /jci/scripts/jci-fw.sh stop 2>/dev/null
+iptables -F 2>/dev/null
+iptables -X 2>/dev/null
+iptables -P INPUT ACCEPT 2>/dev/null
+iptables -P OUTPUT ACCEPT 2>/dev/null
+iptables -P FORWARD ACCEPT 2>/dev/null
+
+# 2. Check current network and start Car AP if not connected to external Wi-Fi
+CUR_IP=$(ifconfig wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}' | sed -e 's/addr://')
+if [ -z "$CUR_IP" ] || [ "$CUR_IP" = "192.168.53.1" ]; then
+  killall -q wpa_supplicant 2>/dev/null
+  rm -f /var/run/wpa_supplicant/wlan0 2>/dev/null
+  killall -q hostapd udhcpd 2>/dev/null
+  ifconfig wlan0 up 2>/dev/null
+  sleep 1
+
+  if [ -f /jci/scripts/jci-wifiap.sh ]; then
+    /jci/scripts/jci-wifiap.sh start
+  elif [ -f /jci/bin/jci-wifiap.sh ]; then
+    /jci/bin/jci-wifiap.sh start
+  fi
+  sleep 2
+
+  CMU_MAC=$(ifconfig wlan0 2>/dev/null | grep -i 'HWaddr' | awk '{print $5}')
+  SSID_NAME="CMU-${CMU_MAC:-*}"
+  NET_INFO="Wi-Fi SSID: ${SSID_NAME} (No pass)\nIP: 192.168.53.1"
+else
+  NET_INFO="Wi-Fi IP: ${CUR_IP}\n(Connected to shared hotspot)"
+fi
+
+# 3. Setup credentials & restart sshd with password authentication
 echo "root:mazda" | chpasswd 2>/dev/null
 echo "cmu:jci" | chpasswd 2>/dev/null
+killall -9 sshd 2>/dev/null
+sleep 0.5
+/usr/sbin/sshd -p 22 -p 36000 -o PasswordAuthentication=yes -o PermitRootLogin=yes 2>/dev/null
 
-/jci/tools/jci-dialog --info --title="SSH Enabled" --text="SSH started for current session!\nConnect to CMU AP: 192.168.53.1\nuser: root / pass: mazda\n(Turns off on reboot)" --no-cancel &
-sleep 10; killall -q jci-dialog
+# 4. Display notification
+killall -q jci-dialog 2>/dev/null
+/jci/tools/jci-dialog --info \
+  --title="SSH Enabled" \
+  --text="SSH active! (Port 22/36000)\n${NET_INFO}\nuser: root / pass: mazda\nuser: cmu  / pass: jci" \
+  --no-cancel &
+sleep 20
+killall -q jci-dialog 2>/dev/null

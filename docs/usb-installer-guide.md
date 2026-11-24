@@ -138,7 +138,9 @@ Nếu muốn tự làm từng bước bằng tay:
 3. **Tiến hành cài đặt:**
    - **Trường hợp 1 (Tự động - qua CVE-2024-8359):** Sau khoảng 10-20 giây, màn hình xe sẽ tự động bật hộp thoại chẩn đoán `jci-dialog`:
      - **Menu chính:** *"What would you like to do?"*
-       - Chọn **[Enable SSH]**: Khởi chạy dịch vụ SSH tạm thời cho phiên làm việc hiện tại (tắt/bật lại xe là SSH tự ngắt, đảm bảo an toàn và chuẩn zin hệ thống), hiện thông tin IP (`192.168.53.1`) & mật khẩu (`root:mazda`). Không cần reboot xe.
+       - Chọn **[Enable SSH]**: Khởi chạy dịch vụ SSH tạm thời cho phiên làm việc hiện tại (tự động tắt khi tắt máy xe, an toàn chuẩn zin). Hệ thống sẽ tự động tắt tường lửa `iptables`, hỗ trợ cả Port 22 lẫn Port 36000 (`root:mazda` / `cmu:jci`):
+         - *Nếu xe chưa nối Wi-Fi:* Xe tự động phát Wi-Fi AP riêng tên `CMU-<MAC>` (không mật khẩu) tại IP `192.168.53.1`. Laptop chỉ cần kết nối vào Wi-Fi `CMU-*` này rồi gõ `ssh root@192.168.53.1`.
+         - *Nếu xe đang nối mạng hotspot chung:* Màn hình sẽ cho bạn lựa chọn giữ Wi-Fi hiện tại (hiện IP thực tế của xe do hotspot cấp để bạn SSH vào) hoặc chuyển sang phát Car AP (`192.168.53.1`).
        - Chọn **[Install Mod]**: Đi vào quy trình cài đặt mod HUD.
      - **Nếu chọn Install Mod:**
        - Chọn gói: *"Which integrations would you like to manage?"* -> Chọn **Both** (hoặc chọn riêng Android Auto / CarPlay).

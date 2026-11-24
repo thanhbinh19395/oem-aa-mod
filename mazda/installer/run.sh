@@ -247,9 +247,72 @@ if [ "$MODE" = "ssh" ]; then
   exec > "${MYDIR}/logs/enable_ssh.log" 2>&1
   echo "=== oem-aa-mod Enable SSH start (session only) ==="
 
-  /usr/sbin/sshd 2>/dev/null
+  # 1. Stop firewall and flush iptables to allow inbound traffic on wlan0, eth0, eth1
+  if [ -f /jci/scripts/jci-fw.sh ]; then
+    /jci/scripts/jci-fw.sh stop 2>/dev/null
+  fi
+  iptables -F 2>/dev/null
+  iptables -X 2>/dev/null
+  iptables -P INPUT ACCEPT 2>/dev/null
+  iptables -P OUTPUT ACCEPT 2>/dev/null
+  iptables -P FORWARD ACCEPT 2>/dev/null
+
+  # 2. Check current Wi-Fi connection
+  CUR_WLAN_IP=$(ifconfig wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}' | sed -e 's/addr://')
+  USE_AP=1
+  TARGET_IP="192.168.53.1"
+
+  if [ -n "$CUR_WLAN_IP" ] && [ "$CUR_WLAN_IP" != "192.168.53.1" ]; then
+    # Car is already connected to an external Wi-Fi / mobile hotspot
+    killall -q jci-dialog 2>/dev/null
+    /jci/tools/jci-dialog --question \
+      --title="SSH - Network Mode" \
+      --text="Car is on Wi-Fi (${CUR_WLAN_IP}).\nSelect network mode for SSH:" \
+      --ok-label="Keep Wi-Fi" \
+      --cancel-label="Car AP (53.1)"
+    NET_CHOICE=$?
+    if [ "$NET_CHOICE" -eq 0 ]; then
+      USE_AP=0
+      TARGET_IP="$CUR_WLAN_IP"
+    fi
+  fi
+
+  if [ "$USE_AP" -eq 1 ]; then
+    # Clean up client Wi-Fi sessions and start native Mazda Wi-Fi AP
+    killall -q wpa_supplicant 2>/dev/null
+    rm -f /var/run/wpa_supplicant/wlan0 2>/dev/null
+    killall -q hostapd udhcpd 2>/dev/null
+    ifconfig wlan0 up 2>/dev/null
+    sleep 1
+
+    if [ -f /jci/scripts/jci-wifiap.sh ]; then
+      /jci/scripts/jci-wifiap.sh start
+    elif [ -f /jci/bin/jci-wifiap.sh ]; then
+      /jci/bin/jci-wifiap.sh start
+    fi
+    sleep 2
+
+    CMU_MAC=$(ifconfig wlan0 2>/dev/null | grep -i 'HWaddr' | awk '{print $5}')
+    if [ -n "$CMU_MAC" ]; then
+      SSID_TEXT="Connect laptop to Wi-Fi:\n• SSID: CMU-${CMU_MAC} (No pass)\n• IP: 192.168.53.1"
+    else
+      SSID_TEXT="Connect laptop to Wi-Fi:\n• SSID: CMU-* (No pass)\n• IP: 192.168.53.1"
+    fi
+  else
+    SSID_TEXT="Connect laptop to same Wi-Fi!\n• Car IP: ${TARGET_IP}"
+  fi
+
+  # 3. Set credentials
   echo "root:mazda" | chpasswd 2>/dev/null
   echo "cmu:jci" | chpasswd 2>/dev/null
+
+  # 4. Restart sshd listening on both port 22 and port 36000 with password authentication
+  killall -9 sshd 2>/dev/null
+  sleep 0.5
+  /usr/sbin/sshd -p 22 -p 36000 \
+    -o PasswordAuthentication=yes \
+    -o PermitRootLogin=yes \
+    -o PermitEmptyPasswords=yes 2>/dev/null
 
   sync
   echo "=== oem-aa-mod Enable SSH complete ==="
@@ -257,9 +320,9 @@ if [ "$MODE" = "ssh" ]; then
   killall -q jci-dialog 2>/dev/null
   /jci/tools/jci-dialog --info \
     --title="SSH Enabled" \
-    --text="SSH service is active for this session only!\nConnect laptop to car Wi-Fi hotspot:\n• IP: 192.168.53.1 (Port 22/36000)\n• user: root / pass: mazda\n• user: cmu  / pass: jci\n(SSH turns off automatically on car restart)" \
+    --text="SSH is active for this session only!\n${SSID_TEXT}\n• Port: 22 (or 36000)\n• user: root / pass: mazda\n• user: cmu  / pass: jci\n(SSH turns off on car restart)" \
     --no-cancel &
-  sleep 15
+  sleep 20
   killall -q jci-dialog 2>/dev/null
   exit 0
 fi
