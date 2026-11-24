@@ -10,24 +10,18 @@
 //    (0x0003a358). If CarPlay / Bluetooth is not connected yet, stock logic
 //    skips unready sources and falls back directly to findByName("fmradio"),
 //    blasting harsh FM static at the start of every drive.
-//    By hooking getFirstAvailableSource() to return nullptr when the candidate
-//    is a broadcast source, ActivateActiveOrLastAudio drops into its built-in
-//    empty-source branch and injects event 1454 (SelectEntertainmentNoAudio)
-//    — entering clean Audio Off. CarPlay media focus can then reclaim audio
-//    seamlessly when the phone connects.
+//    We hook getFirstAvailableSource(): if the candidate is broadcast and
+//    was NOT the user's active source before shutdown, return nullptr so
+//    ActivateActiveOrLastAudio cleanly enters stock SelectEntertainmentNoAudio
+//    (Audio Off). If the user was genuinely listening to radio, it is kept.
 //
-// 2. Disconnect & reconnect-timer expiry:
-//    activatePrevious() (0x0003b37c) runs when CarPlay/AA/USB disconnects or
-//    when reconnect timer expires. It falls back to lastBroadcast (FM).
-//    We hook activatePrevious() to inject SelectEntertainmentNoAudio instead.
+// 2. Disconnect fallback (activatePrevious):
+//    activatePrevious() (0x0003b37c) runs when CarPlay/AA/USB disconnects.
+//    If the candidate is broadcast radio, we inject SelectEntertainmentNoAudio.
 //
-// 3. getLastBroadcast helper:
-//    UIA_SYSTEM_AudioStack_getLastBroadcast() (0x00039e50) supplies the
-//    fallback broadcast source. We hook it to return nullptr so no OEM
-//    subsystem can pull a broadcast radio fallback.
-//
-// Offsets are for cmu150_NA_74.00.324A (vaddr-0 PIE). The prologue checks
-// abort the hooks if the binary does not match.
+// 3. Reconnect-timer expiry (ActivateLastBroadcast):
+//    UIA_SYSTEM_ActivateLastBroadcast() (0x0003dc88) runs when the reconnect
+//    timer expires. We hook it to inject SelectEntertainmentNoAudio instead.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -56,8 +50,10 @@ constexpr uintptr_t   kOffAnchor   = 0x0005c220; // UiApp_InjectEvent (exported)
 
 constexpr uintptr_t kOffActivatePrevious        = 0x0003b37c;
 constexpr uintptr_t kOffGetFirstAvailableSource = 0x0003a358;
-constexpr uintptr_t kOffGetLastBroadcast        = 0x00039e50;
+constexpr uintptr_t kOffActivateLastBroadcast   = 0x0003dc88;
+constexpr uintptr_t kOffGetCurrent              = 0x00039e2c;
 constexpr uintptr_t kOffGetPrevious             = 0x00039e3c;
+constexpr uintptr_t kOffGetLastBroadcast        = 0x00039e50;
 constexpr uintptr_t kOffIsAvailable             = 0x00038290;
 constexpr uintptr_t kOffIsBroadcastSource       = 0x00039d1c;
 
@@ -69,31 +65,33 @@ constexpr uint32_t kPrologue1_ap  = 0xe24dd018; // sub  sp, sp, #24
 constexpr uint32_t kPrologue0_fas = 0xe92d4010; // push {r4,lr}
 constexpr uint32_t kPrologue1_fas = 0xe24dd010; // sub  sp, sp, #16
 
-// Expected first two instructions of getLastBroadcast (ldr r3, [pc, #8] + add r3, pc, r3).
-constexpr uint32_t kPrologue0_glb = 0xe59f3008; // ldr  r3, [pc, #8]
-constexpr uint32_t kPrologue1_glb = 0xe08f3003; // add  r3, pc, r3
+// Expected first two instructions of ActivateLastBroadcast (push + sub sp).
+constexpr uint32_t kPrologue0_alb = 0xe92d4010; // push {r4,lr}
+constexpr uint32_t kPrologue1_alb = 0xe24dd018; // sub  sp, sp, #24
 
 // Absolute jump: ldr pc, [pc, #-4] ; .word target
 constexpr uint32_t kLdrPcM4   = 0xe51ff004;
 
-using ActivatePreviousFn = int (*)(int);
-using GetAppFn           = void *(*)();
-using IsAvailableFn      = int (*)(void *);
-using IsBroadcastFn      = int (*)(void *);
-using InjectToNameFn     = void (*)(const char *, const char *, void *, int);
+using ActivatePreviousFn      = int (*)(int);
+using ActivateLastBroadcastFn = int (*)();
+using GetAppFn                = void *(*)();
+using IsAvailableFn           = int (*)(void *);
+using IsBroadcastFn           = int (*)(void *);
+using InjectToNameFn          = void (*)(const char *, const char *, void *, int);
 
-uintptr_t          g_base                 = 0;
-ActivatePreviousFn g_real_activate        = nullptr;
-GetAppFn           g_real_first_available = nullptr;
-GetAppFn           g_real_last_broadcast  = nullptr;
+uintptr_t               g_base                      = 0;
+ActivatePreviousFn      g_real_activate             = nullptr;
+GetAppFn                g_real_first_available      = nullptr;
+ActivateLastBroadcastFn g_real_activate_last_bcast  = nullptr;
 
-GetAppFn           g_get_previous         = nullptr;
-GetAppFn           g_get_last_bcast       = nullptr;
-IsAvailableFn      g_is_available         = nullptr;
-IsBroadcastFn      g_is_broadcast         = nullptr;
-InjectToNameFn     g_inject_to_name       = nullptr;
+GetAppFn                g_get_current               = nullptr;
+GetAppFn                g_get_previous              = nullptr;
+GetAppFn                g_get_last_bcast            = nullptr;
+IsAvailableFn           g_is_available              = nullptr;
+IsBroadcastFn           g_is_broadcast              = nullptr;
+InjectToNameFn          g_inject_to_name            = nullptr;
 
-bool               g_installed            = false;
+bool                    g_installed                 = false;
 
 bool set_prot(uintptr_t addr, size_t len, int prot)
 {
@@ -114,15 +112,12 @@ int select_audio_off()
         LOGE("fallback: UiApp_InjectEventToUiaName unresolved");
         return 0;
     }
-    // Stock Entertainment → Audio Off path. Null payload matches the
-    // empty `{}` the GUI sends; the event handler tolerates a NULL JSON
-    // object and delivers SelectEntertainmentNoAudio (event 1454).
     LOGD("fallback: injecting SelectEntertainmentNoAudio (Audio Off)");
     g_inject_to_name("system", "SelectEntertainmentNoAudio", nullptr, 0);
     return 1;
 }
 
-// 1. Our activatePrevious replacement (called on disconnect & reconnect timer).
+// 1. Hook activatePrevious (disconnect fallback).
 int hook_activatePrevious(int flag)
 {
     if (!libpatch_config::fallback_audio_off() || !g_real_activate) {
@@ -151,7 +146,7 @@ int hook_activatePrevious(int flag)
     return g_real_activate(flag);
 }
 
-// 2. Our getFirstAvailableSource replacement (called on boot/ACC ON source activation).
+// 2. Hook getFirstAvailableSource (bootup / ACC ON source activation fallback).
 void *hook_getFirstAvailableSource()
 {
     if (!libpatch_config::fallback_audio_off() || !g_real_first_available) {
@@ -159,23 +154,37 @@ void *hook_getFirstAvailableSource()
     }
 
     void *cand = g_real_first_available();
-    if (cand && g_is_broadcast && g_is_broadcast(cand) == 1) {
-        LOGD("fallback: getFirstAvailableSource broadcast candidate (%p) — returning nullptr (Audio Off)", cand);
+    if (!cand) {
         return nullptr;
     }
 
-    return cand;
-}
-
-// 3. Our getLastBroadcast replacement (never return a broadcast candidate).
-void *hook_getLastBroadcast()
-{
-    if (!libpatch_config::fallback_audio_off()) {
-        return g_real_last_broadcast ? g_real_last_broadcast() : nullptr;
+    // Only intercept broadcast radio (FM, AM, SiriusXM, DAB).
+    if (!g_is_broadcast || g_is_broadcast(cand) != 1) {
+        return cand;
     }
 
-    LOGD("fallback: getLastBroadcast suppressed (returning nullptr)");
+    // If candidate was the actively playing source before shutdown, keep it (do not break user choice).
+    if (g_get_current && g_is_available) {
+        void *cur = g_get_current();
+        if (cur == cand && g_is_available(cur) == 1) {
+            LOGD("fallback: getFirstAvailableSource user-selected active radio (%p) — keeping", cand);
+            return cand;
+        }
+    }
+
+    LOGD("fallback: getFirstAvailableSource broadcast fallback (%p) — returning nullptr (Audio Off)", cand);
     return nullptr;
+}
+
+// 3. Hook ActivateLastBroadcast (reconnect-timer expiry fallback).
+int hook_ActivateLastBroadcast()
+{
+    if (!libpatch_config::fallback_audio_off() || !g_real_activate_last_bcast) {
+        return g_real_activate_last_bcast ? g_real_activate_last_bcast() : 0;
+    }
+
+    LOGD("fallback: ActivateLastBroadcast triggered — Audio Off instead of radio");
+    return select_audio_off();
 }
 
 bool install_trampoline(uintptr_t target_off, uint32_t p0, uint32_t p1,
@@ -207,8 +216,10 @@ bool install_trampoline(uintptr_t target_off, uint32_t p0, uint32_t p1,
         LOGE("fallback: mprotect RW failed @%p", target);
         return false;
     }
-    target[0] = kLdrPcM4;
+    // Write target address first, barrier, then jump opcode (thread safety).
     target[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hook_fn));
+    __sync_synchronize();
+    target[0] = kLdrPcM4;
     __builtin___clear_cache(reinterpret_cast<char *>(target),
                             reinterpret_cast<char *>(target + 2));
     if (!set_prot(reinterpret_cast<uintptr_t>(target), 8, PROT_READ | PROT_EXEC)) {
@@ -220,13 +231,8 @@ bool install_trampoline(uintptr_t target_off, uint32_t p0, uint32_t p1,
     return true;
 }
 
-bool install_hook()
+bool install_hook(void *h)
 {
-    void *h = dlopen(kUiaSystemSo, RTLD_NOW | RTLD_NOLOAD);
-    if (!h) {
-        return false;
-    }
-
     void *anchor = dlsym(h, kAnchorSym);
     if (!anchor) {
         LOGE("fallback: dlsym(%s) failed", kAnchorSym);
@@ -237,6 +243,7 @@ bool install_hook()
     LOGD("fallback: libjciuiasystem base=0x%08lx",
          static_cast<unsigned long>(g_base));
 
+    g_get_current    = reinterpret_cast<GetAppFn>(at(kOffGetCurrent));
     g_get_previous   = reinterpret_cast<GetAppFn>(at(kOffGetPrevious));
     g_get_last_bcast = reinterpret_cast<GetAppFn>(at(kOffGetLastBroadcast));
     g_is_available   = reinterpret_cast<IsAvailableFn>(at(kOffIsAvailable));
@@ -248,24 +255,24 @@ bool install_hook()
         return false;
     }
 
-    // 1. Hook activatePrevious (disconnect & reconnect-timer fallback).
+    // 1. Hook activatePrevious (disconnect fallback).
     if (!install_trampoline(kOffActivatePrevious, kPrologue0_ap, kPrologue1_ap,
                             reinterpret_cast<void *>(&hook_activatePrevious),
                             reinterpret_cast<void **>(&g_real_activate))) {
         return false;
     }
 
-    // 2. Hook getFirstAvailableSource (bootup / ACC ON source activation fallback).
+    // 2. Hook getFirstAvailableSource (bootup / ACC ON fallback).
     if (!install_trampoline(kOffGetFirstAvailableSource, kPrologue0_fas, kPrologue1_fas,
                             reinterpret_cast<void *>(&hook_getFirstAvailableSource),
                             reinterpret_cast<void **>(&g_real_first_available))) {
         return false;
     }
 
-    // 3. Hook getLastBroadcast (suppress broadcast radio candidate).
-    if (!install_trampoline(kOffGetLastBroadcast, kPrologue0_glb, kPrologue1_glb,
-                            reinterpret_cast<void *>(&hook_getLastBroadcast),
-                            reinterpret_cast<void **>(&g_real_last_broadcast))) {
+    // 3. Hook ActivateLastBroadcast (reconnect-timer expiry fallback).
+    if (!install_trampoline(kOffActivateLastBroadcast, kPrologue0_alb, kPrologue1_alb,
+                            reinterpret_cast<void *>(&hook_ActivateLastBroadcast),
+                            reinterpret_cast<void **>(&g_real_activate_last_bcast))) {
         return false;
     }
 
@@ -276,10 +283,13 @@ bool install_hook()
 
 void *waiter_main(void *)
 {
-    // mmuiLoadUias() runs after our constructor; poll briefly for the
-    // system UIA library, then give up quietly if absent (wrong PID).
+    // mmuiLoadUias() runs after constructor; wait until mapped, then install once.
     for (int i = 0; i < 100; ++i) {
-        if (install_hook()) {
+        void *h = dlopen(kUiaSystemSo, RTLD_NOW | RTLD_NOLOAD);
+        if (h) {
+            if (!install_hook(h)) {
+                LOGE("fallback: install_hook failed (unsupported FW?) — aborting");
+            }
             return nullptr;
         }
         usleep(100 * 1000);
