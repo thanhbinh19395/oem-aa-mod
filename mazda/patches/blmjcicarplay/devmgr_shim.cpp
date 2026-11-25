@@ -41,10 +41,18 @@ namespace {
 
 typedef int (*pfn4)(void *, void *, void *, void *);
 
-// RouteGuidanceDisplayComponent identifier advertised by ipoddev_full_auth
-// (verified in /etc/devmgr_config_master.xml: <name>NaviCompId</name><value>0x5555</value>
-// and ipoddev_full_auth::IAP2_StartNavigationRouteGuidanceUpdate).
-constexpr uintptr_t kNaviCompId = 0x5555u;
+// RouteGuidanceDisplayComponent identifier advertised by ipoddev_full_auth.
+// Disasm proof on FW 74.00.324A ipoddev_full_auth:
+//   - /etc/devmgr_config_master.xml sets `<name>NaviCompId</name><value>0x5555</value>`.
+//   - eDevMgriPodInitConfigParams (@0x53fc4) passes "0x5555" to eDevMgrSetIntParam (@0x36fa0),
+//     which calls `strtol(val, NULL, 10)` (BASE 10 @0x37004, NOT base 0!).
+//   - `strtol("0x5555", NULL, 10)` stops at 'x' and returns 0 (>= 0), overwriting the 0x5555
+//     default at cfg+3712 with 0. Thus iAP2 IdentificationInformation advertises
+//     RouteGuidanceDisplayComponent Identifier = 0 (NOT 0x5555) to the iPhone.
+//   - Sending StartNavigationRouteGuidanceUpdate (0x5200) with compId=0x5555 returns rc=1
+//     from ipoddev IPC, but iOS silently drops it because component 0x5555 was never declared!
+constexpr uintptr_t kNaviCompId         = 0u;
+constexpr uintptr_t kNaviCompIdFallback = 0x5555u;
 
 pfn4  g_real_register  = nullptr;
 pfn4  g_real_callstate = nullptr;
@@ -61,8 +69,10 @@ bool             g_session_active   = false;
 void            *g_procH            = nullptr;
 void            *g_devH             = nullptr;
 void            *g_started_devH     = nullptr;
-std::atomic<bool> g_armed{false};       // gates the passive msgrcv tap
-std::atomic<bool> g_nav_rx_seen{false}; // true once 0x8058/0x8059 received in this session
+std::atomic<bool>     g_armed{false};         // gates the passive msgrcv tap
+std::atomic<bool>     g_nav_rx_seen{false};   // true once 0x8058/0x8059 received in this session
+std::atomic<bool>     g_cp_tbt_active{false}; // true while OEM TurnByTurnEntity == 1 (CARPLAY)
+std::atomic<uint32_t> g_tbt_epoch{0};         // bumped on each TurnByTurnEntity -> 1 transition
 
 extern "C" int eDevMgrRegisterProcess(void *, void *, void *, void *);
 extern "C" int eDevMgriPodStartCallStateUpdates(void *, void *, void *, void *);
@@ -107,51 +117,80 @@ void resolve_all_once(void)
     pthread_once(&g_resolve_once, resolve_all_impl);
 }
 
-// Retry worker: only retries StartNaviRouteGuidenceUpdates(compId=0x5555) when
-// the initial call during CarPlay bring-up returned rc != 1 (e.g. iAP2 session
-// not ready yet). Once rc == 1 or nav traffic (0x8058/0x8059) is observed, it
-// goes completely idle — zero IPC semaphore contention and zero bogus iAP2
-// packets during the drive. Automatically resumes if a new devH connects.
+// Retry worker:
+//  1) Retries StartNaviRouteGuidenceUpdates(compId=0) during CarPlay bring-up if the initial
+//     call returned rc != 1.
+//  2) Also acts as a bounded active-TBT recovery (at most 4 attempts per TBT activation): if
+//     CarPlay owns Turn-by-Turn (TurnByTurnEntity == 1, e.g. Google Maps / Apple Maps / VietMap)
+//     yet zero 0x8058/0x8059 frames have arrived (e.g. CallState fired slightly before iAP2
+//     Identification settled, or decimal NaviCompId=21845 was configured), re-sends compId=0
+//     (and fallback 0x5555 on odd retries). Stays 100% idle during non-navigating drives and
+//     as soon as 0x8058/0x8059 traffic is seen.
 void *navi_retry_thread(void *)
 {
-    void *last_devH = nullptr;
-    int   attempts  = 0;
+    void    *last_devH     = nullptr;
+    uint32_t last_epoch    = 0;
+    int      init_attempts = 0;
+    int      tbt_attempts  = 0;
     for (;;) {
-        sleep(attempts >= 10 ? 15 : 3);
+        sleep(init_attempts >= 10 ? 15 : 2);
 
-        void *procH = nullptr;
-        void *devH  = nullptr;
-        pfn4  fn    = nullptr;
+        const bool     rx_seen    = g_nav_rx_seen.load(std::memory_order_relaxed);
+        const bool     tbt_active = g_cp_tbt_active.load(std::memory_order_relaxed);
+        const uint32_t cur_epoch  = g_tbt_epoch.load(std::memory_order_relaxed);
+        if (cur_epoch != last_epoch) {
+            last_epoch   = cur_epoch;
+            tbt_attempts = 0;
+        }
+
+        void *procH      = nullptr;
+        void *devH       = nullptr;
+        pfn4  fn         = nullptr;
+        bool  need_init  = false;
         pthread_mutex_lock(&g_mu);
-        if (g_session_active && g_procH && g_devH &&
-            g_started_devH != g_devH &&
-            !g_nav_rx_seen.load(std::memory_order_relaxed)) {
-            procH = g_procH;
-            devH  = g_devH;
-            fn    = g_real_startnavi;
+        if (g_session_active && g_procH && g_devH && !rx_seen) {
+            need_init = (g_started_devH != g_devH);
+            if (need_init || (tbt_active && tbt_attempts < 4)) {
+                procH = g_procH;
+                devH  = g_devH;
+                fn    = g_real_startnavi;
+            }
         }
         pthread_mutex_unlock(&g_mu);
 
         if (!fn || !procH || !devH) {
-            attempts = 0;
+            init_attempts = 0;
             continue;
         }
         if (devH != last_devH) {
-            last_devH = devH;
-            attempts  = 0;
+            last_devH     = devH;
+            init_attempts = 0;
+            tbt_attempts  = 0;
         }
 
-        int rc = fn(procH, devH, reinterpret_cast<void *>(kNaviCompId), nullptr);
-        attempts++;
-        LOGD("retry#%d StartNaviRouteGuidence(procH=%p devH=%p compId=0x%lx) rc=%d",
-             attempts, procH, devH, static_cast<unsigned long>(kNaviCompId), rc);
-        if (rc == 1) {
+        uintptr_t compId = kNaviCompId;
+        int attempt_no   = 0;
+        if (need_init) {
+            init_attempts++;
+            attempt_no = init_attempts;
+        } else {
+            // Alternate 0, 0x5555, 0, 0x5555 across the 4 bounded TBT recovery tries.
+            compId = (tbt_attempts & 1) ? kNaviCompIdFallback : kNaviCompId;
+            tbt_attempts++;
+            attempt_no = tbt_attempts;
+        }
+
+        int rc = fn(procH, devH, reinterpret_cast<void *>(compId), nullptr);
+        LOGD("retry#%d (%s) StartNaviRouteGuidence(procH=%p devH=%p compId=0x%lx) rc=%d",
+             attempt_no, need_init ? "init" : "tbt-active",
+             procH, devH, static_cast<unsigned long>(compId), rc);
+        if (rc == 1 && compId == kNaviCompId) {
             pthread_mutex_lock(&g_mu);
             if (g_session_active && g_devH == devH) {
                 g_started_devH = devH;
             }
             pthread_mutex_unlock(&g_mu);
-            attempts = 0;
+            init_attempts = 0;
         }
     }
     return nullptr;
@@ -194,7 +233,13 @@ void cp_tbt_entity_cb(void *conn, void *p_entity, void *p_aux, void *userdata)
         // (nav switched off) or 2=NATIVE (the OEM nav took the HUD) — means CarPlay is no longer
         // doing TBT, so wipe our HUD. Verified live: turning nav off fires entity 1->0. The 6s
         // staleness timer stays as a backstop for any unit where this subscribe didn't come up.
-        if (e != 1) hud_request_clear();
+        if (e == 1) {
+            g_cp_tbt_active.store(true, std::memory_order_relaxed);
+            g_tbt_epoch.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_cp_tbt_active.store(false, std::memory_order_relaxed);
+            hud_request_clear();
+        }
     } catch (...) { LOGE("cp_tbt_entity_cb exception swallowed (OEM dbus thread)"); }
 }
 
@@ -209,6 +254,7 @@ void cp_deactive_cb(void *a0, void *a1, void *a2, void *a3)
         g_session_active = false;
         g_started_devH   = nullptr;
         pthread_mutex_unlock(&g_mu);
+        g_cp_tbt_active.store(false, std::memory_order_relaxed);
         g_nav_rx_seen.store(false, std::memory_order_relaxed);
         hud_request_fullclear();   // CarPlay session gone (e.g. phone unplugged) -> FULL wipe incl sign (like AA teardown)
     } catch (...) { LOGE("cp_deactive_cb exception swallowed (OEM dbus thread)"); }

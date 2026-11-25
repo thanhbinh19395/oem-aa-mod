@@ -14,6 +14,7 @@
 # per service, sanity-check the edit, and set reset_board="no" so a shim fault
 # restarts only that service instead of rebooting the whole unit.
 
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
 hwclock --hctosys
 
 echo 1 > /sys/class/gpio/Watchdog\ Disable/value
@@ -302,9 +303,17 @@ if [ "$MODE" = "ssh" ]; then
     SSID_TEXT="Connect laptop to same Wi-Fi!\n• Car IP: ${TARGET_IP}"
   fi
 
-  # 3. Set credentials
-  echo "root:mazda" | chpasswd 2>/dev/null
-  echo "cmu:jci" | chpasswd 2>/dev/null
+  # 3. Set credentials (/etc/passwd lives on /config-mfg, a separate ro mount on FW 74!)
+  mount -o rw,remount / 2>/dev/null || true
+  mount -o rw,remount /config-mfg 2>/dev/null || true
+  if [ -x /usr/sbin/chpasswd ]; then
+    echo "cmu:jci" | /usr/sbin/chpasswd || (echo jci; echo jci) | passwd cmu
+    echo "root:mazda" | /usr/sbin/chpasswd 2>/dev/null || (echo mazda; echo mazda) | passwd root 2>/dev/null || true
+  else
+    (echo jci; echo jci) | passwd cmu
+    (echo mazda; echo mazda) | passwd root 2>/dev/null || true
+  fi
+  mount -o ro,remount /config-mfg 2>/dev/null || true
 
   # 4. Restart sshd listening on both port 22 and port 36000 with password authentication
   killall -9 sshd 2>/dev/null
@@ -312,7 +321,26 @@ if [ "$MODE" = "ssh" ]; then
   /usr/sbin/sshd -p 22 -p 36000 \
     -o PasswordAuthentication=yes \
     -o PermitRootLogin=yes \
-    -o PermitEmptyPasswords=yes 2>/dev/null
+    -o PermitEmptyPasswords=yes
+
+  # 5. Snapshot runtime HUD/nav diagnostic logs to USB (logs/diag/)
+  DIAG_DIR="${MYDIR}/logs/diag"
+  mkdir -p "${DIAG_DIR}"
+  cp -f /tmp/carplay_bridge.log "${DIAG_DIR}/carplay_bridge.log" 2>/dev/null || true
+  {
+    echo "=== DATE ==="; date
+    echo "=== PS ==="; ps w | grep -E "jciCARPLAY|splim_seriald|jciAAPA|jcinavi|aap_service"
+    echo "=== LIBS ==="; ls -la "${MOD_DIR}/" 2>/dev/null
+    echo "=== CONF ==="; cat "${MOD_DIR}/libpatch-carplay.conf" 2>/dev/null; echo "---"; cat "${MOD_DIR}/libpatch.conf" 2>/dev/null
+    echo "=== /tmp STATE ==="
+    for f in /tmp/vmnav /tmp/splim /tmp/splim_over /tmp/vmnextsplim; do
+      echo "--- $f ---"
+      ls -la "$f" 2>/dev/null
+      cat "$f" 2>/dev/null; echo ""
+    done
+    echo "=== SYSLOG (libpatch) ==="
+    grep -i "libpatch" /var/log/messages /tmp/messages 2>/dev/null | tail -n 200
+  } > "${DIAG_DIR}/cmu_nav_debug.txt" 2>&1
 
   sync
   echo "=== oem-aa-mod Enable SSH complete ==="

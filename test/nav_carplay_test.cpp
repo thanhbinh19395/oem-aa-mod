@@ -299,6 +299,44 @@ int main()
         CHECK_EQ_S(g_last_turn_road, "Nguyễn Văn Cừ", "Apple head=2 road preserved");
     }
 
+    printf("\n=== Test 17: Google Maps CarPlay (iOS 17.4+ mtype!=0 at idx=0, cnt=0 or head=0) ===\n");
+    {
+        nav_request_reset();
+        // Google Maps populates CPManeuver.maneuverType (e.g. 2=RightTurn) on upcomingManeuvers[0] (idx=0)
+        // and secondary maneuver (1=LeftTurn) on upcomingManeuvers[1] (idx=1).
+        auto m0 = make_maneuver(0, 2, "Rẽ phải", "Điện Biên Phủ");
+        auto m1 = make_maneuver(1, 1, "Rẽ trái", "Pasteur");
+        nav_on_devmgr_msg(m0.data(), m0.size());
+        nav_on_devmgr_msg(m1.data(), m1.size());
+        CHECK_EQ_U(g_last_turn_event, 4, "Google Maps idx=0 EV_TURN not dropped");
+        CHECK_EQ_U(g_last_turn_side, 2, "Google Maps idx=0 SIDE_RIGHT selected (not idx=1)");
+        CHECK_EQ_S(g_last_turn_road, "Điện Biên Phủ", "Google Maps idx=0 road selected");
+
+        // Guidance tick with cnt=0 (CPNavigationSession style)
+        auto g0 = make_guidance(220, 0, 0);
+        nav_on_devmgr_msg(g0.data(), g0.size());
+        CHECK_EQ_U(g_last_dist_m, 220, "Google Maps guidance distance 220m");
+        CHECK_EQ_U(g_last_turn_side, 2, "Google Maps still SIDE_RIGHT after cnt=0 guidance");
+
+        // Switch from Apple Maps (stale head=3) directly to Google Maps (idx=0, mtype=1)
+        nav_request_reset();
+        auto a0 = make_maneuver(0, 11, "Start", "");
+        auto a3 = make_maneuver(3, 2, "Rẽ phải", "Lê Duẩn");
+        auto ag = make_guidance(500, 3, 1);
+        nav_on_devmgr_msg(a0.data(), a0.size());
+        nav_on_devmgr_msg(a3.data(), a3.size());
+        nav_on_devmgr_msg(ag.data(), ag.size());
+        CHECK_EQ_S(g_last_turn_road, "Lê Duẩn", "Apple Maps head=3 active");
+
+        auto gm0 = make_maneuver(0, 1, "Rẽ trái", "Nam Kỳ Khởi Nghĩa");
+        auto gmg = make_guidance(180, 0, 0);
+        nav_on_devmgr_msg(gm0.data(), gm0.size());
+        nav_on_devmgr_msg(gmg.data(), gmg.size());
+        CHECK_EQ_U(g_last_turn_side, 1, "Direct switch to Google Maps updates to SIDE_LEFT");
+        CHECK_EQ_S(g_last_turn_road, "Nam Kỳ Khởi Nghĩa", "Direct switch to Google Maps road");
+        CHECK_EQ_U(g_last_dist_m, 180, "Direct switch to Google Maps distance 180m");
+    }
+
     if (g_fail) {
         printf("\nTEST SUITE FAILED\n");
         return 1;
