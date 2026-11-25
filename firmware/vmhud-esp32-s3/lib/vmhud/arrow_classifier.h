@@ -240,11 +240,11 @@ inline uint32_t jpegOutputCb(esp_rom_tjpgd_dec_t *dec, void *bitmap, esp_rom_tjp
 
 } // namespace detail
 
-// Decode a baseline JPEG (e.g. VietMap CMD 0x40 arrow) using ESP32 ROM TJpgDec
-// and classify it into a MazdaIcon. Must be called single-threaded from loop()
-// (never from NimBLE host task). Static work/ctx buffers keep stack usage minimal (~600 B).
-inline bool classifyJpeg(const uint8_t *jpeg, size_t len, ArrowResult &out) {
-    out = ArrowResult{};
+// Decode a baseline JPEG into a 16x16 grayscale luma grid using ESP32 ROM TJpgDec.
+// Must be called single-threaded from loop() (never from NimBLE host task).
+// Shared static work/ctx buffers keep stack usage minimal (~600 B) and avoid
+// duplicating the ~4.5 KB TJpgDec workspace across arrow & speed-sign classifiers.
+inline bool decodeJpegToLuma16(const uint8_t *jpeg, size_t len, uint8_t outLuma[256]) {
     if (!jpeg || len < 16 || jpeg[0] != 0xFF || jpeg[1] != 0xD8) {
         return false;
     }
@@ -265,8 +265,19 @@ inline bool classifyJpeg(const uint8_t *jpeg, size_t len, ArrowResult &out) {
     if (esp_rom_tjpgd_decomp(&dec, detail::jpegOutputCb, 0) != JDR_OK) {
         return false;
     }
+    s_ctx.acc.finalize(outLuma);
+    return true;
+}
+
+// Decode a baseline JPEG (e.g. VietMap CMD 0x40 arrow) using ESP32 ROM TJpgDec
+// and classify it into a MazdaIcon. Must be called single-threaded from loop()
+// (never from NimBLE host task).
+inline bool classifyJpeg(const uint8_t *jpeg, size_t len, ArrowResult &out) {
+    out = ArrowResult{};
     uint8_t luma[256];
-    s_ctx.acc.finalize(luma);
+    if (!decodeJpegToLuma16(jpeg, len, luma)) {
+        return false;
+    }
     return classifyGrid16(luma, out);
 }
 #endif // ESP_PLATFORM

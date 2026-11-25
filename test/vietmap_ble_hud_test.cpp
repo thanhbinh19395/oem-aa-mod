@@ -13,6 +13,9 @@
 
 #include "hud_codec.h"
 #include "arrow_classifier.h"
+#include "speed_sign_classifier.h"
+#include "blmjcicarplay/hud/next_splim_policy.h"
+#include "common/translit.h"
 
 static int g_fail = 0;
 
@@ -217,6 +220,163 @@ int main()
         vmhud::ArrowResult res;
         CHECK(vmhud::classifyRgbImage(rgb.data(), 60, 60, res), "60x60 RGB image classified");
         CHECK_EQ_U(res.icon, tmpl.icon, "60x60 RGB matched expected MazdaIcon");
+    }
+
+    printf("\n=== Test 7: CMD 0x01 2-slot camera/speed parser (current vs upcoming) ===\n");
+    {
+        // Case A: Single-slot steady driving at 60 km/h
+        uint8_t p1[4] = { 0x01, 0x00, 0x64, 60 };
+        vmhud::Frame f1; f1.command = 1; f1.payload = p1; f1.size = sizeof(p1);
+        auto r1 = vmhud::parseCameraFrame(f1, 0);
+        CHECK_EQ_U(r1.currentLimit, 60, "single-slot current=60");
+        CHECK_EQ_U(r1.nextLimit, 0, "single-slot next=0");
+
+        // Case B: Speed camera on same 60 km/h road -> no next-speed alert
+        uint8_t p2[8] = { 0x02, 0x01, 0x2C, 60,  0x01, 0x00, 0x64, 60 };
+        vmhud::Frame f2; f2.command = 1; f2.payload = p2; f2.size = sizeof(p2);
+        auto r2 = vmhud::parseCameraFrame(f2, 60);
+        CHECK_EQ_U(r2.currentLimit, 60, "same-limit camera current=60");
+        CHECK_EQ_U(r2.nextLimit, 0, "same-limit camera next=0");
+
+        // Case C: VietMap iOS 2-slot upcoming speed limit 50 at 250m while currently on 60 (slot 1 dist=100)
+        uint8_t p3[8] = { 0x01, 0x00, 0xFA, 50,  0x01, 0x00, 0x64, 60 };
+        vmhud::Frame f3; f3.command = 1; f3.payload = p3; f3.size = sizeof(p3);
+        auto r3 = vmhud::parseCameraFrame(f3, 60);
+        CHECK_EQ_U(r3.currentLimit, 60, "2-slot approaching 50: current stays 60");
+        CHECK_EQ_U(r3.nextLimit, 50, "2-slot approaching 50: next=50");
+        CHECK_EQ_U(r3.nextDist, 250, "2-slot approaching 50: nextDist=250m");
+
+        // Case D: Same layout at 80m (< 100m dummy!) -> continuity still keeps current=60, next=50
+        uint8_t p4[8] = { 0x01, 0x00, 0x50, 50,  0x01, 0x00, 0x64, 60 };
+        vmhud::Frame f4; f4.command = 1; f4.payload = p4; f4.size = sizeof(p4);
+        auto r4 = vmhud::parseCameraFrame(f4, 60);
+        CHECK_EQ_U(r4.currentLimit, 60, "2-slot at 80m: current stays 60 (no premature flip)");
+        CHECK_EQ_U(r4.nextLimit, 50, "2-slot at 80m: next=50");
+        CHECK_EQ_U(r4.nextDist, 80, "2-slot at 80m: nextDist=80m");
+
+        // Case E: Cold start (prev=0) with slot 0 real countdown 300m -> slot 0 is next, slot 1 (dummy 100) is current
+        uint8_t p5[8] = { 0x01, 0x01, 0x2C, 80,  0x01, 0x00, 0x64, 60 };
+        vmhud::Frame f5; f5.command = 1; f5.payload = p5; f5.size = sizeof(p5);
+        auto r5 = vmhud::parseCameraFrame(f5, 0);
+        CHECK_EQ_U(r5.currentLimit, 60, "cold-start current=60 (slot 1 dummy dist=100)");
+        CHECK_EQ_U(r5.nextLimit, 80, "cold-start next=80 (slot 0 countdown=300m)");
+        CHECK_EQ_U(r5.nextDist, 300, "cold-start nextDist=300m");
+
+        // Case F: Reversed slot order (slot 0 current=60, slot 1 upcoming=50 with dummy 100)
+        uint8_t p6[8] = { 0x01, 0x00, 0x00, 60,  0x01, 0x00, 0x64, 50 };
+        vmhud::Frame f6; f6.command = 1; f6.payload = p6; f6.size = sizeof(p6);
+        auto r6 = vmhud::parseCameraFrame(f6, 60);
+        CHECK_EQ_U(r6.currentLimit, 60, "reversed-slot continuity current=60");
+        CHECK_EQ_U(r6.nextLimit, 50, "reversed-slot continuity next=50");
+        CHECK_EQ_U(r6.nextDist, 0, "reversed-slot dummy dist=100 normalized to 0");
+    }
+
+    printf("\n=== Test 8: Speed-sign classifier self-consistency across all %zu signs (30..120) ===\n",
+           vmhud::kSpeedSignTemplateCount);
+    {
+        CHECK_EQ_U(vmhud::kSpeedSignTemplateCount, 10, "10 VietMap speed sign templates (30..120)");
+        size_t matched = 0;
+        for (size_t t = 0; t < vmhud::kSpeedSignTemplateCount; ++t) {
+            const vmhud::SpeedSignTemplate &tmpl = vmhud::kSpeedSignTemplates[t];
+            uint8_t luma[256];
+            memset(luma, 128, sizeof(luma));
+            size_t k = 0;
+            for (size_t r = vmhud::kSpeedSignRowStart; r < vmhud::kSpeedSignRowEnd; ++r) {
+                for (size_t c = vmhud::kSpeedSignColStart; c < vmhud::kSpeedSignColEnd; ++c) {
+                    int v = 128 + static_cast<int>(tmpl.vec[k++]);
+                    if (v < 0) v = 0;
+                    if (v > 255) v = 255;
+                    luma[r * 16 + c] = static_cast<uint8_t>(v);
+                }
+            }
+            auto m = vmhud::classifySpeedSignLuma16(luma);
+            if (m.limit == tmpl.limit && m.score >= 0.99f) {
+                matched++;
+            } else {
+                printf("  MISS sign[%zu] want=%u got=%u score=%.4f margin=%.4f\n",
+                       t, (unsigned)tmpl.limit, (unsigned)m.limit, m.score, m.margin);
+            }
+        }
+        CHECK_EQ_U(matched, vmhud::kSpeedSignTemplateCount, "all 10 speed signs self-match >= 0.99");
+
+        uint8_t blank[256] = {0};
+        CHECK_EQ_U(vmhud::classifySpeedSignLuma16(blank).limit, 0, "blank image rejected as speed sign");
+        uint8_t checker[256];
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x)
+                checker[y * 16 + x] = ((x + y) & 1) ? 255 : 0;
+        CHECK_EQ_U(vmhud::classifySpeedSignLuma16(checker).limit, 0, "checkerboard rejected as speed sign");
+    }
+
+    printf("\n=== Test 9: 10-second Next-Speed-Limit HUD Alert + Deferred Nav Queue ===\n");
+    {
+        hud_next_splim::AlertController ctrl;
+        hud_next_splim::IncomingAlert a1;
+        a1.id = 1u; a1.limit = 50u; a1.dist_m = 250u;
+
+        // t=1000ms: New alert id=1 arrives -> holds HUD until t=11000ms
+        auto s0 = ctrl.step(1000, &a1, /*cp_guiding=*/true);
+        CHECK(s0.active && s0.changed && !s0.just_ended, "alert id=1 activates at t=1000ms");
+        CHECK_EQ_U(ctrl.limit(), 50, "alert limit=50");
+        CHECK_EQ_U(ctrl.dist_m(), 250, "alert dist=250m");
+
+        // t=3000ms: New navigation turn arrives -> queued, MUST NOT interrupt alert
+        ctrl.on_nav_update();
+        CHECK(ctrl.has_queued_nav(), "nav update queued during 10s alert");
+        a1.dist_m = 180u;
+        auto s1 = ctrl.step(3000, &a1, /*cp_guiding=*/true);
+        CHECK(s1.active && s1.changed && !s1.just_ended, "same id updates distance without breaking hold");
+        CHECK_EQ_U(ctrl.dist_m(), 180, "alert distance updated to 180m");
+
+        // t=9500ms: Repeated same alert_id=1 MUST NOT extend timer past t=11000ms!
+        auto s2 = ctrl.step(9500, &a1, /*cp_guiding=*/true);
+        CHECK(s2.active && !s2.changed && !s2.just_ended, "still holding at t=9500ms (no redundant repaint)");
+
+        // t=11000ms (exact 10.0s): Alert expires -> just_ended=true so queued nav flushes!
+        auto s3 = ctrl.step(11000, &a1, /*cp_guiding=*/true);
+        CHECK(!s3.active && s3.just_ended && !s3.run_deferred_clear,
+              "alert ends at exact t=11000ms even while same id=1 still present");
+
+        // t=12000ms: Same id=1 still in file -> MUST NOT re-trigger
+        auto s4 = ctrl.step(12000, &a1, /*cp_guiding=*/true);
+        CHECK(!s4.active && !s4.changed && !s4.just_ended, "same id=1 does not re-trigger after expiry");
+
+        // t=15000ms: New alert id=2 (40 km/h); in-app nav_clear arrives at t=17000ms -> deferred until t=25000ms!
+        hud_next_splim::IncomingAlert a2;
+        a2.id = 2u; a2.limit = 40u; a2.dist_m = 150u;
+        auto s5 = ctrl.step(15000, &a2, /*cp_guiding=*/true);
+        CHECK(s5.active && s5.changed, "new alert id=2 activates at t=15000ms");
+        CHECK(!ctrl.on_nav_clear(), "in-app nav_clear deferred during active 10s alert");
+        auto s6 = ctrl.step(20000, nullptr, /*cp_guiding=*/false);
+        CHECK(s6.active && !s6.just_ended, "alert stays active at t=20000ms even after /tmp/vmnextsplim gone");
+        auto s7 = ctrl.step(25000, nullptr, /*cp_guiding=*/false);
+        CHECK(!s7.active && s7.just_ended && s7.run_deferred_clear,
+              "deferred nav_clear executes cleanly at t=25000ms");
+
+        // Full session disconnect aborts active alert immediately
+        hud_next_splim::IncomingAlert a3;
+        a3.id = 3u; a3.limit = 80u; a3.dist_m = 0u;
+        auto s8 = ctrl.step(30000, &a3, /*cp_guiding=*/false);
+        CHECK(s8.active, "alert id=3 active");
+        ctrl.on_full_clear();
+        CHECK(!ctrl.active(), "full_clear aborts active alert immediately");
+    }
+
+    printf("\n=== Test 10: VietMap label transliteration for Mazda HUD font ===\n");
+    {
+        char label[64];
+        strncpy(label, hud_next_splim::kAlertLabel, sizeof(label) - 1);
+        label[sizeof(label) - 1] = '\0';
+        hud_translit::fold(label, '?');
+        CHECK(strcmp(label, "T\xC3\xB4" "c \xC4\x91\xC3\xB4 ti\xC3\xAAp theo") == 0,
+              "\"Tốc độ tiếp theo\" folds cleanly to 1-/2-byte HUD glyphs (\"Tôc đô tiêp theo\")");
+        // Ensure zero '?' fallback characters and zero 3-byte UTF-8 lead bytes (>= 0xE0)
+        bool all_hud_safe = true;
+        for (size_t i = 0; label[i]; ++i) {
+            unsigned char ch = static_cast<unsigned char>(label[i]);
+            if (ch == '?' || ch >= 0xE0u) { all_hud_safe = false; break; }
+        }
+        CHECK(all_hud_safe, "folded label contains zero unrenderable >=U+0800 code points");
     }
 
     if (g_fail) {

@@ -38,6 +38,7 @@
 
 #include "../patch.h"
 #include "hud_send.h"
+#include "next_splim_policy.h"            // 10s "Tốc độ tiếp theo" alert + nav queue
 #include "../oem/libjcivbsnaviclient.h"   // OEM transport (libjcidbus + VBS_NAVI_*)
 #include "common/config.h"                // runtime libpatch.conf (carplay_* keys)
 #include "common/thread_util.h"           // preload_thread_create (256 KiB bounded stack)
@@ -47,7 +48,6 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
-#include <string>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
@@ -55,6 +55,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 // [2026-06-13 #3] Defined in nav.cpp — flags the nav-side selection/emit state for reset on the
 // next maneuver (msgrcv thread) so the HUD repaints when a route is re-started after a nav-off.
@@ -372,6 +375,75 @@ static bool read_vmnav(NaviSnapshot &out)
     return true;
 }
 
+// Monotonic milliseconds without -lrt or std::chrono::steady_clock
+// (glibc 2.11 + libstdc++ 6.0.14 safe; immune to GPS/NTP wall-clock jumps).
+static int64_t mono_ms()
+{
+    struct timespec ts = {0, 0};
+#ifdef __linux__
+    if (::syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts) != 0) {
+        return static_cast<int64_t>(std::time(nullptr)) * 1000LL;
+    }
+#else
+    if (::clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return static_cast<int64_t>(std::time(nullptr)) * 1000LL;
+    }
+#endif
+    return static_cast<int64_t>(ts.tv_sec) * 1000LL +
+           static_cast<int64_t>(ts.tv_nsec) / 1000000LL;
+}
+
+// [VIETMAP-BLE] Read upcoming speed-limit alert written by splim_seriald
+// ("<id> <limit> <dist_m> <unix_ts>") in RAM tmpfs (/tmp/vmnextsplim).
+static bool read_vmnextsplim(hud_next_splim::IncomingAlert &out)
+{
+    if (!libpatch_config::carplay_speed_limit() ||
+        !libpatch_config::carplay_next_speed_limit()) {
+        return false;
+    }
+
+    char buf[64];
+    if (read_tiny_file("/tmp/vmnextsplim", buf, sizeof(buf)) <= 0) return false;
+    if (buf[0] < '0' || buf[0] > '9') return false;
+
+    unsigned long id = 0;
+    unsigned int lim = 0;
+    unsigned long dist_m = 0;
+    long ts = 0;
+    if (std::sscanf(buf, "%lu %u %lu %ld", &id, &lim, &dist_m, &ts) < 4) {
+        return false;
+    }
+    long now = static_cast<long>(std::time(nullptr));
+    if (now - ts > 8 || ts - now > 2) return false;
+    if (id == 0ul || lim < 5u || lim > 200u || dist_m > 999000ul) return false;
+
+    out.id     = static_cast<uint32_t>(id);
+    out.limit  = static_cast<uint16_t>(lim);
+    out.dist_m = static_cast<uint32_t>(dist_m);
+    return true;
+}
+
+// Build the HUD snapshot shown during the 10-second upcoming speed-limit alert.
+// Uses HUD_STRAIGHT so the Mazda cluster keeps the street-name strip visible
+// (nextManeuverInfo == 0 hides guidancePointName on Mazda HUD).
+static void make_next_splim_snap(uint32_t dist_m, NaviSnapshot &out)
+{
+    std::memset(&out, 0, sizeof(out));
+    out.direct_icon = MazdaIcon::HUD_STRAIGHT;
+    if (dist_m > 0u && dist_m < 1000u) {
+        out.distance_dec  = static_cast<int32_t>(dist_m * 10u);
+        out.distance_unit = 1;  // METERS
+    } else if (dist_m >= 1000u) {
+        out.distance_dec  = static_cast<int32_t>(dist_m / 100u);
+        out.distance_unit = 3;  // KILOMETERS
+    } else {
+        out.distance_dec  = 0;
+        out.distance_unit = 1;  // METERS (never emit unit=0 with live icon)
+    }
+    std::strncpy(out.road_name, hud_next_splim::kAlertLabel, sizeof(out.road_name) - 1);
+    out.road_name[sizeof(out.road_name) - 1] = '\0';
+}
+
 // Wake the sender thread without a lost-wakeup race against g_cv.wait().
 inline void wake_sender()
 {
@@ -670,7 +742,9 @@ void *sender_main(void *)
     uint32_t     last_processed = 0;
     uint16_t     prev_splim = 0;
     bool         prev_vmnav = false;
+    bool         pending_restore = false;
     uint32_t     last_tick = 0;
+    hud_next_splim::AlertController next_ctrl;
 
     // [NAV-END] Fresh bring-up: if no route is active (neither CarPlay iAP2 nor
     // VietMap BLE), wipe any maneuver the cluster ECU retained from a previous
@@ -716,6 +790,8 @@ void *sender_main(void *)
         bool nav_req  = g_clear_req.exchange(false, std::memory_order_acquire);
         if (full_req) {
             LOGD("hud: CarPlay session gone -> full HUD wipe (incl sign)");
+            next_ctrl.on_full_clear();
+            pending_restore = false;
             if (send_clear(sync_bit)) {
                 g_have_guidance.store(false, std::memory_order_relaxed);
                 prev           = {};
@@ -724,82 +800,164 @@ void *sender_main(void *)
                 last_processed = g_seq.load(std::memory_order_acquire);
                 nav_request_reset();
             }
-        } else if (nav_req) {
-            // CarPlay iAP2 TBT turned off (TurnByTurnEntity != CARPLAY). If VietMap
-            // BLE nav is active, hand the HUD straight over to VietMap without wiping.
-            g_have_guidance.store(false, std::memory_order_relaxed);
-            nav_request_reset();
-            last_processed = g_seq.load(std::memory_order_acquire);
-            NaviSnapshot vmnav_snap;
-            if (read_vmnav(vmnav_snap)) {
-                LOGD("hud: CarPlay iAP2 TBT off -> keeping VietMap BLE nav");
-                if (send_one(vmnav_snap, prev, sync_bit, painted, splim_changed, /*force=*/true)) {
-                    prev       = vmnav_snap;
-                    prev_splim = splim;
-                    prev_vmnav = true;
+        } else {
+            // Advance the 10-second upcoming speed-limit alert controller.
+            hud_next_splim::IncomingAlert inc_alert;
+            const bool has_inc = read_vmnextsplim(inc_alert);
+            bool cp_guiding = g_have_guidance.load(std::memory_order_acquire);
+
+            if (nav_req) {
+                g_have_guidance.store(false, std::memory_order_relaxed);
+                cp_guiding = false;
+                nav_request_reset();
+                last_processed = g_seq.load(std::memory_order_acquire);
+            }
+
+            const hud_next_splim::StepResult ns =
+                next_ctrl.step(mono_ms(), has_inc ? &inc_alert : nullptr, cp_guiding);
+
+            if (ns.just_ended) {
+                pending_restore = true;
+                LOGD("hud: next-speed-limit 10s alert finished -> restoring queued HUD state");
+            }
+
+            bool run_nav_clear = false;
+            if (nav_req) {
+                run_nav_clear = next_ctrl.on_nav_clear();
+            }
+            if (ns.run_deferred_clear) {
+                run_nav_clear = true;
+            }
+
+            if (ns.active) {
+                // 10-second upcoming speed-limit alert owns the HUD.
+                // Queue any incoming CarPlay nav updates (latest-wins in g_snapshot)
+                // without interrupting the banner and without busy-spinning g_cv.wait().
+                if (s2 != last_processed) {
+                    last_processed = s2;
+                    next_ctrl.on_nav_update();
+                }
+                const uint32_t cur_tick = g_splim_tick.load(std::memory_order_relaxed);
+                const bool tick_woke = (cur_tick != last_tick);
+                if (ns.changed || tick_woke) {
+                    NaviSnapshot alert_snap;
+                    make_next_splim_snap(next_ctrl.dist_m(), alert_snap);
+                    if (ns.changed) {
+                        LOGD("hud: next-speed-limit alert -> %u km/h dist=%u m (10s hold)",
+                             static_cast<unsigned>(next_ctrl.limit()),
+                             static_cast<unsigned>(next_ctrl.dist_m()));
+                    }
+                    if (send_one(alert_snap, prev, sync_bit,
+                                 /*splim=*/next_ctrl.limit(),
+                                 /*splim_changed=*/ns.changed || (next_ctrl.limit() != prev_splim),
+                                 /*force=*/true)) {
+                        prev            = alert_snap;
+                        prev_splim      = next_ctrl.limit();
+                        prev_vmnav      = false;
+                        pending_restore = false;
+                    }
+                }
+            } else if (run_nav_clear) {
+                // CarPlay iAP2 TBT turned off (TurnByTurnEntity != CARPLAY). If VietMap
+                // BLE nav is active, hand the HUD straight over to VietMap without wiping.
+                NaviSnapshot vmnav_snap;
+                if (read_vmnav(vmnav_snap)) {
+                    LOGD("hud: CarPlay iAP2 TBT off -> keeping VietMap BLE nav");
+                    if (send_one(vmnav_snap, prev, sync_bit, painted,
+                                 splim_changed || pending_restore, /*force=*/true)) {
+                        prev            = vmnav_snap;
+                        prev_splim      = splim;
+                        prev_vmnav      = true;
+                        pending_restore = false;
+                    }
+                } else {
+                    LOGD("hud: CarPlay TBT off (still connected) -> maneuver off, keep sign");
+                    if (libpatch_config::carplay_speed_limit() && splim > 0) {
+                        if (send_one(kBlankSnap, prev, sync_bit, painted,
+                                     /*splim_changed=*/true, /*force=*/true)) {
+                            prev            = kBlankSnap;
+                            prev_splim      = splim;
+                            prev_vmnav      = false;
+                            pending_restore = false;
+                        }
+                    } else if (send_clear(sync_bit)) {
+                        prev            = {};
+                        prev_splim      = 0;
+                        prev_vmnav      = false;
+                        pending_restore = false;
+                    }
                 }
             } else {
-                LOGD("hud: CarPlay TBT off (still connected) -> maneuver off, keep sign");
-                if (libpatch_config::carplay_speed_limit() && splim > 0) {
-                    if (send_one(kBlankSnap, prev, sync_bit, painted, /*splim_changed=*/true, /*force=*/true)) {
-                        prev       = kBlankSnap;
-                        prev_splim = splim;
-                        prev_vmnav = false;
-                    }
-                } else if (send_clear(sync_bit)) {
-                    prev       = {};
-                    prev_splim = 0;
-                    prev_vmnav = false;
-                }
-            }
-        } else {
-            const bool cp_guiding = g_have_guidance.load(std::memory_order_acquire);
-            // Only poll /tmp/vmnav when CarPlay iAP2 is NOT actively guiding (zero overhead
-            // during Apple Maps / Google Maps turns).
-            NaviSnapshot vmnav_snap;
-            const bool using_vmnav = (!cp_guiding && read_vmnav(vmnav_snap));
-            const NaviSnapshot &curSnap =
-                cp_guiding  ? snap :
-                using_vmnav ? vmnav_snap : kBlankSnap;
+                // Only poll /tmp/vmnav when CarPlay iAP2 is NOT actively guiding (zero overhead
+                // during Apple Maps / Google Maps turns).
+                NaviSnapshot vmnav_snap;
+                const bool using_vmnav = (!cp_guiding && read_vmnav(vmnav_snap));
+                const NaviSnapshot &curSnap =
+                    cp_guiding  ? snap :
+                    using_vmnav ? vmnav_snap : kBlankSnap;
 
-            const bool vmnav_ended = (prev_vmnav && !using_vmnav && !cp_guiding);
-            const bool vmnav_changed =
-                (!cp_guiding) &&
-                (using_vmnav != prev_vmnav ||
-                 (using_vmnav &&
-                  (vmnav_snap.direct_icon   != prev.direct_icon   ||
-                   vmnav_snap.distance_dec  != prev.distance_dec  ||
-                   vmnav_snap.distance_unit != prev.distance_unit ||
-                   std::strncmp(vmnav_snap.road_name, prev.road_name, sizeof(prev.road_name)) != 0)));
+                const bool vmnav_ended = (prev_vmnav && !using_vmnav && !cp_guiding);
+                const bool vmnav_changed =
+                    (!cp_guiding) &&
+                    (using_vmnav != prev_vmnav ||
+                     (using_vmnav &&
+                      (vmnav_snap.direct_icon   != prev.direct_icon   ||
+                       vmnav_snap.distance_dec  != prev.distance_dec  ||
+                       vmnav_snap.distance_unit != prev.distance_unit ||
+                       std::strncmp(vmnav_snap.road_name, prev.road_name, sizeof(prev.road_name)) != 0)));
 
-            if (vmnav_ended) {
-                LOGD("hud: VietMap BLE nav ended -> maneuver off (splim=%u)",
-                     static_cast<unsigned>(splim));
-                if (libpatch_config::carplay_speed_limit() && splim > 0) {
-                    if (send_one(kBlankSnap, prev, sync_bit, painted, /*splim_changed=*/true, /*force=*/true)) {
-                        prev           = kBlankSnap;
-                        prev_splim     = splim;
-                        prev_vmnav     = false;
-                        last_processed = s2;
+                if (pending_restore && !cp_guiding && !using_vmnav) {
+                    if (libpatch_config::carplay_speed_limit() && splim > 0) {
+                        if (send_one(kBlankSnap, prev, sync_bit, painted,
+                                     /*splim_changed=*/true, /*force=*/true)) {
+                            prev            = kBlankSnap;
+                            prev_splim      = splim;
+                            prev_vmnav      = false;
+                            last_processed  = s2;
+                            pending_restore = false;
+                        }
+                    } else if (send_clear(sync_bit)) {
+                        prev            = {};
+                        prev_splim      = 0;
+                        prev_vmnav      = false;
+                        last_processed  = s2;
+                        pending_restore = false;
                     }
-                } else if (send_clear(sync_bit)) {
-                    prev           = {};
-                    prev_splim     = 0;
-                    prev_vmnav     = false;
-                    last_processed = s2;
+                } else if (vmnav_ended) {
+                    LOGD("hud: VietMap BLE nav ended -> maneuver off (splim=%u)",
+                         static_cast<unsigned>(splim));
+                    if (libpatch_config::carplay_speed_limit() && splim > 0) {
+                        if (send_one(kBlankSnap, prev, sync_bit, painted,
+                                     /*splim_changed=*/true, /*force=*/true)) {
+                            prev            = kBlankSnap;
+                            prev_splim      = splim;
+                            prev_vmnav      = false;
+                            last_processed  = s2;
+                            pending_restore = false;
+                        }
+                    } else if (send_clear(sync_bit)) {
+                        prev            = {};
+                        prev_splim      = 0;
+                        prev_vmnav      = false;
+                        last_processed  = s2;
+                        pending_restore = false;
+                    }
+                } else if (pending_restore || s2 != last_processed || splim_changed || vmnav_changed) {
+                    if (send_one(curSnap, prev, sync_bit, painted,
+                                 splim_changed || pending_restore,
+                                 /*force=*/pending_restore)) {
+                        prev            = curSnap;
+                        prev_splim      = splim;
+                        prev_vmnav      = using_vmnav;
+                        last_processed  = s2;
+                        pending_restore = false;
+                    }
+                } else if (cp_guiding || using_vmnav || prev_splim != 0) {
+                    // [KEEPALIVE] Ticker woke us with no change -> re-assert the
+                    // last frame so the cluster ECU doesn't age out the maneuver OR
+                    // the speed-limit (native re-asserts ~2Hz).
+                    send_one(prev, prev, sync_bit, painted, false, /*force=*/true);
                 }
-            } else if (s2 != last_processed || splim_changed || vmnav_changed) {
-                if (send_one(curSnap, prev, sync_bit, painted, splim_changed, /*force=*/false)) {
-                    prev           = curSnap;
-                    prev_splim     = splim;
-                    prev_vmnav     = using_vmnav;
-                    last_processed = s2;
-                }
-            } else if (cp_guiding || using_vmnav || prev_splim != 0) {
-                // [KEEPALIVE] Ticker woke us with no change -> re-assert the
-                // last frame so the cluster ECU doesn't age out the maneuver OR
-                // the speed-limit (native re-asserts ~2Hz).
-                send_one(prev, prev, sync_bit, painted, false, /*force=*/true);
             }
         }
 

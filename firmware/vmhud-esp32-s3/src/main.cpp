@@ -9,6 +9,7 @@
 #include "mbedtls/md5.h"
 #include "hud_codec.h"
 #include "arrow_classifier.h"
+#include "speed_sign_classifier.h"
 #include "display_ui.h"
 
 #ifdef VMHUD_BOARD_C3
@@ -17,6 +18,7 @@ static constexpr size_t kRxBufCap = 6144;
 static constexpr size_t kRxBufCap = 8192;
 #endif
 static constexpr size_t kMaxJpegBytes = 6144;
+static constexpr size_t kMaxAlertImgBytes = 4096;
 static constexpr size_t kMaxRoadBytes = 192;
 
 static String g_name = "VIETMAP-HUD";
@@ -44,6 +46,39 @@ static std::atomic<uint8_t> g_postedLimit{0};
 static std::atomic<uint16_t> g_currentSpeed{0};
 static std::atomic<uint16_t> g_camDist{0};
 static std::atomic<uint8_t> g_camType{0};
+
+// Upcoming ("next") speed limit detection from CMD 0x01 (2-slot), CMD 0x41, and CMD 0x08 (JPEG sign).
+static std::atomic<uint8_t>  g_camNextLimit{0};
+static std::atomic<uint16_t> g_camNextDist{0};
+static std::atomic<uint32_t> g_camNextRxMs{0};
+static std::atomic<uint8_t>  g_customNextLimit{0};
+static std::atomic<uint16_t> g_customNextDist{0};
+static std::atomic<uint32_t> g_customNextRxMs{0};
+
+// CMD 0x08 (sendImage) alert JPEG handoff (BLE task -> loop() task).
+struct PendingAlertImg {
+  uint8_t jpeg[kMaxAlertImgBytes];
+  size_t  len = 0;
+};
+static std::mutex g_alertImgMutex;
+static PendingAlertImg g_pendingAlertImg;
+static std::atomic<bool> g_alertImgDirty{false};
+static std::atomic<bool> g_alertImgCancel{false};
+static std::atomic<bool> g_nextResetReq{false};
+
+// loop()-owned upcoming speed-limit edge-trigger latch (ensures each warning fires once for 10 s).
+static uint8_t  g_imgNextLimit = 0;
+static uint32_t g_imgNextRxMs = 0;
+static uint32_t g_lastAlertImgHash = 0;
+static size_t   g_lastAlertImgLen = 0;
+static uint32_t g_nextAlertId = 0;
+static uint8_t  g_latchedNextLimit = 0;
+static uint32_t g_nextAbsentSinceMs = 0;
+static uint32_t g_lastNextEmitMs = 0;
+static uint16_t g_lastNextEmitDist = 0xFFFFu;
+static constexpr uint32_t kNextSourceStaleMs = 5000;
+static constexpr uint32_t kNextClearDebounceMs = 3000;
+static constexpr uint32_t kNextReemitMs = 1000;
 #if VMHUD_HAS_DISPLAY
 static std::mutex g_roadMutex;
 static String g_currentRoad = "";
@@ -238,46 +273,20 @@ static void emitSplim(uint8_t limit) {
   serialWriteLine(buf, (size_t)n);
 }
 
-static uint8_t postedLimitFromCamera(const vmhud::Frame &frame, uint16_t &outDist, uint8_t &outType) {
-  outDist = 0;
-  outType = 0;
-  if (frame.command != 1 || frame.size < 4 || (frame.size % 4) != 0) {
-    return 0;
+// Called strictly from loop() so NEXTSPLIM lines never interleave with SPLIM/NAV lines.
+static void emitNextSplim(uint32_t alertId, uint8_t limit, uint16_t distM) {
+  if (alertId == 0 || limit < 5 || limit > 200) {
+    return;
   }
-  uint8_t pick = 0;
-  uint16_t pickDist = 0xFFFF;
-  uint8_t pickType = 0;
-
-  for (size_t i = 0; i < frame.size; i += 4) {
-    const uint8_t type = frame.payload[i];
-    const uint16_t dist = vmhud::be16(frame.payload + i + 1);
-    const uint8_t lim = frame.payload[i + 3];
-    if (lim < 5 || lim > 200) {
-      continue;
-    }
-    if (dist >= 60000) {
-      continue;
-    }
-    if (dist < pickDist) {
-      pickDist = dist;
-      pick = lim;
-      pickType = type;
-    }
+  char buf[40];
+  int n = snprintf(buf, sizeof(buf), "NEXTSPLIM %lu %u %u\n",
+                   (unsigned long)alertId, (unsigned)limit, (unsigned)distM);
+  if (n <= 0 || (size_t)n >= sizeof(buf)) {
+    return;
   }
-  if (pick) {
-    outDist = pickDist;
-    outType = pickType;
-    return pick;
-  }
-  for (size_t i = 0; i < frame.size; i += 4) {
-    const uint8_t lim = frame.payload[i + 3];
-    if (lim >= 5 && lim <= 200) {
-      outDist = vmhud::be16(frame.payload + i + 1);
-      outType = frame.payload[i];
-      return lim;
-    }
-  }
-  return 0;
+  g_lastNextEmitMs = millis();
+  g_lastNextEmitDist = distM;
+  serialWriteLine(buf, (size_t)n);
 }
 
 static void notifyInfo(const vmhud::Frame &request, NimBLECharacteristic *route) {
@@ -396,21 +405,72 @@ static void onFrame(const vmhud::Frame &frame, void *user) {
     return;
   }
 
-  // Camera and speed limit (CMD 0x01, multiple of 4 bytes)
+  // Camera and speed limit (CMD 0x01, multiple of 4 bytes: current + optional upcoming slot)
   if (frame.command == 1 && frame.size >= 4 && (frame.size % 4) == 0) {
     g_camPktCount.fetch_add(1, std::memory_order_relaxed);
-    uint16_t dist = 0;
-    uint8_t type = 0;
-    const uint8_t lim = postedLimitFromCamera(frame, dist, type);
-    g_camDist.store(dist, std::memory_order_relaxed);
-    g_camType.store(type, std::memory_order_relaxed);
-    g_postedLimit.store(lim, std::memory_order_release);
-    if (lim >= 5 && lim <= 200) {
+    const uint8_t prevLim = g_postedLimit.load(std::memory_order_relaxed);
+    const vmhud::CameraParseResult cam = vmhud::parseCameraFrame(frame, prevLim);
+    g_camDist.store(cam.camDist, std::memory_order_relaxed);
+    g_camType.store(cam.camType, std::memory_order_relaxed);
+    g_postedLimit.store(cam.currentLimit, std::memory_order_release);
+    if (cam.currentLimit >= 5 && cam.currentLimit <= 200) {
       // Request prompt USB CDC transmission from loop() (<= 20 ms latency)
       g_splimForceEmit.store(true, std::memory_order_release);
     }
+    if (cam.nextLimit >= 5 && cam.nextLimit <= 200) {
+      g_camNextDist.store(cam.nextDist, std::memory_order_relaxed);
+      g_camNextRxMs.store(millis(), std::memory_order_relaxed);
+      g_camNextLimit.store(cam.nextLimit, std::memory_order_release);
+    } else {
+      g_camNextLimit.store(0, std::memory_order_release);
+      g_camNextDist.store(0, std::memory_order_relaxed);
+    }
     g_displayDirty.store(true, std::memory_order_relaxed);
-    debugLogf("[CAM] type=%u dist=%u limit=%u\n", (unsigned)type, (unsigned)dist, (unsigned)lim);
+    debugLogf("[CAM] type=%u dist=%u cur=%u next=%u(d=%u)\n",
+              (unsigned)cam.camType, (unsigned)cam.camDist,
+              (unsigned)cam.currentLimit, (unsigned)cam.nextLimit, (unsigned)cam.nextDist);
+    return;
+  }
+
+  // Custom camera alert with embedded image (CMD 0x41: [type, dist_be16, limit, imgLen_be32, ...])
+  if (frame.command == 0x41 && frame.size >= 8) {
+    const uint16_t dist = vmhud::be16(frame.payload + 1);
+    const uint8_t lim = frame.payload[3];
+    if (lim >= 5 && lim <= 200) {
+      g_customNextDist.store(dist < 60000u ? dist : 0u, std::memory_order_relaxed);
+      g_customNextRxMs.store(millis(), std::memory_order_relaxed);
+      g_customNextLimit.store(lim, std::memory_order_release);
+      debugLogf("[CAM41] dist=%u lim=%u\n", (unsigned)dist, (unsigned)lim);
+    }
+    return;
+  }
+
+  // Warning/sign overlay image (CMD 0x08: [posX_be16, posY_be16, JPEG...]).
+  // Offload JPEG decode to loop() so NimBLE task stack stays tiny.
+  if (frame.command == 0x08 && frame.size >= 20) {
+    const uint8_t *jpg = frame.payload + 4;
+    const size_t jpgLen = frame.size - 4;
+    if (jpg[0] == 0xFF && jpg[1] == 0xD8) {
+      if (jpgLen <= kMaxAlertImgBytes) {
+        {
+          std::lock_guard<std::mutex> guard(g_alertImgMutex);
+          memcpy(g_pendingAlertImg.jpeg, jpg, jpgLen);
+          g_pendingAlertImg.len = jpgLen;
+        }
+        g_alertImgCancel.store(false, std::memory_order_relaxed);
+        g_alertImgDirty.store(true, std::memory_order_release);
+      } else {
+        debugLogf("[SIGN] jpeg oversize %u > %u\n",
+                  (unsigned)jpgLen, (unsigned)kMaxAlertImgBytes);
+      }
+    }
+    return;
+  }
+
+  // Cancel overlay image (CMD 0x09)
+  if (frame.command == 0x09) {
+    g_alertImgDirty.store(false, std::memory_order_release);
+    g_alertImgCancel.store(true, std::memory_order_release);
     return;
   }
 
@@ -455,6 +515,13 @@ struct ServerCB : NimBLEServerCallbacks {
     g_postedLimit.store(0, std::memory_order_release);
     g_camDist.store(0, std::memory_order_relaxed);
     g_camType.store(0, std::memory_order_relaxed);
+    g_camNextLimit.store(0, std::memory_order_release);
+    g_camNextDist.store(0, std::memory_order_relaxed);
+    g_customNextLimit.store(0, std::memory_order_release);
+    g_customNextDist.store(0, std::memory_order_relaxed);
+    g_alertImgDirty.store(false, std::memory_order_release);
+    g_alertImgCancel.store(true, std::memory_order_release);
+    g_nextResetReq.store(true, std::memory_order_release);
     g_lastEmittedLimit.store(0, std::memory_order_relaxed);
     g_splimForceEmit.store(false, std::memory_order_relaxed);
     {
@@ -580,6 +647,9 @@ void setup() {
   h50->start();
 
   applyAdvertising();
+  // Seed alert ID from ESP32 hardware TRNG so a board reboot never collides with
+  // the CMU's last_seen_id_ on an ongoing CarPlay session.
+  g_nextAlertId = (esp_random() & 0x0FFFFFFFu) | 1u;
 }
 
 static void processCmuSerial() {
@@ -637,8 +707,11 @@ void loop() {
     emitNavOff();
   }
 
+  // Shared single-task scratch buffer for loop() JPEG decoding (reused by both
+  // CMD 0x40 nav arrows and CMD 0x08 speed signs — saves 4 KB static SRAM).
+  static uint8_t jpegScratch[kMaxJpegBytes];
+
   if (g_navDirty.exchange(false, std::memory_order_acquire)) {
-    static uint8_t jpegCopy[kMaxJpegBytes];
     bool     active = false;
     uint32_t dist = 0;
     char     roadCopy[kMaxRoadBytes + 1] = {0};
@@ -652,7 +725,7 @@ void loop() {
       roadCopy[kMaxRoadBytes] = '\0';
       if (g_pendingNav.hasNewJpeg && g_pendingNav.jpegLen > 0) {
         jpegLen = g_pendingNav.jpegLen;
-        memcpy(jpegCopy, g_pendingNav.jpeg, jpegLen);
+        memcpy(jpegScratch, g_pendingNav.jpeg, jpegLen);
         hasJpeg = true;
         g_pendingNav.hasNewJpeg = false;
       }
@@ -670,12 +743,12 @@ void loop() {
       }
     } else {
       if (hasJpeg) {
-        const uint32_t jhash = fnv1a32(jpegCopy, jpegLen);
+        const uint32_t jhash = fnv1a32(jpegScratch, jpegLen);
         if (jhash != g_lastJpegHash || jpegLen != g_lastJpegLen || g_navIcon == 0) {
           g_lastJpegHash = jhash;
           g_lastJpegLen = jpegLen;
           vmhud::ArrowResult res;
-          if (vmhud::classifyJpeg(jpegCopy, jpegLen, res)) {
+          if (vmhud::classifyJpeg(jpegScratch, jpegLen, res)) {
             g_navIcon = res.icon;
             debugLogf("[ARROW] icon=%u score=%.3f margin=%.3f\n",
                       (unsigned)res.icon, res.score, res.margin);
@@ -731,6 +804,104 @@ void loop() {
     if (!g_navGuiding && (now - g_lastKeepaliveMs) >= kKeepaliveMs) {
       g_lastKeepaliveMs = now;
       serialWriteLine("PING\n", 5);
+    }
+  }
+
+  // Process upcoming ("next") speed limit alerts from CMD 0x01 / CMD 0x41 / CMD 0x08.
+  if (g_nextResetReq.exchange(false, std::memory_order_acquire)) {
+    g_imgNextLimit = 0;
+    g_lastAlertImgHash = 0;
+    g_lastAlertImgLen = 0;
+    g_latchedNextLimit = 0;
+    g_nextAbsentSinceMs = 0;
+  }
+  if (g_alertImgCancel.exchange(false, std::memory_order_acquire)) {
+    g_imgNextLimit = 0;
+    g_lastAlertImgHash = 0;
+    g_lastAlertImgLen = 0;
+  }
+  if (g_alertImgDirty.exchange(false, std::memory_order_acquire)) {
+    size_t alertLen = 0;
+    {
+      std::lock_guard<std::mutex> guard(g_alertImgMutex);
+      alertLen = g_pendingAlertImg.len;
+      if (alertLen > 0 && alertLen <= kMaxAlertImgBytes) {
+        memcpy(jpegScratch, g_pendingAlertImg.jpeg, alertLen);
+      } else {
+        alertLen = 0;
+      }
+    }
+    if (alertLen >= 16) {
+      const uint32_t h = fnv1a32(jpegScratch, alertLen);
+      if (h != g_lastAlertImgHash || alertLen != g_lastAlertImgLen) {
+        g_lastAlertImgHash = h;
+        g_lastAlertImgLen = alertLen;
+        const vmhud::SpeedSignMatch m = vmhud::classifySpeedSignJpeg(jpegScratch, alertLen);
+        g_imgNextLimit = m.limit;
+        if (m.limit != 0) {
+          g_imgNextRxMs = now;
+          debugLogf("[SIGN] speed=%u score=%.3f margin=%.3f\n",
+                    (unsigned)m.limit, m.score, m.margin);
+        } else {
+          debugLogf("[SIGN] non-speed score=%.3f margin=%.3f\n", m.score, m.margin);
+        }
+      } else if (g_imgNextLimit != 0) {
+        g_imgNextRxMs = now;
+      }
+    }
+  }
+
+  // Arbitrate upcoming speed-limit candidate across CMD 0x01 > CMD 0x41 > CMD 0x08.
+  uint8_t  candNextLim = 0;
+  uint16_t candNextDist = 0;
+  const uint8_t camNext = g_camNextLimit.load(std::memory_order_acquire);
+  if (camNext >= 5 && camNext <= 200 &&
+      (now - g_camNextRxMs.load(std::memory_order_relaxed)) <= kNextSourceStaleMs) {
+    candNextLim = camNext;
+    candNextDist = g_camNextDist.load(std::memory_order_relaxed);
+  } else {
+    const uint8_t c41Next = g_customNextLimit.load(std::memory_order_acquire);
+    if (c41Next >= 5 && c41Next <= 200 &&
+        (now - g_customNextRxMs.load(std::memory_order_relaxed)) <= kNextSourceStaleMs) {
+      candNextLim = c41Next;
+      candNextDist = g_customNextDist.load(std::memory_order_relaxed);
+    } else if (g_imgNextLimit >= 5 && g_imgNextLimit <= 200 &&
+               (now - g_imgNextRxMs) <= kNextSourceStaleMs) {
+      candNextLim = g_imgNextLimit;
+      candNextDist = 0;
+    }
+  }
+
+  // Edge-triggered alert ID latch: fires a NEW alert_id once per distinct upcoming speed limit.
+  if (candNextLim >= 5 && candNextLim <= 200 && candNextLim != lim) {
+    g_nextAbsentSinceMs = 0;
+    if (candNextLim != g_latchedNextLimit) {
+      if (++g_nextAlertId == 0) g_nextAlertId = 1;
+      g_latchedNextLimit = candNextLim;
+      emitNextSplim(g_nextAlertId, candNextLim, candNextDist);
+      debugLogf("[NEXT] trigger id=%lu lim=%u dist=%u (cur=%u)\n",
+                (unsigned long)g_nextAlertId, (unsigned)candNextLim,
+                (unsigned)candNextDist, (unsigned)lim);
+    } else {
+      const uint16_t distDiff = (candNextDist > g_lastNextEmitDist)
+                                    ? (candNextDist - g_lastNextEmitDist)
+                                    : (g_lastNextEmitDist - candNextDist);
+      if ((now - g_lastNextEmitMs) >= kNextReemitMs ||
+          (candNextDist != g_lastNextEmitDist &&
+           (candNextDist == 0 || g_lastNextEmitDist == 0 || distDiff >= 10u))) {
+        emitNextSplim(g_nextAlertId, candNextLim, candNextDist);
+      }
+    }
+  } else if (g_latchedNextLimit != 0) {
+    if (lim == g_latchedNextLimit) {
+      // Vehicle entered the new speed-limit zone -> release latch immediately.
+      g_latchedNextLimit = 0;
+      g_nextAbsentSinceMs = 0;
+    } else if (g_nextAbsentSinceMs == 0) {
+      g_nextAbsentSinceMs = now;
+    } else if ((now - g_nextAbsentSinceMs) >= kNextClearDebounceMs) {
+      g_latchedNextLimit = 0;
+      g_nextAbsentSinceMs = 0;
     }
   }
 

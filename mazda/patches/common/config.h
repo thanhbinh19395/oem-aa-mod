@@ -247,6 +247,7 @@ struct Settings {
     bool         carplay_vn_normalize = true;   // blmjcicarplay: fold VN 3-byte street names for the HUD font
     bool         carplay_speed_limit  = true;   // blmjcicarplay: read + show posted speed limit (auto-launches splim_seriald)
     bool         carplay_vietmap_nav  = true;   // blmjcicarplay: read + show VietMap BLE turn-by-turn nav (/tmp/vmnav via splim_seriald)
+    bool         carplay_next_speed_limit = true; // blmjcicarplay: 10s "Tốc độ tiếp theo" alert from /tmp/vmnextsplim
     bool         loaded               = false;
 };
 
@@ -304,6 +305,8 @@ inline void apply_kv(const char *key, const char *val, void *ud)
         s.carplay_speed_limit = parse_bool(val, s.carplay_speed_limit);
     } else if (strcasecmp(key, "carplay_vietmap_nav") == 0) {
         s.carplay_vietmap_nav = parse_bool(val, s.carplay_vietmap_nav);
+    } else if (strcasecmp(key, "carplay_next_speed_limit") == 0) {
+        s.carplay_next_speed_limit = parse_bool(val, s.carplay_next_speed_limit);
     } else {
         // Common schema: a key this library doesn't act on is not an
         // error, just informational.
@@ -318,7 +321,7 @@ inline void log_effective(const char *prefix)
          "hud_fold_latin=%s use_protocol_v1_6=%s aa_audio_low_latency=%s "
          "mute_pauses_phone=%s block_headunit_media_play=%s "
          "fallback_audio_off=%s "
-         "carplay_vn_normalize=%s carplay_speed_limit=%s carplay_vietmap_nav=%s",
+         "carplay_vn_normalize=%s carplay_speed_limit=%s carplay_vietmap_nav=%s carplay_next_speed_limit=%s",
          prefix,
          s.touch ? "true" : "false",
          s.hud   ? "true" : "false",
@@ -332,7 +335,8 @@ inline void log_effective(const char *prefix)
          s.fallback_audio_off ? "true" : "false",
          s.carplay_vn_normalize ? "true" : "false",
          s.carplay_speed_limit ? "true" : "false",
-         s.carplay_vietmap_nav ? "true" : "false");
+         s.carplay_vietmap_nav ? "true" : "false",
+         s.carplay_next_speed_limit ? "true" : "false");
 }
 
 // === Public API ===============================================
@@ -382,6 +386,7 @@ inline bool         fallback_audio_off() { return settings().fallback_audio_off;
 inline bool         carplay_vn_normalize() { return settings().carplay_vn_normalize; }
 inline bool         carplay_speed_limit()  { return settings().carplay_speed_limit; }
 inline bool         carplay_vietmap_nav()  { return settings().carplay_vietmap_nav; }
+inline bool         carplay_next_speed_limit() { return settings().carplay_next_speed_limit; }
 
 } // namespace libpatch_config
 

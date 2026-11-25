@@ -5,10 +5,10 @@
 //
 // Part of an AGPL-3.0 work — see NOTICE.md for full attribution.
 //
-// Reads line-oriented "SPLIM <km/h>", "NAV <icon> <dist_m> [road]", and "NAV OFF"
-// from an ESP32 USB CDC port (ttyACM*/ttyUSB*) and atomically writes "/tmp/splim"
-// ("<limit> <unix_ts>") and "/tmp/vmnav" ("<icon> <dist_m> <unix_ts> [road]")
-// on RAM tmpfs (zero eMMC flash wear) for libpatch-blmjcicarplay to consume.
+// Reads line-oriented "SPLIM <km/h>", "NEXTSPLIM <id> <km/h> <dist_m>",
+// "NAV <icon> <dist_m> [road]", and "NAV OFF" from an ESP32 USB CDC port
+// (ttyACM*/ttyUSB*) and atomically writes "/tmp/splim", "/tmp/vmnextsplim",
+// and "/tmp/vmnav" on RAM tmpfs (zero eMMC flash wear) for libpatch-blmjcicarplay.
 //
 // EXCLUSIVITY: a lock file under /tmp keeps a second instance from opening the
 // same writer path. Prefer a single writer of splim (do not run OCR / a competing
@@ -39,10 +39,12 @@
 
 // Stored in /tmp (tmpfs RAM) instead of /data_persist (eMMC flash) so the
 // periodic timestamp refresh incurs ZERO flash wear and auto-cleans on boot.
-#define SPLIM_PATH     "/tmp/splim"
-#define SPLIM_TMP      "/tmp/splim.tmp"
-#define VMNAV_PATH     "/tmp/vmnav"
-#define VMNAV_TMP      "/tmp/vmnav.tmp"
+#define SPLIM_PATH       "/tmp/splim"
+#define SPLIM_TMP        "/tmp/splim.tmp"
+#define VMNAV_PATH       "/tmp/vmnav"
+#define VMNAV_TMP        "/tmp/vmnav.tmp"
+#define VMNEXTSPLIM_PATH "/tmp/vmnextsplim"
+#define VMNEXTSPLIM_TMP  "/tmp/vmnextsplim.tmp"
 #define LOCK_PATH      "/tmp/splim_seriald.lock"
 #define DEFAULT_BAUD   B115200
 #define SPLIM_LINE_MAX 384   // fits "NAV <icon> <dist_m> <utf8_road>" cleanly
@@ -136,6 +138,43 @@ static void clear_vmnav(void)
 {
     unlink(VMNAV_PATH);
     unlink(VMNAV_TMP);
+}
+
+static void clear_vmnextsplim(void)
+{
+    unlink(VMNEXTSPLIM_PATH);
+    unlink(VMNEXTSPLIM_TMP);
+}
+
+static int write_vmnextsplim(unsigned long alert_id, int limit, unsigned long dist_m)
+{
+    if (alert_id == 0 || limit < 5 || limit > 200 || dist_m > 999000UL)
+        return -1;
+
+    char buf[80];
+    int blen = snprintf(buf, sizeof(buf), "%lu %d %lu %ld\n",
+                        alert_id, limit, dist_m, (long)time(NULL));
+    if (blen <= 0 || (size_t)blen >= sizeof(buf))
+        return -1;
+
+    int fd = open(VMNEXTSPLIM_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, LOG_TAG "open vmnextsplim tmp: %s\n", strerror(errno));
+        return -1;
+    }
+    ssize_t wn = write(fd, buf, (size_t)blen);
+    int c_rc = close(fd);
+    if (wn != (ssize_t)blen || c_rc != 0) {
+        fprintf(stderr, LOG_TAG "write vmnextsplim tmp: %s\n", strerror(errno));
+        unlink(VMNEXTSPLIM_TMP);
+        return -1;
+    }
+    if (rename(VMNEXTSPLIM_TMP, VMNEXTSPLIM_PATH) != 0) {
+        fprintf(stderr, LOG_TAG "rename vmnextsplim: %s\n", strerror(errno));
+        unlink(VMNEXTSPLIM_TMP);
+        return -1;
+    }
+    return 0;
 }
 
 static int write_vmnav(int icon, unsigned long dist_m, const char *road)
@@ -269,6 +308,57 @@ static int parse_line(const char *line, int *out_limit)
 }
 
 // Accept:
+//   "NEXTSPLIM <id> <limit> <dist_m>"
+static int parse_nextsplim_line(const char *line, unsigned long *out_id,
+                                int *out_limit, unsigned long *out_dist)
+{
+    const char *p = line;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (strncmp(p, "NEXTSPLIM", 9) != 0 || (p[9] != ' ' && p[9] != '\t'))
+        return -1;
+    p += 9;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p < '0' || *p > '9')
+        return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long id = strtoul(p, &end, 10);
+    if (errno == ERANGE || end == p || (*end != ' ' && *end != '\t'))
+        return -1;
+    p = end;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p < '0' || *p > '9')
+        return -1;
+    errno = 0;
+    long lim = strtol(p, &end, 10);
+    if (errno == ERANGE || end == p || (*end != ' ' && *end != '\t'))
+        return -1;
+    p = end;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p < '0' || *p > '9')
+        return -1;
+    errno = 0;
+    unsigned long dist = strtoul(p, &end, 10);
+    if (errno == ERANGE || end == p)
+        return -1;
+    while (*end == ' ' || *end == '\t')
+        end++;
+    if (*end != '\0')
+        return -1;
+    if (id == 0 || lim < 5 || lim > 200 || dist > 999000UL)
+        return -1;
+
+    *out_id = id;
+    *out_limit = (int)lim;
+    *out_dist = dist;
+    return 0;
+}
+
+// Accept:
 //   "NAV OFF"
 //   "NAV <icon> <dist_m>"
 //   "NAV <icon> <dist_m> <road_utf8>"
@@ -361,6 +451,11 @@ typedef struct {
     int           last_limit;
     long          last_splim_mono;
     time_t        last_splim_wall;
+    unsigned long last_next_id;
+    int           last_next_limit;
+    unsigned long last_next_dist;
+    long          last_next_mono;
+    time_t        last_next_wall;
     int           last_nav_active;
     int           last_nav_icon;
     unsigned long last_nav_dist;
@@ -383,6 +478,9 @@ static void feed_byte(int fd, char *buf, size_t *len, int *discard,
         buf[*len] = '\0';
         if (*len > 0) {
             int limit = 0;
+            unsigned long next_id = 0;
+            int next_limit = 0;
+            unsigned long next_dist = 0;
             int nav_active = 0;
             int nav_icon = 0;
             unsigned long nav_dist = 0;
@@ -409,6 +507,33 @@ static void feed_byte(int fd, char *buf, size_t *len, int *discard,
                 if (fd >= 0) {
                     char ack[32];
                     snprintf(ack, sizeof(ack), "CMU:ACK %d\n", limit);
+                    serial_send(fd, ack);
+                }
+            } else if (parse_nextsplim_line(buf, &next_id, &next_limit, &next_dist) == 0) {
+                long   now_mono = monotonic_sec();
+                time_t now_wall = time(NULL);
+                int changed = (next_id != st->last_next_id) ||
+                              (next_limit != st->last_next_limit) ||
+                              (next_dist != st->last_next_dist);
+                if (changed ||
+                    now_mono - st->last_next_mono >= NAV_REFRESH_SEC ||
+                    now_wall < st->last_next_wall ||
+                    now_wall - st->last_next_wall >= NAV_REFRESH_SEC) {
+                    if (write_vmnextsplim(next_id, next_limit, next_dist) == 0) {
+                        st->last_next_mono = now_mono;
+                        st->last_next_wall = now_wall;
+                        if (next_id != st->last_next_id || next_limit != st->last_next_limit) {
+                            fprintf(stderr, LOG_TAG "nextsplim id=%lu lim=%d dist=%lu\n",
+                                    next_id, next_limit, next_dist);
+                        }
+                        st->last_next_id = next_id;
+                        st->last_next_limit = next_limit;
+                        st->last_next_dist = next_dist;
+                    }
+                }
+                if (fd >= 0) {
+                    char ack[32];
+                    snprintf(ack, sizeof(ack), "CMU:NEXTACK %lu\n", next_id);
                     serial_send(fd, ack);
                 }
             } else if (parse_nav_line(buf, &nav_active, &nav_icon, &nav_dist,
@@ -492,6 +617,7 @@ int main(int argc, char **argv)
         return 1;
 
     clear_vmnav();
+    clear_vmnextsplim();
 
     const char *want = NULL;
     if (argc >= 2 && argv[1][0])
@@ -505,6 +631,7 @@ int main(int argc, char **argv)
     memset(&st, 0, sizeof(st));
     st.last_limit = -1;
     st.last_splim_mono = -100;
+    st.last_next_mono = -100;
     st.last_nav_mono = -100;
     long last_hb_mono = 0;
     char line[SPLIM_LINE_MAX];
@@ -548,6 +675,10 @@ int main(int argc, char **argv)
                 clear_vmnav();
                 st.last_nav_active = 0;
             }
+            if (st.last_next_id != 0) {
+                clear_vmnextsplim();
+                st.last_next_id = 0;
+            }
             sleep(1);
             continue;
         }
@@ -576,6 +707,10 @@ int main(int argc, char **argv)
                     clear_vmnav();
                     st.last_nav_active = 0;
                 }
+                if (st.last_next_id != 0) {
+                    clear_vmnextsplim();
+                    st.last_next_id = 0;
+                }
                 sleep(1);
                 continue;
             }
@@ -586,6 +721,10 @@ int main(int argc, char **argv)
                 if (st.last_nav_active) {
                     clear_vmnav();
                     st.last_nav_active = 0;
+                }
+                if (st.last_next_id != 0) {
+                    clear_vmnextsplim();
+                    st.last_next_id = 0;
                 }
                 sleep(1);
                 continue;
@@ -603,12 +742,17 @@ int main(int argc, char **argv)
                 clear_vmnav();
                 st.last_nav_active = 0;
             }
+            if (st.last_next_id != 0) {
+                clear_vmnextsplim();
+                st.last_next_id = 0;
+            }
             sleep(1);
             continue;
         }
     }
 
     clear_vmnav();
+    clear_vmnextsplim();
     if (fd >= 0)
         close(fd);
     release_lock();
