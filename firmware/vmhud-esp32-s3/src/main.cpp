@@ -1,6 +1,6 @@
-// VietMap Live → BLE HUD emulator → USB CDC "SPLIM <km/h>" for Mazda CMU.
+// VietMap Live (iPhone) → BLE HUD emulator → USB CDC "SPLIM <km/h>" + "NAV <icon> <dist_m> <road>" for Mazda CMU.
 // Supports Headless (Super Mini) and Display (LilyGO T-Display S3 or I2C OLED).
-// Codec: lib/vmhud/hud_codec.h (AGPL-3.0, shared with mzd-vietnav-hud).
+// Codec: lib/vmhud/hud_codec.h + lib/vmhud/arrow_classifier.h (AGPL-3.0).
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
@@ -8,7 +8,18 @@
 #include <mutex>
 #include "mbedtls/md5.h"
 #include "hud_codec.h"
+#include "arrow_classifier.h"
+#include "speed_sign_classifier.h"
 #include "display_ui.h"
+
+#ifdef VMHUD_BOARD_C3
+static constexpr size_t kRxBufCap = 6144;
+#else
+static constexpr size_t kRxBufCap = 8192;
+#endif
+static constexpr size_t kMaxJpegBytes = 6144;
+static constexpr size_t kMaxAlertImgBytes = 4096;
+static constexpr size_t kMaxRoadBytes = 192;
 
 static String g_name = "VIETMAP-HUD";
 static String g_model = "H50";
@@ -28,14 +39,84 @@ static NimBLECharacteristic *g_h1 = nullptr;
 static NimBLECharacteristic *g_h50 = nullptr;
 static std::atomic<bool> g_subH1{false};
 static std::atomic<bool> g_subH50{false};
-static vmhud::Receiver<4096> g_rxH1, g_rxH50;
+static vmhud::Receiver<kRxBufCap> g_rxH1;
+static vmhud::Receiver<512> g_rxH50;  // H50 GATT stub (option 2 future work); saves ~7.5 KB SRAM
 
 static std::atomic<uint8_t> g_postedLimit{0};
 static std::atomic<uint16_t> g_currentSpeed{0};
 static std::atomic<uint16_t> g_camDist{0};
 static std::atomic<uint8_t> g_camType{0};
+
+// Upcoming ("next") speed limit detection from CMD 0x01 (2-slot), CMD 0x41, and CMD 0x08 (JPEG sign).
+static std::atomic<uint8_t>  g_camNextLimit{0};
+static std::atomic<uint16_t> g_camNextDist{0};
+static std::atomic<uint32_t> g_camNextRxMs{0};
+static std::atomic<uint8_t>  g_customNextLimit{0};
+static std::atomic<uint16_t> g_customNextDist{0};
+static std::atomic<uint32_t> g_customNextRxMs{0};
+
+// CMD 0x08 (sendImage) alert JPEG handoff (BLE task -> loop() task).
+struct PendingAlertImg {
+  uint8_t jpeg[kMaxAlertImgBytes];
+  size_t  len = 0;
+};
+static std::mutex g_alertImgMutex;
+static PendingAlertImg g_pendingAlertImg;
+static std::atomic<bool> g_alertImgDirty{false};
+static std::atomic<bool> g_alertImgCancel{false};
+static std::atomic<bool> g_nextResetReq{false};
+
+// loop()-owned upcoming speed-limit edge-trigger latch (ensures each warning fires once for 10 s).
+static uint8_t  g_imgNextLimit = 0;
+static uint32_t g_imgNextRxMs = 0;
+static uint32_t g_lastAlertImgHash = 0;
+static size_t   g_lastAlertImgLen = 0;
+static uint32_t g_nextAlertId = 0;
+static uint8_t  g_latchedNextLimit = 0;
+static uint32_t g_nextAbsentSinceMs = 0;
+static uint32_t g_lastNextEmitMs = 0;
+static uint16_t g_lastNextEmitDist = 0xFFFFu;
+static constexpr uint32_t kNextSourceStaleMs = 5000;
+static constexpr uint32_t kNextClearDebounceMs = 3000;
+static constexpr uint32_t kNextReemitMs = 1000;
+#if VMHUD_HAS_DISPLAY
 static std::mutex g_roadMutex;
 static String g_currentRoad = "";
+#endif
+
+// VietMap BLE turn-by-turn navigation handoff (BLE task -> loop() task).
+// JPEG decode runs exclusively on loop() (large stack) so NimBLE task stays tiny & fast.
+struct PendingNav {
+  bool     active = false;
+  uint32_t distance = 0;
+  char     road[kMaxRoadBytes + 1] = {0};
+  uint8_t  jpeg[kMaxJpegBytes];
+  size_t   jpegLen = 0;
+  bool     hasNewJpeg = false;
+};
+static std::mutex g_navMutex;
+static PendingNav g_pendingNav;
+static std::atomic<bool> g_navDirty{false};
+static std::atomic<bool> g_navOffReq{false};
+static std::atomic<uint32_t> g_lastNavRxMs{0};
+
+// loop()-owned active nav state & dedup
+static bool     g_navGuiding = false;
+static uint8_t  g_navIcon = 0;
+static uint32_t g_navDist = 0;
+static char     g_navRoad[kMaxRoadBytes + 1] = {0};
+static uint8_t  g_lastEmitNavIcon = 0;
+static uint32_t g_lastEmitNavDist = 0xFFFFFFFFu;
+static char     g_lastEmitNavRoad[kMaxRoadBytes + 1] = {0};
+static uint32_t g_lastNavEmitMs = 0;
+static uint32_t g_lastJpegHash = 0;
+static size_t   g_lastJpegLen = 0;
+
+static uint32_t fnv1a32(const uint8_t *p, size_t n) {
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 16777619u;
+  return h;
+}
 
 static std::atomic<uint32_t> g_camPktCount{0};
 static std::atomic<uint32_t> g_navPktCount{0};
@@ -54,9 +135,10 @@ static uint32_t g_lastKeepaliveMs = 0;
 static std::atomic<bool> g_displayDirty{true};
 static uint32_t g_lastDisplayMs = 0;
 
-// CMU read_splim() rejects entries older than 8 s — re-emit every 2 s while
-// a valid limit is held so the HUD sign does not go stale between CAM frames.
+// CMU read_splim() rejects entries older than 8 s and read_vmnav() rejects > 6 s.
 static const uint32_t kKeepaliveMs = 2000;
+static const uint32_t kNavKeepaliveMs = 1500;
+static const uint32_t kNavTimeoutMs = 6000;
 
 static void serialWriteLine(const char *line, size_t len) {
   std::lock_guard<std::mutex> guard(g_serialMutex);
@@ -93,6 +175,7 @@ static bool sdkChecksum(const uint8_t *p, size_t n, const uint8_t *uid, uint8_t 
   return true;
 }
 
+#if VMHUD_HAS_DISPLAY
 static String textUtf8(const uint8_t *p, size_t n) {
   String value;
   value.reserve(n);
@@ -100,6 +183,74 @@ static String textUtf8(const uint8_t *p, size_t n) {
     value += (char)p[i];
   }
   return value;
+}
+#endif
+
+// Sanitize UTF-8 road name into single-line NUL-terminated buffer without
+// splitting multi-byte UTF-8 sequences. Strips CR/LF/control chars and trims ends.
+static void sanitizeRoadUtf8(const uint8_t *p, size_t n, char *out, size_t cap) {
+  if (!out || cap == 0) return;
+  size_t o = 0;
+  if (p && n > 0) {
+    for (size_t i = 0; i < n && p[i] && o + 1 < cap; ++i) {
+      uint8_t c = p[i];
+      if (c < 0x20 || c == 0x7F) {
+        if (o > 0 && out[o - 1] != ' ') out[o++] = ' ';
+      } else {
+        out[o++] = (char)c;
+      }
+    }
+    // Back off if truncated mid-UTF-8 sequence.
+    if (o > 0 && o + 1 == cap) {
+      size_t k = o;
+      while (k > 0 && (static_cast<uint8_t>(out[k - 1]) & 0xC0u) == 0x80u) --k;
+      if (k > 0) {
+        uint8_t lead = static_cast<uint8_t>(out[k - 1]);
+        size_t need = (lead < 0x80u) ? 1u : ((lead & 0xE0u) == 0xC0u) ? 2u :
+                      ((lead & 0xF0u) == 0xE0u) ? 3u : 4u;
+        if (o - (k - 1) < need) o = k - 1;
+      }
+    }
+  }
+  while (o > 0 && out[o - 1] == ' ') --o;
+  size_t leadSpaces = 0;
+  while (leadSpaces < o && out[leadSpaces] == ' ') ++leadSpaces;
+  if (leadSpaces > 0) {
+    o -= leadSpaces;
+    memmove(out, out + leadSpaces, o);
+  }
+  out[o] = '\0';
+}
+
+// Called strictly from loop() so NAV lines never interleave with SPLIM lines.
+static void emitNav(uint8_t icon, uint32_t distM, const char *road) {
+  if (icon == 0 || icon > 60) return;
+  if (distM > 999000u) distM = 999000u;
+  char buf[kMaxRoadBytes + 48];
+  int n;
+  if (road && road[0]) {
+    n = snprintf(buf, sizeof(buf), "NAV %u %lu %s\n",
+                 (unsigned)icon, (unsigned long)distM, road);
+  } else {
+    n = snprintf(buf, sizeof(buf), "NAV %u %lu\n",
+                 (unsigned)icon, (unsigned long)distM);
+  }
+  if (n <= 0 || (size_t)n >= sizeof(buf)) return;
+  g_lastEmitNavIcon = icon;
+  g_lastEmitNavDist = distM;
+  strncpy(g_lastEmitNavRoad, road ? road : "", kMaxRoadBytes);
+  g_lastEmitNavRoad[kMaxRoadBytes] = '\0';
+  g_lastNavEmitMs = millis();
+  serialWriteLine(buf, (size_t)n);
+}
+
+static void emitNavOff() {
+  static const char kNavOff[] = "NAV OFF\n";
+  g_lastEmitNavIcon = 0;
+  g_lastEmitNavDist = 0xFFFFFFFFu;
+  g_lastEmitNavRoad[0] = '\0';
+  g_lastNavEmitMs = millis();
+  serialWriteLine(kNavOff, sizeof(kNavOff) - 1);
 }
 
 // Called strictly from loop() so SPLIM lines are never interleaved with other tasks
@@ -122,46 +273,20 @@ static void emitSplim(uint8_t limit) {
   serialWriteLine(buf, (size_t)n);
 }
 
-static uint8_t postedLimitFromCamera(const vmhud::Frame &frame, uint16_t &outDist, uint8_t &outType) {
-  outDist = 0;
-  outType = 0;
-  if (frame.command != 1 || frame.size < 4 || (frame.size % 4) != 0) {
-    return 0;
+// Called strictly from loop() so NEXTSPLIM lines never interleave with SPLIM/NAV lines.
+static void emitNextSplim(uint32_t alertId, uint8_t limit, uint16_t distM) {
+  if (alertId == 0 || limit < 5 || limit > 200) {
+    return;
   }
-  uint8_t pick = 0;
-  uint16_t pickDist = 0xFFFF;
-  uint8_t pickType = 0;
-
-  for (size_t i = 0; i < frame.size; i += 4) {
-    const uint8_t type = frame.payload[i];
-    const uint16_t dist = vmhud::be16(frame.payload + i + 1);
-    const uint8_t lim = frame.payload[i + 3];
-    if (lim < 5 || lim > 200) {
-      continue;
-    }
-    if (dist >= 60000) {
-      continue;
-    }
-    if (dist < pickDist) {
-      pickDist = dist;
-      pick = lim;
-      pickType = type;
-    }
+  char buf[40];
+  int n = snprintf(buf, sizeof(buf), "NEXTSPLIM %lu %u %u\n",
+                   (unsigned long)alertId, (unsigned)limit, (unsigned)distM);
+  if (n <= 0 || (size_t)n >= sizeof(buf)) {
+    return;
   }
-  if (pick) {
-    outDist = pickDist;
-    outType = pickType;
-    return pick;
-  }
-  for (size_t i = 0; i < frame.size; i += 4) {
-    const uint8_t lim = frame.payload[i + 3];
-    if (lim >= 5 && lim <= 200) {
-      outDist = vmhud::be16(frame.payload + i + 1);
-      outType = frame.payload[i];
-      return lim;
-    }
-  }
-  return 0;
+  g_lastNextEmitMs = millis();
+  g_lastNextEmitDist = distM;
+  serialWriteLine(buf, (size_t)n);
 }
 
 static void notifyInfo(const vmhud::Frame &request, NimBLECharacteristic *route) {
@@ -214,31 +339,138 @@ static void onFrame(const vmhud::Frame &frame, void *user) {
     }
     g_navPktCount.fetch_add(1, std::memory_order_relaxed);
     g_currentSpeed.store(nav.speed, std::memory_order_relaxed);
-    const String current = textUtf8(nav.current, nav.currentSize);
+
+    const bool navIdle = (nav.distance == 0xFFFFFFFFu) || (nav.direction == 0xFFu);
+    if (navIdle) {
+      {
+        std::lock_guard<std::mutex> guard(g_navMutex);
+        g_pendingNav.active = false;
+        g_pendingNav.hasNewJpeg = false;
+        g_pendingNav.jpegLen = 0;
+        g_pendingNav.road[0] = '\0';
+      }
+      g_navDirty.store(true, std::memory_order_release);
+#if VMHUD_HAS_DISPLAY
+      const String current = textUtf8(nav.current, nav.currentSize);
+      {
+        std::lock_guard<std::mutex> guard(g_roadMutex);
+        g_currentRoad = current;
+      }
+#endif
+      g_displayDirty.store(true, std::memory_order_relaxed);
+      debugLogf("[NAV] idle/end (dir=0x%02X dist=0x%lX)\n",
+                (unsigned)nav.direction, (unsigned long)nav.distance);
+      return;
+    }
+
+    char roadBuf[kMaxRoadBytes + 1];
+    if (nav.next && nav.nextSize > 0) {
+      sanitizeRoadUtf8(nav.next, nav.nextSize, roadBuf, sizeof(roadBuf));
+    } else {
+      roadBuf[0] = '\0';
+    }
+    if (!roadBuf[0] && nav.current && nav.currentSize > 0) {
+      sanitizeRoadUtf8(nav.current, nav.currentSize, roadBuf, sizeof(roadBuf));
+    }
+    {
+      std::lock_guard<std::mutex> guard(g_navMutex);
+      g_pendingNav.active = true;
+      g_pendingNav.distance = nav.distance;
+      strncpy(g_pendingNav.road, roadBuf, kMaxRoadBytes);
+      g_pendingNav.road[kMaxRoadBytes] = '\0';
+      if (nav.image && nav.imageSize >= 16) {
+        if (nav.imageSize <= kMaxJpegBytes) {
+          memcpy(g_pendingNav.jpeg, nav.image, nav.imageSize);
+          g_pendingNav.jpegLen = nav.imageSize;
+          g_pendingNav.hasNewJpeg = true;
+        } else {
+          debugLogf("[ARROW] jpeg oversize %u > %u\n",
+                    (unsigned)nav.imageSize, (unsigned)kMaxJpegBytes);
+        }
+      }
+    }
+    g_lastNavRxMs.store(millis(), std::memory_order_relaxed);
+    g_navDirty.store(true, std::memory_order_release);
+
+#if VMHUD_HAS_DISPLAY
     {
       std::lock_guard<std::mutex> guard(g_roadMutex);
-      g_currentRoad = current;
+      g_currentRoad = roadBuf[0] ? String(roadBuf) : textUtf8(nav.current, nav.currentSize);
     }
+#endif
     g_displayDirty.store(true, std::memory_order_relaxed);
-    debugLogf("[NAV] speed=%u cur=\"%s\"\n", (unsigned)nav.speed, current.c_str());
+    debugLogf("[NAV] cmd=0x%02X dist=%lu img=%u keep=%u road=\"%s\"\n",
+              (unsigned)frame.command, (unsigned long)nav.distance,
+              (unsigned)nav.imageSize, (unsigned)nav.keepImage, roadBuf);
     return;
   }
 
-  // Camera and speed limit (CMD 0x01, multiple of 4 bytes)
+  // Camera and speed limit (CMD 0x01, multiple of 4 bytes: current + optional upcoming slot)
   if (frame.command == 1 && frame.size >= 4 && (frame.size % 4) == 0) {
     g_camPktCount.fetch_add(1, std::memory_order_relaxed);
-    uint16_t dist = 0;
-    uint8_t type = 0;
-    const uint8_t lim = postedLimitFromCamera(frame, dist, type);
-    g_camDist.store(dist, std::memory_order_relaxed);
-    g_camType.store(type, std::memory_order_relaxed);
-    g_postedLimit.store(lim, std::memory_order_release);
-    if (lim >= 5 && lim <= 200) {
+    const uint8_t prevLim = g_postedLimit.load(std::memory_order_relaxed);
+    const vmhud::CameraParseResult cam = vmhud::parseCameraFrame(frame, prevLim);
+    g_camDist.store(cam.camDist, std::memory_order_relaxed);
+    g_camType.store(cam.camType, std::memory_order_relaxed);
+    g_postedLimit.store(cam.currentLimit, std::memory_order_release);
+    if (cam.currentLimit >= 5 && cam.currentLimit <= 200) {
       // Request prompt USB CDC transmission from loop() (<= 20 ms latency)
       g_splimForceEmit.store(true, std::memory_order_release);
     }
+    if (cam.nextLimit >= 5 && cam.nextLimit <= 200) {
+      g_camNextDist.store(cam.nextDist, std::memory_order_relaxed);
+      g_camNextRxMs.store(millis(), std::memory_order_relaxed);
+      g_camNextLimit.store(cam.nextLimit, std::memory_order_release);
+    } else {
+      g_camNextLimit.store(0, std::memory_order_release);
+      g_camNextDist.store(0, std::memory_order_relaxed);
+    }
     g_displayDirty.store(true, std::memory_order_relaxed);
-    debugLogf("[CAM] type=%u dist=%u limit=%u\n", (unsigned)type, (unsigned)dist, (unsigned)lim);
+    debugLogf("[CAM] type=%u dist=%u cur=%u next=%u(d=%u)\n",
+              (unsigned)cam.camType, (unsigned)cam.camDist,
+              (unsigned)cam.currentLimit, (unsigned)cam.nextLimit, (unsigned)cam.nextDist);
+    return;
+  }
+
+  // Custom camera alert with embedded image (CMD 0x41: [type, dist_be16, limit, imgLen_be32, ...])
+  if (frame.command == 0x41 && frame.size >= 8) {
+    const uint16_t dist = vmhud::be16(frame.payload + 1);
+    const uint8_t lim = frame.payload[3];
+    if (lim >= 5 && lim <= 200) {
+      g_customNextDist.store(dist < 60000u ? dist : 0u, std::memory_order_relaxed);
+      g_customNextRxMs.store(millis(), std::memory_order_relaxed);
+      g_customNextLimit.store(lim, std::memory_order_release);
+      debugLogf("[CAM41] dist=%u lim=%u\n", (unsigned)dist, (unsigned)lim);
+    }
+    return;
+  }
+
+  // Warning/sign overlay image (CMD 0x08: [posX_be16, posY_be16, JPEG...]).
+  // Offload JPEG decode to loop() so NimBLE task stack stays tiny.
+  if (frame.command == 0x08 && frame.size >= 20) {
+    const uint8_t *jpg = frame.payload + 4;
+    const size_t jpgLen = frame.size - 4;
+    if (jpg[0] == 0xFF && jpg[1] == 0xD8) {
+      if (jpgLen <= kMaxAlertImgBytes) {
+        {
+          std::lock_guard<std::mutex> guard(g_alertImgMutex);
+          memcpy(g_pendingAlertImg.jpeg, jpg, jpgLen);
+          g_pendingAlertImg.len = jpgLen;
+        }
+        g_alertImgCancel.store(false, std::memory_order_relaxed);
+        g_alertImgDirty.store(true, std::memory_order_release);
+      } else {
+        debugLogf("[SIGN] jpeg oversize %u > %u\n",
+                  (unsigned)jpgLen, (unsigned)kMaxAlertImgBytes);
+      }
+    }
+    return;
+  }
+
+  // Cancel overlay image (CMD 0x09)
+  if (frame.command == 0x09) {
+    g_alertImgDirty.store(false, std::memory_order_release);
+    g_alertImgCancel.store(true, std::memory_order_release);
     return;
   }
 
@@ -283,8 +515,24 @@ struct ServerCB : NimBLEServerCallbacks {
     g_postedLimit.store(0, std::memory_order_release);
     g_camDist.store(0, std::memory_order_relaxed);
     g_camType.store(0, std::memory_order_relaxed);
+    g_camNextLimit.store(0, std::memory_order_release);
+    g_camNextDist.store(0, std::memory_order_relaxed);
+    g_customNextLimit.store(0, std::memory_order_release);
+    g_customNextDist.store(0, std::memory_order_relaxed);
+    g_alertImgDirty.store(false, std::memory_order_release);
+    g_alertImgCancel.store(true, std::memory_order_release);
+    g_nextResetReq.store(true, std::memory_order_release);
     g_lastEmittedLimit.store(0, std::memory_order_relaxed);
     g_splimForceEmit.store(false, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> guard(g_navMutex);
+      g_pendingNav.active = false;
+      g_pendingNav.hasNewJpeg = false;
+      g_pendingNav.jpegLen = 0;
+      g_pendingNav.road[0] = '\0';
+    }
+    g_navDirty.store(false, std::memory_order_release);
+    g_navOffReq.store(true, std::memory_order_release);
     g_displayDirty.store(true, std::memory_order_relaxed);
     debugLogf("[BLE] disconnected reason=%d\n", reason);
     startConnectable();
@@ -306,11 +554,12 @@ struct SubscribeCB : NimBLECharacteristicCallbacks {
   }
 };
 
+template <size_t RxCap>
 struct WriteCB : NimBLECharacteristicCallbacks {
   NimBLECharacteristic *route;
   const char *label;
-  vmhud::Receiver<4096> *rx;
-  WriteCB(NimBLECharacteristic *r, const char *l, vmhud::Receiver<4096> *b) : route(r), label(l), rx(b) {}
+  vmhud::Receiver<RxCap> *rx;
+  WriteCB(NimBLECharacteristic *r, const char *l, vmhud::Receiver<RxCap> *b) : route(r), label(l), rx(b) {}
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &conn) override {
     if (conn.getConnHandle() != g_conn.load(std::memory_order_acquire)) {
       return;
@@ -369,6 +618,13 @@ void setup() {
     g_protocol = g_store.getString("protocol", g_protocol);
     g_sid = g_store.getString("sid", g_sid);
     g_adv = g_store.getString("adv", g_adv);
+    // VietMap iOS DJBTManager strips CMD 0x40 JPEG turn arrows whenever PROTOCOL
+    // contains "S" (e.g. legacy "2.2.2S"). Auto-migrate stale NVS to "2.2.2".
+    if (g_protocol.indexOf('S') >= 0 || g_protocol.indexOf('s') >= 0) {
+      g_protocol = "2.2.2";
+      g_store.putString("protocol", g_protocol);
+    }
+    g_store.end();
   }
 
   NimBLEDevice::init(std::string(g_name.c_str()));
@@ -379,18 +635,21 @@ void setup() {
   g_h1 = h1->createCharacteristic("FFF1", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
   g_h1->setCallbacks(new SubscribeCB());
   const uint32_t writable = NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR;
-  h1->createCharacteristic("FFF2", writable)->setCallbacks(new WriteCB(g_h1, "FFF2", &g_rxH1));
-  h1->createCharacteristic("FFF3", writable)->setCallbacks(new WriteCB(g_h1, "FFF3", &g_rxH1));
+  h1->createCharacteristic("FFF2", writable)->setCallbacks(new WriteCB<kRxBufCap>(g_h1, "FFF2", &g_rxH1));
+  h1->createCharacteristic("FFF3", writable)->setCallbacks(new WriteCB<kRxBufCap>(g_h1, "FFF3", &g_rxH1));
   h1->createCharacteristic("FFF4", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
   h1->start();
 
   NimBLEService *h50 = server->createService("FFFF");
   g_h50 = h50->createCharacteristic("1234", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
   g_h50->setCallbacks(new SubscribeCB());
-  h50->createCharacteristic("9ABC", writable)->setCallbacks(new WriteCB(g_h50, "9ABC", &g_rxH50));
+  h50->createCharacteristic("9ABC", writable)->setCallbacks(new WriteCB<512>(g_h50, "9ABC", &g_rxH50));
   h50->start();
 
   applyAdvertising();
+  // Seed alert ID from ESP32 hardware TRNG so a board reboot never collides with
+  // the CMU's last_seen_id_ on an ongoing CarPlay session.
+  g_nextAlertId = (esp_random() & 0x0FFFFFFFu) | 1u;
 }
 
 static void processCmuSerial() {
@@ -437,6 +696,101 @@ void loop() {
     }
   }
 
+  // Process VietMap BLE turn-by-turn navigation updates on loop() (safe stack for JPEG decode).
+  if (g_navOffReq.exchange(false, std::memory_order_acquire)) {
+    g_navGuiding = false;
+    g_navIcon = 0;
+    g_navDist = 0;
+    g_navRoad[0] = '\0';
+    g_lastJpegHash = 0;
+    g_lastJpegLen = 0;
+    emitNavOff();
+  }
+
+  // Shared single-task scratch buffer for loop() JPEG decoding (reused by both
+  // CMD 0x40 nav arrows and CMD 0x08 speed signs — saves 4 KB static SRAM).
+  static uint8_t jpegScratch[kMaxJpegBytes];
+
+  if (g_navDirty.exchange(false, std::memory_order_acquire)) {
+    bool     active = false;
+    uint32_t dist = 0;
+    char     roadCopy[kMaxRoadBytes + 1] = {0};
+    size_t   jpegLen = 0;
+    bool     hasJpeg = false;
+    {
+      std::lock_guard<std::mutex> guard(g_navMutex);
+      active = g_pendingNav.active;
+      dist = g_pendingNav.distance;
+      strncpy(roadCopy, g_pendingNav.road, kMaxRoadBytes);
+      roadCopy[kMaxRoadBytes] = '\0';
+      if (g_pendingNav.hasNewJpeg && g_pendingNav.jpegLen > 0) {
+        jpegLen = g_pendingNav.jpegLen;
+        memcpy(jpegScratch, g_pendingNav.jpeg, jpegLen);
+        hasJpeg = true;
+        g_pendingNav.hasNewJpeg = false;
+      }
+    }
+
+    if (!active) {
+      g_lastJpegHash = 0;
+      g_lastJpegLen = 0;
+      if (g_navGuiding) {
+        g_navGuiding = false;
+        g_navIcon = 0;
+        g_navDist = 0;
+        g_navRoad[0] = '\0';
+        emitNavOff();
+      }
+    } else {
+      if (hasJpeg) {
+        const uint32_t jhash = fnv1a32(jpegScratch, jpegLen);
+        if (jhash != g_lastJpegHash || jpegLen != g_lastJpegLen || g_navIcon == 0) {
+          g_lastJpegHash = jhash;
+          g_lastJpegLen = jpegLen;
+          vmhud::ArrowResult res;
+          if (vmhud::classifyJpeg(jpegScratch, jpegLen, res)) {
+            g_navIcon = res.icon;
+            debugLogf("[ARROW] icon=%u score=%.3f margin=%.3f\n",
+                      (unsigned)res.icon, res.score, res.margin);
+          } else {
+            debugLogf("[ARROW] weak/non-arrow score=%.3f margin=%.3f (keep=%u)\n",
+                      res.score, res.margin, (unsigned)g_navIcon);
+            if (g_navIcon == 0) g_navIcon = vmhud::kMazdaIconStraight;
+          }
+        }
+      } else if (g_navIcon == 0) {
+        g_navIcon = vmhud::kMazdaIconStraight;
+      }
+      g_navGuiding = true;
+      g_navDist = dist;
+      strncpy(g_navRoad, roadCopy, kMaxRoadBytes);
+      g_navRoad[kMaxRoadBytes] = '\0';
+
+      const bool changed = (g_navIcon != g_lastEmitNavIcon) ||
+                           (g_navDist != g_lastEmitNavDist) ||
+                           (strcmp(g_navRoad, g_lastEmitNavRoad) != 0);
+      if (changed) {
+        emitNav(g_navIcon, g_navDist, g_navRoad);
+      }
+    }
+  }
+
+  // Nav keepalive / staleness guard (while guiding)
+  if (g_navGuiding) {
+    if (now - g_lastNavRxMs.load(std::memory_order_relaxed) > kNavTimeoutMs) {
+      g_navGuiding = false;
+      g_navIcon = 0;
+      g_navDist = 0;
+      g_navRoad[0] = '\0';
+      g_lastJpegHash = 0;
+      g_lastJpegLen = 0;
+      emitNavOff();
+      debugLogf("[NAV] timeout -> NAV OFF\n");
+    } else if (now - g_lastNavEmitMs >= kNavKeepaliveMs) {
+      emitNav(g_navIcon, g_navDist, g_navRoad);
+    }
+  }
+
   // SPLIM USB serial keepalive / probe emission to CMU (single-task owned).
   if (lim >= 5 && lim <= 200) {
     const bool forceEmit = g_splimForceEmit.exchange(false, std::memory_order_acquire);
@@ -446,10 +800,108 @@ void loop() {
     }
   } else {
     g_splimForceEmit.store(false, std::memory_order_relaxed);
-    // When no limit is held from VietMap, poll CMU service every 2 s
-    if ((now - g_lastKeepaliveMs) >= kKeepaliveMs) {
+    // When neither limit nor nav is active, poll CMU service every 2 s
+    if (!g_navGuiding && (now - g_lastKeepaliveMs) >= kKeepaliveMs) {
       g_lastKeepaliveMs = now;
       serialWriteLine("PING\n", 5);
+    }
+  }
+
+  // Process upcoming ("next") speed limit alerts from CMD 0x01 / CMD 0x41 / CMD 0x08.
+  if (g_nextResetReq.exchange(false, std::memory_order_acquire)) {
+    g_imgNextLimit = 0;
+    g_lastAlertImgHash = 0;
+    g_lastAlertImgLen = 0;
+    g_latchedNextLimit = 0;
+    g_nextAbsentSinceMs = 0;
+  }
+  if (g_alertImgCancel.exchange(false, std::memory_order_acquire)) {
+    g_imgNextLimit = 0;
+    g_lastAlertImgHash = 0;
+    g_lastAlertImgLen = 0;
+  }
+  if (g_alertImgDirty.exchange(false, std::memory_order_acquire)) {
+    size_t alertLen = 0;
+    {
+      std::lock_guard<std::mutex> guard(g_alertImgMutex);
+      alertLen = g_pendingAlertImg.len;
+      if (alertLen > 0 && alertLen <= kMaxAlertImgBytes) {
+        memcpy(jpegScratch, g_pendingAlertImg.jpeg, alertLen);
+      } else {
+        alertLen = 0;
+      }
+    }
+    if (alertLen >= 16) {
+      const uint32_t h = fnv1a32(jpegScratch, alertLen);
+      if (h != g_lastAlertImgHash || alertLen != g_lastAlertImgLen) {
+        g_lastAlertImgHash = h;
+        g_lastAlertImgLen = alertLen;
+        const vmhud::SpeedSignMatch m = vmhud::classifySpeedSignJpeg(jpegScratch, alertLen);
+        g_imgNextLimit = m.limit;
+        if (m.limit != 0) {
+          g_imgNextRxMs = now;
+          debugLogf("[SIGN] speed=%u score=%.3f margin=%.3f\n",
+                    (unsigned)m.limit, m.score, m.margin);
+        } else {
+          debugLogf("[SIGN] non-speed score=%.3f margin=%.3f\n", m.score, m.margin);
+        }
+      } else if (g_imgNextLimit != 0) {
+        g_imgNextRxMs = now;
+      }
+    }
+  }
+
+  // Arbitrate upcoming speed-limit candidate across CMD 0x01 > CMD 0x41 > CMD 0x08.
+  uint8_t  candNextLim = 0;
+  uint16_t candNextDist = 0;
+  const uint8_t camNext = g_camNextLimit.load(std::memory_order_acquire);
+  if (camNext >= 5 && camNext <= 200 &&
+      (now - g_camNextRxMs.load(std::memory_order_relaxed)) <= kNextSourceStaleMs) {
+    candNextLim = camNext;
+    candNextDist = g_camNextDist.load(std::memory_order_relaxed);
+  } else {
+    const uint8_t c41Next = g_customNextLimit.load(std::memory_order_acquire);
+    if (c41Next >= 5 && c41Next <= 200 &&
+        (now - g_customNextRxMs.load(std::memory_order_relaxed)) <= kNextSourceStaleMs) {
+      candNextLim = c41Next;
+      candNextDist = g_customNextDist.load(std::memory_order_relaxed);
+    } else if (g_imgNextLimit >= 5 && g_imgNextLimit <= 200 &&
+               (now - g_imgNextRxMs) <= kNextSourceStaleMs) {
+      candNextLim = g_imgNextLimit;
+      candNextDist = 0;
+    }
+  }
+
+  // Edge-triggered alert ID latch: fires a NEW alert_id once per distinct upcoming speed limit.
+  if (candNextLim >= 5 && candNextLim <= 200 && candNextLim != lim) {
+    g_nextAbsentSinceMs = 0;
+    if (candNextLim != g_latchedNextLimit) {
+      if (++g_nextAlertId == 0) g_nextAlertId = 1;
+      g_latchedNextLimit = candNextLim;
+      emitNextSplim(g_nextAlertId, candNextLim, candNextDist);
+      debugLogf("[NEXT] trigger id=%lu lim=%u dist=%u (cur=%u)\n",
+                (unsigned long)g_nextAlertId, (unsigned)candNextLim,
+                (unsigned)candNextDist, (unsigned)lim);
+    } else {
+      const uint16_t distDiff = (candNextDist > g_lastNextEmitDist)
+                                    ? (candNextDist - g_lastNextEmitDist)
+                                    : (g_lastNextEmitDist - candNextDist);
+      if ((now - g_lastNextEmitMs) >= kNextReemitMs ||
+          (candNextDist != g_lastNextEmitDist &&
+           (candNextDist == 0 || g_lastNextEmitDist == 0 || distDiff >= 10u))) {
+        emitNextSplim(g_nextAlertId, candNextLim, candNextDist);
+      }
+    }
+  } else if (g_latchedNextLimit != 0) {
+    if (lim == g_latchedNextLimit) {
+      // Vehicle entered the new speed-limit zone -> release latch immediately.
+      g_latchedNextLimit = 0;
+      g_nextAbsentSinceMs = 0;
+    } else if (g_nextAbsentSinceMs == 0) {
+      g_nextAbsentSinceMs = now;
+    } else if ((now - g_nextAbsentSinceMs) >= kNextClearDebounceMs) {
+      g_latchedNextLimit = 0;
+      g_nextAbsentSinceMs = 0;
     }
   }
 

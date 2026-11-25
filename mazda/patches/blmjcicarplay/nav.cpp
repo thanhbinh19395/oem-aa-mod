@@ -586,8 +586,12 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
 
         Maneuver mv;
         if (mtype != 0) {
-            // Apple Maps / standard iAP2 mtype: skip idx0 (heading) and context types
-            if (idx == 0 || is_context_type(mtype)) return;
+            // Standard iAP2 CPManeuverType: skip context/heading entries (5=FollowRoad,
+            // 11=StartRoute, 18=StartRouteWithUTurn). Do NOT blindly drop idx==0: Apple Maps
+            // uses mtype 11/18/5 at idx 0 (already caught by is_context_type), whereas 3rd-party
+            // CPNavigationSession apps on iOS 17.4+ (e.g. Google Maps) populate maneuverType!=0
+            // directly on upcomingManeuvers[0] at idx==0!
+            if (is_context_type(mtype)) return;
             mv = classify(mtype, junction, jAngle, driveSide);
         } else {
             // mtype == 0: 3rd-party app (e.g. VietMap Live, Google Maps) using public CPManeuver.
@@ -621,22 +625,31 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
         // [BUILD-19] Re-paint with the last known imminent head so a fresh burst (recalc) updates the same
         // maneuver, and a stationary re-start paints before the next guidance frame. If the head isn't
         // buffered yet (mid-rebuild) select_by_head returns -1 -> keep the current display (no flash).
-        if (mtype == 0) {
+        if (mtype == 0 && g_buf[0].mtype == 0) {
             // [VIETMAP/3RD-PARTY] upcomingManeuvers[0] is always the imminent turn.
-            // Guidance active-maneuverList is omitted by iOS, so invalidate any stale Apple Maps
-            // head pointer and emit index 0 immediately.
+            // Only take over when this burst itself is a 3rd-party mtype==0 burst (so a
+            // stray mtype==0 entry inside an Apple Maps mtype!=0 burst cannot corrupt
+            // g_last_head_valid or flash EV_STRAIGHT).
             g_last_head_valid = false;
             g_last_head = 0;
             emit_selection(0);
         } else if (g_last_head_valid) {
             int sel = select_by_head(g_last_head);
-            if (sel >= 0) emit_selection(sel);
+            if (sel >= 0) {
+                emit_selection(sel);
+            } else if (g_buf[0].idx == 0) {
+                // Switched from Apple Maps (idx0 skipped -> g_buf[0].idx>=1, stale head>=2)
+                // to a 3rd-party CPNavigationSession app (e.g. Google Maps) that places its
+                // imminent turn at idx==0 with mtype!=0.
+                g_last_head_valid = false;
+                g_last_head = 0;
+                emit_selection(0);
+            }
         } else if (g_buf_count > 0) {
-            // [VIETMAP-FALLBACK] Some CarPlay Maps apps (notably VietMap) stream 0x8059
-            // maneuvers but leave the guidance active-maneuverList (iAP2 TLV 0x000D /
-            // @0x458,@0x656) empty. Without a head we previously never called
-            // emit_selection, so the HUD stayed blank forever. Bootstrap on the first
-            // displayable entry; a later real head (Apple Maps) still overrides.
+            // [3RD-PARTY FALLBACK] CarPlay CPNavigationSession apps (VietMap, Google Maps)
+            // stream 0x8059 maneuvers with upcomingManeuvers[0] at g_buf[0] and may leave the
+            // guidance active-maneuverList (iAP2 TLV 0x000D / @0x458,@0x656) empty. Bootstrap
+            // on g_buf[0]; an authoritative guidance head (Apple Maps) overrides on 0x8058.
             LOGD("nav MAN bootstrap sel=0 (no guidance head yet, buf=%d)", g_buf_count);
             emit_selection(0);
         }
@@ -657,9 +670,10 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
                 emit_selection(sel);
             }
             // sel < 0: head not buffered yet (mid-rebuild / transient ~0.2%) -> KEEP previous selection.
-        } else if (g_buf_count > 0 && (!g_last_head_valid || g_buf[0].mtype == 0)) {
-            // [VIETMAP-FALLBACK] Guidance distance ticks arrive, but maneuverList count is 0.
-            // If the buffered turn is 3rd-party (mtype == 0) or we have no valid head, paint sel 0.
+        } else if (g_buf_count > 0 && (!g_last_head_valid || g_buf[0].mtype == 0 || g_buf[0].idx == 0)) {
+            // [3RD-PARTY FALLBACK] Guidance distance ticks arrive, but maneuverList count is 0.
+            // Both mtype==0 apps (VietMap) and mtype!=0 CPNavigationSession apps (Google Maps on
+            // iOS 17.4+, where upcomingManeuvers[0] sits at idx==0) paint sel 0.
             g_last_head_valid = false;
             LOGD("nav GUIDE bootstrap sel=0 (maneuverList cnt=0, buf=%d)", g_buf_count);
             emit_selection(0);

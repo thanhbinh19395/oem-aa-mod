@@ -64,7 +64,7 @@ HUD_DIR       := ../mazda/patches/blmjciaapa/hud
 HOST_CXXFLAGS := -std=gnu++11 -O2 -Wall -Wextra -I$(HUD_DIR) -I../mazda/patches
 
 BUILD := build
-TOOLS := gsi_test lane_test nav16_test nav_carplay_test
+TOOLS := gsi_test lane_test nav16_test nav_carplay_test vietmap_ble_hud_test
 BINS  := $(addprefix $(BUILD)/,$(TOOLS))
 
 .PHONY: all clean $(TOOLS)
@@ -85,6 +85,10 @@ $(BUILD)/nav16_test: nav16_test.cpp $(HUD_DIR)/hud_nav16.cpp | $(BUILD)
 # nav_carplay_test is a HOST binary — exercises the CarPlay / VietMap iAP2 nav decoder.
 $(BUILD)/nav_carplay_test: nav_carplay_test.cpp ../mazda/patches/blmjcicarplay/nav.cpp | $(BUILD)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -I../mazda/patches/blmjcicarplay $^ -o $@
+
+# vietmap_ble_hud_test is a HOST binary — exercises ESP32 BLE CMD 0x40 codec & arrow classifier.
+$(BUILD)/vietmap_ble_hud_test: vietmap_ble_hud_test.cpp | $(BUILD)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -I../firmware/vmhud-esp32-s3/lib/vmhud $^ -o $@ -lm
 
 # Convenience: `make gsi_test` builds build/gsi_test.
 $(TOOLS): %: $(BUILD)/%

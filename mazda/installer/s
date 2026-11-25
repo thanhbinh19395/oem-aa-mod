@@ -1,5 +1,9 @@
 #!/bin/sh
 # Start SSH daemon and network for current session only (no persistence on reboot)
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
+mount -o rw,remount / 2>/dev/null || true
+MYDIR=$(dirname "$(readlink -f "$0")")
+mount -o rw,remount "${MYDIR}" 2>/dev/null || true
 
 # 1. Disable firewall to allow incoming traffic on wlan0, eth0, eth1
 [ -f /jci/scripts/jci-fw.sh ] && /jci/scripts/jci-fw.sh stop 2>/dev/null
@@ -32,12 +36,33 @@ else
   NET_INFO="Wi-Fi IP: ${CUR_IP}\n(Connected to shared hotspot)"
 fi
 
-# 3. Setup credentials & restart sshd with password authentication
-echo "root:mazda" | chpasswd 2>/dev/null
-echo "cmu:jci" | chpasswd 2>/dev/null
+# 3. Setup credentials & restart sshd (/etc/passwd is on /config-mfg on FW 74)
+mount -o rw,remount /config-mfg 2>/dev/null || true
+if [ -x /usr/sbin/chpasswd ]; then
+  echo "cmu:jci" | /usr/sbin/chpasswd || (echo jci; echo jci) | passwd cmu
+  echo "root:mazda" | /usr/sbin/chpasswd 2>/dev/null || (echo mazda; echo mazda) | passwd root 2>/dev/null || true
+else
+  (echo jci; echo jci) | passwd cmu
+  (echo mazda; echo mazda) | passwd root 2>/dev/null || true
+fi
+mount -o ro,remount /config-mfg 2>/dev/null || true
 killall -9 sshd 2>/dev/null
 sleep 0.5
-/usr/sbin/sshd -p 22 -p 36000 -o PasswordAuthentication=yes -o PermitRootLogin=yes 2>/dev/null
+/usr/sbin/sshd -p 22 -p 36000 -o PasswordAuthentication=yes -o PermitRootLogin=yes -o PermitEmptyPasswords=yes 2>/dev/null
+
+# Snapshot runtime HUD/nav logs to USB if writable
+DIAG_DIR="${MYDIR}/logs/diag"
+mkdir -p "${DIAG_DIR}" 2>/dev/null
+cp -f /tmp/carplay_bridge.log "${DIAG_DIR}/carplay_bridge.log" 2>/dev/null || true
+{
+  echo "=== DATE ==="; date
+  echo "=== PS ==="; ps w | grep -E "jciCARPLAY|splim_seriald|jciAAPA|jcinavi|aap_service"
+  echo "=== /tmp STATE ==="
+  for f in /tmp/vmnav /tmp/splim /tmp/splim_over /tmp/vmnextsplim; do
+    echo "--- $f ---"; ls -la "$f" 2>/dev/null; cat "$f" 2>/dev/null; echo ""
+  done
+} > "${DIAG_DIR}/cmu_nav_debug.txt" 2>&1
+sync
 
 # 4. Display notification
 killall -q jci-dialog 2>/dev/null

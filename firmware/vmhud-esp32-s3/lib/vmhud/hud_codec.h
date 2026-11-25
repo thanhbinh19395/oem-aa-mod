@@ -117,6 +117,9 @@ struct Nav {
     uint32_t distance=0, remainingDistance=0;
     const uint8_t *current=nullptr, *next=nullptr;
     size_t currentSize=0, nextSize=0;
+    const uint8_t *image=nullptr;
+    size_t imageSize=0;
+    bool keepImage=false;
     const char *layout="";
 };
 inline void tail(const uint8_t *p, Nav &v) {
@@ -126,10 +129,21 @@ inline void tail(const uint8_t *p, Nav &v) {
 inline bool variable(const uint8_t *p, size_t n, Nav &v, bool second=false) {
     if (n<(second?22u:17u)) return false;
     size_t distanceOffset=1;
+    const uint8_t *imgPtr=nullptr;
+    size_t imgSize=0;
+    bool keepImg=false;
     if (second) {
         const uint32_t image=be32(p+1);
-        if (image==1) { if (p[5]>1) return false;distanceOffset=6; }
-        else { if (image<2 || image>n-5) return false;distanceOffset=5+size_t(image); }
+        if (image==1) {
+            if (p[5]>1) return false;
+            keepImg=(p[5]==1);
+            distanceOffset=6;
+        } else {
+            if (image<2 || image>n-5) return false;
+            imgPtr=p+5;
+            imgSize=size_t(image);
+            distanceOffset=5+size_t(image);
+        }
     }
     if (n-distanceOffset<16) return false;
     size_t o=distanceOffset+4;
@@ -143,6 +157,7 @@ inline bool variable(const uint8_t *p, size_t n, Nav &v, bool second=false) {
     if (n-o!=10) return false;
     v.direction=p[0];v.distance=be32(p+distanceOffset);
     v.next=nextData;v.nextSize=next;v.current=currentData;v.currentSize=current;
+    v.image=imgPtr;v.imageSize=imgSize;v.keepImage=keepImg;
     tail(p+o,v);v.layout=second?"variable2":"variable1";
     return true;
 }
@@ -150,6 +165,7 @@ inline bool fixed(const uint8_t *p, size_t n, Nav &v) {
     if (n!=175) return false;
     v.direction=p[0];v.distance=be32(p+1);
     v.next=p+5;v.nextSize=80;v.current=p+85;v.currentSize=80;
+    v.image=nullptr;v.imageSize=0;v.keepImage=false;
     tail(p+165,v);v.layout="fixed";return true;
 }
 inline bool navigation(const Frame &frame, Nav &v) {
