@@ -17,6 +17,8 @@
 static constexpr uint8_t  kAdvInstHud      = 0;
 static constexpr uint8_t  kAdvInstWake     = 1;
 static constexpr uint32_t kVmUnsubGraceMs  = 1500;
+static constexpr uint32_t kVmSubReadyMs    = 400;
+static constexpr uint32_t kWakeRotateMs    = 4000;
 static constexpr uint32_t kCphKeepaliveMs  = 5000;
 static constexpr uint32_t kSignHoldStaleMs = 15000;
 static constexpr uint32_t kSignDistStaleMs = 8000;
@@ -54,7 +56,15 @@ static std::atomic<uint16_t> g_cphConn{BLE_HS_CONN_HANDLE_NONE};
 static std::atomic<bool> g_cphForceNotify{false};
 static std::atomic<bool> g_vmUnsubWatchdogActive{false};
 static std::atomic<uint32_t> g_vmUnsubWatchdogMs{0};
+static std::atomic<bool> g_vmSubArmed{false};
+static std::atomic<uint32_t> g_vmSubSinceMs{0};
+static std::atomic<bool> g_pendingHudInfo{false};
+static std::atomic<uint32_t> g_pendingHudInfoTs{0};
+static std::atomic<bool> g_pendingHudInfoLegacy{false};
+static std::atomic<bool> g_pendingHudInfoH50{false};
 static bool g_wakeAdvRunning = false;
+static uint32_t g_lastWakeRotateMs = 0;
+static uint32_t g_lastAdvCheckMs = 0;
 static vmhud::Receiver<kRxBufCap> g_rxH1;
 static vmhud::Receiver<512> g_rxH50;  // H50 GATT stub (option 2 future work); saves ~7.5 KB SRAM
 
@@ -321,14 +331,16 @@ static void emitNextSplim(uint32_t alertId, uint8_t limit, uint16_t distM) {
   serialWriteLine(buf, (size_t)n);
 }
 
-static void notifyInfo(const vmhud::Frame &request, NimBLECharacteristic *route) {
+static bool sendHudInfoReply(uint32_t timestamp, bool legacy, NimBLECharacteristic *route) {
+  if (route == nullptr) {
+    return false;
+  }
   const bool subscribed = route == g_h1 ? g_subH1.load(std::memory_order_relaxed)
                                         : g_subH50.load(std::memory_order_relaxed);
   const uint16_t connHandle = g_conn.load(std::memory_order_relaxed);
   if (!g_connected.load(std::memory_order_relaxed) || !subscribed ||
       connHandle == BLE_HS_CONN_HANDLE_NONE) {
-    debugLogf("[HUD] HUDInfo before notify subscribe\n");
-    return;
+    return false;
   }
   String info;
   {
@@ -338,22 +350,35 @@ static void notifyInfo(const vmhud::Frame &request, NimBLECharacteristic *route)
   }
   uint8_t frame[256];
   const size_t count =
-      vmhud::build(0x0e, (const uint8_t *)info.c_str(), info.length(), request.timestamp, frame,
-                   sizeof(frame), sdkChecksum, request.legacy);
+      vmhud::build(0x0e, (const uint8_t *)info.c_str(), info.length(), timestamp, frame,
+                   sizeof(frame), sdkChecksum, legacy);
   if (!count) {
     debugLogf("[HUD] HUDInfo build failed\n");
-    return;
+    return false;
   }
   for (size_t offset = 0; offset < count; offset += 20) {
     const size_t chunk = count - offset < 20 ? count - offset : 20;
     if (!route->notify(frame + offset, chunk, connHandle)) {
       debugLogf("[HUD] notify failed\n");
-      return;
+      return false;
     }
   }
-  g_hudInfoOk.store(true, std::memory_order_relaxed);
+  g_hudInfoOk.store(true, std::memory_order_release);
   g_displayDirty.store(true, std::memory_order_relaxed);
   debugLogf("[HUD] HUDInfo %u bytes\n", (unsigned)count);
+  return true;
+}
+
+static void notifyInfo(const vmhud::Frame &request, NimBLECharacteristic *route) {
+  if (!sendHudInfoReply(request.timestamp, request.legacy, route)) {
+    // On cached-GATT iOS reconnects, DJBTManager's WRITE_NR CMD 0x0E on FFF2 can arrive
+    // milliseconds before CCCD subscribe on FFF1; latch and replay as soon as FFF1 subscribes.
+    g_pendingHudInfoTs.store(request.timestamp, std::memory_order_relaxed);
+    g_pendingHudInfoLegacy.store(request.legacy, std::memory_order_relaxed);
+    g_pendingHudInfoH50.store(route == g_h50, std::memory_order_relaxed);
+    g_pendingHudInfo.store(true, std::memory_order_release);
+    debugLogf("[HUD] HUDInfo queued until notify subscribe\n");
+  }
 }
 
 static void onFrame(const vmhud::Frame &frame, void *user) {
@@ -362,6 +387,13 @@ static void onFrame(const vmhud::Frame &frame, void *user) {
   if (frame.command == 0x0e) {
     notifyInfo(frame, (NimBLECharacteristic *)user);
     return;
+  }
+
+  // DJBTManager retains self.hudInfo across BLE disconnects; any authenticated DJ frame
+  // proves VietMap Live is actively streaming on this link even if CMD 0x0E was not re-sent.
+  if (!g_hudInfoOk.load(std::memory_order_relaxed)) {
+    g_hudInfoOk.store(true, std::memory_order_release);
+    g_displayDirty.store(true, std::memory_order_relaxed);
   }
 
   if (frame.command == 0 || frame.command == 0x40) {
@@ -582,11 +614,16 @@ static void refreshWakeBeaconRandomAddr() {
   esp_fill_random(rnd.val, sizeof(rnd.val));
   rnd.val[5] |= 0xC0u;                     // BLE Core Spec static random MSB bits (11)
   rnd.val[0] = (rnd.val[0] & 0xFEu) | 0x02u;  // Guarantee lower 46 bits are neither all-0 nor all-1
-  ble_gap_ext_adv_set_addr(kAdvInstWake, &rnd);
+  const int rc = ble_gap_ext_adv_set_addr(kAdvInstWake, &rnd);
+  if (rc != 0) {
+    debugLogf("[WAKE] set_addr rc=%d\n", rc);
+  }
 }
 
 static void resetVietMapSessionState() {
   g_hudInfoOk.store(false, std::memory_order_release);
+  g_pendingHudInfo.store(false, std::memory_order_release);
+  g_vmSubArmed.store(false, std::memory_order_release);
   g_rxH1.reset();
   g_rxH50.reset();
   g_postedLimit.store(0, std::memory_order_release);
@@ -628,6 +665,8 @@ struct ServerCB : NimBLEServerCallbacks {
       g_conn.store(conn.getConnHandle(), std::memory_order_release);
       g_connected.store(true, std::memory_order_release);
       g_hudInfoOk.store(false, std::memory_order_relaxed);
+      g_pendingHudInfo.store(false, std::memory_order_relaxed);
+      g_vmSubArmed.store(false, std::memory_order_relaxed);
       g_subH1.store(false, std::memory_order_relaxed);
       g_subH50.store(false, std::memory_order_relaxed);
       g_vmUnsubWatchdogActive.store(false, std::memory_order_relaxed);
@@ -700,6 +739,10 @@ struct SubscribeCB : NimBLECharacteristicCallbacks {
         g_subH1.load(std::memory_order_relaxed) || g_subH50.load(std::memory_order_relaxed);
     if (nowVmSub) {
       g_vmUnsubWatchdogActive.store(false, std::memory_order_release);
+      if (!wasVmSub) {
+        g_vmSubSinceMs.store(millis(), std::memory_order_relaxed);
+        g_vmSubArmed.store(true, std::memory_order_release);
+      }
     } else if (wasVmSub && !nowVmSub) {
       resetVietMapSessionState();
       g_vmUnsubWatchdogMs.store(millis(), std::memory_order_relaxed);
@@ -719,7 +762,8 @@ struct WriteCB : NimBLECharacteristicCallbacks {
   WriteCB(NimBLECharacteristic *r, const char *l, vmhud::Receiver<RxCap> *b) : route(r), label(l), rx(b) {}
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &conn) override {
     const uint16_t h = conn.getConnHandle();
-    if (!g_connected.load(std::memory_order_acquire)) {
+    if (!g_connected.load(std::memory_order_acquire) ||
+        (!g_subH1.load(std::memory_order_relaxed) && !g_subH50.load(std::memory_order_relaxed))) {
       g_conn.store(h, std::memory_order_release);
       g_connected.store(true, std::memory_order_release);
     }
@@ -1114,29 +1158,41 @@ void loop() {
     }
   }
 
-  // Manage Instance 1 non-connectable FFF8 wakeup beacon.
-  const bool vmActive = g_connected.load(std::memory_order_relaxed) &&
-                        g_hudInfoOk.load(std::memory_order_acquire) &&
-                        (g_subH1.load(std::memory_order_relaxed) ||
-                         g_subH50.load(std::memory_order_relaxed));
-  const bool shouldWakeAdv = vmActive && !g_subCph.load(std::memory_order_acquire);
-  if (shouldWakeAdv && !g_wakeAdvRunning) {
-    // Rotate random beacon MAC on every session start so iOS CoreBluetooth background
-    // scanning (AllowDuplicates=false) never suppresses a new drive's wakeup packet.
-    refreshWakeBeaconRandomAddr();
-    if (NimBLEDevice::getAdvertising()->start(kAdvInstWake)) {
-      g_wakeAdvRunning = true;
-      debugLogf("[WAKE] FFF8 beacon started\n");
+  // Replay deferred HUDInfo (CMD 0x0E) if FFF2 write raced ahead of FFF1 CCCD subscribe on reconnect.
+  if (g_pendingHudInfo.load(std::memory_order_acquire)) {
+    NimBLECharacteristic *route =
+        g_pendingHudInfoH50.load(std::memory_order_relaxed) ? g_h50 : g_h1;
+    const bool subReady = route == g_h1 ? g_subH1.load(std::memory_order_relaxed)
+                                        : g_subH50.load(std::memory_order_relaxed);
+    if (!g_connected.load(std::memory_order_relaxed)) {
+      g_pendingHudInfo.store(false, std::memory_order_release);
+    } else if (subReady) {
+      g_pendingHudInfo.store(false, std::memory_order_release);
+      sendHudInfoReply(g_pendingHudInfoTs.load(std::memory_order_relaxed),
+                       g_pendingHudInfoLegacy.load(std::memory_order_relaxed), route);
     }
-  } else if (!shouldWakeAdv && g_wakeAdvRunning) {
-    NimBLEDevice::getAdvertising()->stop(kAdvInstWake);
-    g_wakeAdvRunning = false;
-    debugLogf("[WAKE] FFF8 beacon stopped\n");
   }
 
+  // Self-heal connectable VIETMAP-HUD advertising whenever no VietMap peer is connected.
+  if (!g_connected.load(std::memory_order_relaxed) && (now - g_lastAdvCheckMs) >= 2000u) {
+    g_lastAdvCheckMs = now;
+    if (!NimBLEDevice::getAdvertising()->isActive(kAdvInstHud)) {
+      startConnectable();
+    }
+  }
+
+  // Evaluate VietMap session readiness (either explicit HUDInfo/frame or 400ms post-FFF1 subscribe).
+  const bool vmSub = g_subH1.load(std::memory_order_relaxed) ||
+                     g_subH50.load(std::memory_order_relaxed);
+  const bool vmHandshakeOrGrace =
+      g_hudInfoOk.load(std::memory_order_acquire) ||
+      (vmSub && g_vmSubArmed.load(std::memory_order_acquire) &&
+       (now - g_vmSubSinceMs.load(std::memory_order_relaxed)) >= kVmSubReadyMs);
+  const bool vmActive = g_connected.load(std::memory_order_relaxed) && vmSub && vmHandshakeOrGrace;
+
   // Build and publish CarPlay Helper telemetry frame on FFF9 (READ | NOTIFY)
-  // BEFORE running the lingering-ACL disconnect watchdog so `vietmapConnected = false`
-  // is guaranteed to notify first.
+  // BEFORE starting the wakeup beacon or running the lingering-ACL disconnect watchdog so
+  // FFF9's value and notifications are always up to date first.
   if (g_cph != nullptr) {
     vmhud::CphTelemetryState cphSt{};
     cphSt.vietmapConnected = vmActive;
@@ -1220,11 +1276,41 @@ void loop() {
       if (cphH != BLE_HS_CONN_HANDLE_NONE &&
           (forceCph || vmhud::isCphSemanticChange(g_lastCphNotified, cphSt) ||
            (now - g_lastCphNotifyMs) >= kCphKeepaliveMs)) {
-        g_cph->notify(g_lastCphWire, g_lastCphWireLen, cphH);
-        g_lastCphNotified = cphSt;
-        g_lastCphNotifyMs = now;
+        if (g_cph->notify(g_lastCphWire, g_lastCphWireLen, cphH)) {
+          g_lastCphNotified = cphSt;
+          g_lastCphNotifyMs = now;
+        } else if (forceCph) {
+          g_cphForceNotify.store(true, std::memory_order_release);
+        }
       }
     }
+  }
+
+  // Manage Instance 1 non-connectable FFF8 wakeup beacon.
+  // Rotate static random MAC on start and every 4s while FFF9 remains unsubscribed so iOS
+  // background scanning (AllowDuplicates=false) always wakes CarPlay Helper reliably on reconnect.
+  const bool shouldWakeAdv = vmActive && !g_subCph.load(std::memory_order_acquire);
+  if (shouldWakeAdv && !g_wakeAdvRunning) {
+    NimBLEDevice::getAdvertising()->stop(kAdvInstWake);
+    refreshWakeBeaconRandomAddr();
+    if (NimBLEDevice::getAdvertising()->start(kAdvInstWake)) {
+      g_wakeAdvRunning = true;
+      g_lastWakeRotateMs = now;
+      debugLogf("[WAKE] FFF8 beacon started\n");
+    }
+  } else if (shouldWakeAdv && g_wakeAdvRunning && (now - g_lastWakeRotateMs) >= kWakeRotateMs) {
+    NimBLEDevice::getAdvertising()->stop(kAdvInstWake);
+    refreshWakeBeaconRandomAddr();
+    if (NimBLEDevice::getAdvertising()->start(kAdvInstWake)) {
+      g_lastWakeRotateMs = now;
+      debugLogf("[WAKE] FFF8 beacon rotated\n");
+    } else {
+      g_wakeAdvRunning = false;
+    }
+  } else if (!shouldWakeAdv && g_wakeAdvRunning) {
+    NimBLEDevice::getAdvertising()->stop(kAdvInstWake);
+    g_wakeAdvRunning = false;
+    debugLogf("[WAKE] FFF8 beacon stopped\n");
   }
 
   // Enforce 1.5s lingering-ACL disconnect watchdog when VietMap Live unsubscribes FFF1.
