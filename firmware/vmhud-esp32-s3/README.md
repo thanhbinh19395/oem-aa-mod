@@ -7,17 +7,28 @@ Supports both **Headless** (Super Mini) and **Display** hardware (LilyGO T-Displ
 ```text
 VietMap Live (iOS)
       --BLE FFF0-->  ESP32 (this firmware)  [Optional Screen: Telemetry & CMU TX status]
+      --BLE FFF8-->  CarPlay Helper (same iPhone, shared ACL link + non-connectable FFF8 wakeup beacon)
       --USB CDC-->   CMU /dev/ttyACM*  →  splim_seriald  →  /data_persist/splim
       -->            libpatch-blmjcicarplay  →  Mazda HUD (Active Driving Display)
 ```
 
-Wire format (one line, 115200 baud):
+Wire format on USB CDC (one line, 115200 baud):
 
 ```text
 SPLIM 60
+NEXTSPLIM 42 50 250
+NAV 3 180 Nguyen Van Linh
 ```
 
-Keepalive: the same line is re-sent every **2 s** while a valid limit is held (CMU `read_splim()` drops values older than 8 s).
+Keepalive: `SPLIM` is re-sent every **2 s** while a valid limit is held (CMU `read_splim()` drops values older than 8 s).
+
+## CarPlay Helper BLE Telemetry (`FFF8` / `FFF9`)
+
+Alongside the VietMap HUD service (`FFF0`), the firmware exposes GATT service **`FFF8`** with characteristic **`FFF9`** (`READ | NOTIFY`) so **CarPlay Helper** running on the **same iPhone** can display posted speed limits, upcoming speed limits, and prohibition/warning signs (with `<= 500 m` approaching distance countdowns) inside its CarPlay Dashboard Live Activity alongside 4-tire TPMS data:
+
+- **Single-iPhone Shared ACL Coexistence**: Instance 0 advertises connectable `VIETMAP-HUD` (`FFF0` / `FFFF`, never `FFF8`) so `VietMap Live` always connects unimpeded. Once `VietMap Live` completes the `HUDInfo` (`CMD 0x0E`) handshake and `FFF9` is not yet subscribed, Extended Advertising Instance 1 broadcasts a **non-connectable** `FFF8` beacon (`ADV_NONCONN_IND` on a static random address) to wake `CarPlay Helper` in the background. `CarPlay Helper` attaches via `retrieveConnectedPeripherals(withServices: [FFF0, FFF8])`, sharing iOS `bluetoothd`'s single physical BLE ACL link.
+- **Clean Disconnect Release**: If `VietMap Live` unsubscribes `FFF1`, the firmware immediately notifies `FFF9` with `vietmapConnected = false` so `CarPlay Helper` cancels its peripheral reference, enforces a `1.5 s` lingering-ACL disconnect watchdog, and restarts connectable `VIETMAP-HUD` advertising.
+- **Compact `0xA7` Frame (`13..28` Bytes)**: `[0]=0xA7`, `[1]=10+textLen`, `[2]=flags (bit0:vietmapConnected, bit1:overspeed, bit2:navActive, bit3:cmuConnected)`, `[3]=postedSpeedLimit`, `[4]=currentSpeed`, `[5]=upcomingSpeedLimit`, `[6..7]=upcomingSpeedDistM (u16be)`, `[8]=activeSignCode`, `[9..10]=activeSignDistM (u16be)`, `[11]=textLen (0..15)`, `[12..]=activeSignText (raw UTF-8 from CMD 0x06)`, `[last]=XOR`. Notified immediately on semantic changes and every `5 s` as a keepalive.
 
 ## Boards & Environments
 

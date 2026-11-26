@@ -44,12 +44,20 @@ struct ArrowResult {
 struct Box16Accumulator {
     uint32_t sum[256];
     uint16_t cnt[256];
+    int32_t  rbSum[64];
+    uint16_t rbCnt[64];
     uint32_t imgW;
     uint32_t imgH;
+    bool     trackChroma;
 
-    void reset(uint32_t w, uint32_t h) {
+    void reset(uint32_t w, uint32_t h, bool enableChroma = false) {
         memset(sum, 0, sizeof(sum));
         memset(cnt, 0, sizeof(cnt));
+        trackChroma = enableChroma;
+        if (enableChroma) {
+            memset(rbSum, 0, sizeof(rbSum));
+            memset(rbCnt, 0, sizeof(rbCnt));
+        }
         imgW = w;
         imgH = h;
     }
@@ -68,12 +76,40 @@ struct Box16Accumulator {
                 uint32_t x = left + i;
                 dxMap[i] = (x < imgW) ? static_cast<uint8_t>((x * 16u) / imgW) : 0xFFu;
             }
+            if (!trackChroma) {
+                for (uint32_t y = top; y <= bottom; ++y) {
+                    if (y >= imgH) {
+                        p += rw * 3u;
+                        continue;
+                    }
+                    const uint32_t rowBase = ((y * 16u) / imgH) * 16u;
+                    for (uint32_t i = 0; i < rw; ++i) {
+                        const uint32_t r = p[0];
+                        const uint32_t g = p[1];
+                        const uint32_t b = p[2];
+                        p += 3;
+                        const uint8_t dx = dxMap[i];
+                        if (dx == 0xFFu) continue;
+                        const uint32_t idx = rowBase + dx;
+                        sum[idx] += (77u * r + 150u * g + 29u * b) >> 8;
+                        cnt[idx] += 1u;
+                    }
+                }
+                return;
+            }
+
+            uint8_t dx8Map[16];
+            for (uint32_t i = 0; i < rw; ++i) {
+                dx8Map[i] = (dxMap[i] != 0xFFu) ? static_cast<uint8_t>(dxMap[i] >> 1) : 0xFFu;
+            }
             for (uint32_t y = top; y <= bottom; ++y) {
                 if (y >= imgH) {
                     p += rw * 3u;
                     continue;
                 }
-                const uint32_t rowBase = ((y * 16u) / imgH) * 16u;
+                const uint32_t dy16     = (y * 16u) / imgH;
+                const uint32_t rowBase  = dy16 * 16u;
+                const uint32_t row8Base = (dy16 >> 1) * 8u;
                 for (uint32_t i = 0; i < rw; ++i) {
                     const uint32_t r = p[0];
                     const uint32_t g = p[1];
@@ -85,6 +121,9 @@ struct Box16Accumulator {
                     const uint32_t idx = rowBase + dx;
                     sum[idx] += luma;
                     cnt[idx] += 1u;
+                    const uint32_t idx8 = row8Base + dx8Map[i];
+                    rbSum[idx8] += static_cast<int32_t>(r) - static_cast<int32_t>(b);
+                    rbCnt[idx8] += 1u;
                 }
             }
             return;
@@ -96,7 +135,9 @@ struct Box16Accumulator {
                 p += rw * 3u;
                 continue;
             }
-            const uint32_t rowBase = ((y * 16u) / imgH) * 16u;
+            const uint32_t dy16     = (y * 16u) / imgH;
+            const uint32_t rowBase  = dy16 * 16u;
+            const uint32_t row8Base = (dy16 >> 1) * 8u;
             for (uint32_t x = left; x <= right; ++x) {
                 const uint32_t r = p[0];
                 const uint32_t g = p[1];
@@ -108,6 +149,11 @@ struct Box16Accumulator {
                 const uint32_t idx = rowBase + dx;
                 sum[idx] += luma;
                 cnt[idx] += 1u;
+                if (trackChroma) {
+                    const uint32_t idx8 = row8Base + (dx >> 1);
+                    rbSum[idx8] += static_cast<int32_t>(r) - static_cast<int32_t>(b);
+                    rbCnt[idx8] += 1u;
+                }
             }
         }
     }
@@ -115,6 +161,16 @@ struct Box16Accumulator {
     void finalize(uint8_t outLuma[256]) const {
         for (size_t i = 0; i < 256; ++i) {
             outLuma[i] = cnt[i] ? static_cast<uint8_t>(sum[i] / cnt[i]) : 0u;
+        }
+    }
+
+    void finalizeChroma8(int8_t outRb8[64]) const {
+        for (size_t i = 0; i < 64; ++i) {
+            int32_t v = rbCnt[i] ? (rbSum[i] / static_cast<int32_t>(rbCnt[i])) : 0;
+            int32_t half = v / 2;
+            if (half < -127) half = -127;
+            if (half > 127)  half = 127;
+            outRb8[i] = static_cast<int8_t>(half);
         }
     }
 };
@@ -240,11 +296,10 @@ inline uint32_t jpegOutputCb(esp_rom_tjpgd_dec_t *dec, void *bitmap, esp_rom_tjp
 
 } // namespace detail
 
-// Decode a baseline JPEG into a 16x16 grayscale luma grid using ESP32 ROM TJpgDec.
-// Must be called single-threaded from loop() (never from NimBLE host task).
-// Shared static work/ctx buffers keep stack usage minimal (~600 B) and avoid
-// duplicating the ~4.5 KB TJpgDec workspace across arrow & speed-sign classifiers.
-inline bool decodeJpegToLuma16(const uint8_t *jpeg, size_t len, uint8_t outLuma[256]) {
+// Decode a baseline JPEG into a 16x16 grayscale luma grid (and optional 8x8 R-B chroma grid)
+// using ESP32 ROM TJpgDec. Must be called single-threaded from loop() (never from NimBLE host task).
+inline bool decodeJpegToLuma16Chroma8(const uint8_t *jpeg, size_t len,
+                                      uint8_t outLuma[256], int8_t *outRb8) {
     if (!jpeg || len < 16 || jpeg[0] != 0xFF || jpeg[1] != 0xD8) {
         return false;
     }
@@ -261,12 +316,19 @@ inline bool decodeJpegToLuma16(const uint8_t *jpeg, size_t len, uint8_t outLuma[
     if (dec.width == 0 || dec.height == 0 || dec.width > 512 || dec.height > 512) {
         return false;
     }
-    s_ctx.acc.reset(dec.width, dec.height);
+    s_ctx.acc.reset(dec.width, dec.height, outRb8 != nullptr);
     if (esp_rom_tjpgd_decomp(&dec, detail::jpegOutputCb, 0) != JDR_OK) {
         return false;
     }
     s_ctx.acc.finalize(outLuma);
+    if (outRb8) {
+        s_ctx.acc.finalizeChroma8(outRb8);
+    }
     return true;
+}
+
+inline bool decodeJpegToLuma16(const uint8_t *jpeg, size_t len, uint8_t outLuma[256]) {
+    return decodeJpegToLuma16Chroma8(jpeg, len, outLuma, nullptr);
 }
 
 // Decode a baseline JPEG (e.g. VietMap CMD 0x40 arrow) using ESP32 ROM TJpgDec

@@ -14,6 +14,8 @@
 #include "hud_codec.h"
 #include "arrow_classifier.h"
 #include "speed_sign_classifier.h"
+#include "traffic_sign_classifier.h"
+#include "cph_telemetry.h"
 #include "blmjcicarplay/hud/next_splim_policy.h"
 #include "common/translit.h"
 
@@ -377,6 +379,171 @@ int main()
             if (ch == '?' || ch >= 0xE0u) { all_hud_safe = false; break; }
         }
         CHECK(all_hud_safe, "folded label contains zero unrenderable >=U+0800 code points");
+    }
+
+    printf("\n=== Test 11: Traffic/prohibition sign classifier across all %zu templates ===\n",
+           vmhud::kTrafficSignTemplateCount);
+    {
+        CHECK(vmhud::kTrafficSignTemplateCount >= 20, "traffic sign template bank populated (>=20)");
+        size_t matched = 0;
+        for (size_t t = 0; t < vmhud::kTrafficSignTemplateCount; ++t) {
+            const vmhud::TrafficSignTemplate &tmpl = vmhud::kTrafficSignTemplates[t];
+            uint8_t luma[256];
+            int8_t rb8[64];
+            for (size_t i = 0; i < 256; ++i) {
+                int v = 128 + static_cast<int>(tmpl.vec[i]);
+                if (v < 0) v = 0;
+                if (v > 255) v = 255;
+                luma[i] = static_cast<uint8_t>(v);
+            }
+            for (size_t j = 0; j < 64; ++j) {
+                int v = static_cast<int>(lroundf(float(tmpl.vec[256 + j]) / 1.5f));
+                if (v < -127) v = -127;
+                if (v > 127) v = 127;
+                rb8[j] = static_cast<int8_t>(v);
+            }
+            auto m = vmhud::classifyAlertGrids(luma, rb8);
+            if (m.speedLimit == 0 && m.signCode == tmpl.signCode && m.score >= 0.98f && m.margin >= 0.04f) {
+                matched++;
+            } else {
+                printf("  MISS traffic[%zu] want=0x%02X got=0x%02X (spd=%u) score=%.4f margin=%.4f\n",
+                       t, (unsigned)tmpl.signCode, (unsigned)m.signCode, (unsigned)m.speedLimit,
+                       m.score, m.margin);
+            }
+        }
+        CHECK_EQ_U(matched, vmhud::kTrafficSignTemplateCount,
+                   "all prohibition/area/camera sign templates self-match without cross-class confusion");
+
+        uint8_t blankLuma[256] = {0};
+        int8_t blankRb[64] = {0};
+        auto blankRes = vmhud::classifyAlertGrids(blankLuma, blankRb);
+        CHECK_EQ_U(blankRes.signCode, vmhud::kSignNone, "blank image rejected by traffic sign classifier");
+    }
+
+    printf("\n=== Test 12: CMD 0x06 approaching distance text parser & CMD 0x07/0x47 clear ===\n");
+    {
+        auto makeCmd06 = [](const char *txt, std::vector<uint8_t> &buf) -> vmhud::Frame {
+            buf.assign(9, 0);
+            buf[0] = 0x00; buf[1] = 0x20; // posX
+            buf[2] = 0x00; buf[3] = 0x40; // posY
+            buf[4] = 0x02;                // font
+            buf[6] = 0xFF; buf[7] = 0xFF; buf[8] = 0xFF; // RGB
+            size_t n = strlen(txt);
+            buf.insert(buf.end(), txt, txt + n);
+            buf.push_back(0x00);
+            vmhud::Frame f;
+            f.command = 0x06;
+            f.payload = buf.data();
+            f.size = buf.size();
+            return f;
+        };
+
+        std::vector<uint8_t> b;
+        char txt[vmhud::kMaxOverlayTextBytes + 1];
+        CHECK(vmhud::extractOverlayText(makeCmd06("250 m", b), txt, sizeof(txt)) &&
+                  strcmp(txt, "250 m") == 0,
+              "CMD 0x06 '250 m' forwarded verbatim");
+        CHECK(vmhud::extractOverlayText(makeCmd06("150m", b), txt, sizeof(txt)) &&
+                  strcmp(txt, "150m") == 0,
+              "CMD 0x06 '150m' forwarded verbatim");
+        CHECK(vmhud::extractOverlayText(makeCmd06("  1.2 km \n", b), txt, sizeof(txt)) &&
+                  strcmp(txt, "1.2 km") == 0,
+              "CMD 0x06 '  1.2 km \\n' trimmed verbatim -> '1.2 km'");
+        CHECK(vmhud::extractOverlayText(makeCmd06("0,85km", b), txt, sizeof(txt)) &&
+                  strcmp(txt, "0,85km") == 0,
+              "CMD 0x06 '0,85km' forwarded verbatim");
+        CHECK(!vmhud::extractOverlayText(makeCmd06("   ", b), txt, sizeof(txt)),
+              "CMD 0x06 blank string ignored");
+
+        vmhud::Frame clr7; clr7.command = 0x07;
+        vmhud::Frame clr47; clr47.command = 0x47;
+        CHECK(vmhud::isOverlayTextClear(clr7) && vmhud::isOverlayTextClear(clr47),
+              "CMD 0x07 and 0x47 recognized as overlay text clear");
+    }
+
+    printf("\n=== Test 13: CPH FFF9 binary frame codec (with raw CMD 0x06 text), XOR, overspeed & buckets ===\n");
+    {
+        vmhud::CphTelemetryState st;
+        st.vietmapConnected = true;
+        st.postedSpeedLimit = 60;
+        st.currentSpeed = 61;
+        st.overspeed = vmhud::evaluateOverspeed(60, 61, false);
+        CHECK(!st.overspeed, "61 km/h on 60 limit does not trigger overspeed (+2 hysteresis)");
+        st.currentSpeed = 63;
+        st.overspeed = vmhud::evaluateOverspeed(60, 63, st.overspeed);
+        CHECK(st.overspeed, "63 km/h on 60 limit triggers overspeed");
+        st.currentSpeed = 61;
+        st.overspeed = vmhud::evaluateOverspeed(60, 61, st.overspeed);
+        CHECK(st.overspeed, "61 km/h stays overspeed until <= 60");
+        st.currentSpeed = 60;
+        st.overspeed = vmhud::evaluateOverspeed(60, 60, st.overspeed);
+        CHECK(!st.overspeed, "60 km/h clears overspeed");
+
+        st.upcomingSpeedLimit = 50;
+        st.upcomingSpeedDistM = 295;
+        st.activeSignCode = vmhud::kSignNoLeftTurn;
+        st.activeSignDistM = 0;
+        strcpy(st.activeSignText, "1.2 km");
+
+        uint8_t wire[vmhud::kCphMaxFrameBytes];
+        const size_t wireLen = vmhud::encodeCphFrame(st, wire);
+        CHECK_EQ_U(wire[0], 0xA7, "magic byte 0xA7");
+        CHECK_EQ_U(wireLen, 13 + 6, "frame len 19 bytes (13 + '1.2 km')");
+
+        vmhud::CphTelemetryState dec;
+        CHECK(vmhud::decodeCphFrame(wire, wireLen, dec), "valid CPH frame with raw text decoded");
+        CHECK(dec.vietmapConnected && !dec.overspeed, "flags round-tripped");
+        CHECK_EQ_U(dec.postedSpeedLimit, 60, "postedSpeedLimit=60");
+        CHECK_EQ_U(dec.upcomingSpeedLimit, 50, "upcomingSpeedLimit=50");
+        CHECK_EQ_U(dec.upcomingSpeedDistM, 295, "upcomingSpeedDistM=295");
+        CHECK_EQ_U(dec.activeSignCode, vmhud::kSignNoLeftTurn, "activeSignCode=noLeftTurn");
+        CHECK(strcmp(dec.activeSignText, "1.2 km") == 0, "activeSignText='1.2 km' round-tripped");
+
+        // Identical raw text + 1 km/h GPS drift suppressed
+        vmhud::CphTelemetryState nextTick = st;
+        nextTick.currentSpeed = 59;
+        CHECK(!vmhud::isCphSemanticChange(st, nextTick),
+              "identical raw text & 1 km/h GPS drift suppressed");
+
+        // Changing raw CMD 0x06 text triggers notification
+        strcpy(nextTick.activeSignText, "250 m");
+        CHECK(vmhud::isCphSemanticChange(st, nextTick),
+              "changed raw CMD 0x06 text triggers semantic change");
+
+        // Corrupt XOR checksum byte -> rejected
+        wire[wireLen - 1] ^= 0xFF;
+        CHECK(!vmhud::decodeCphFrame(wire, wireLen, dec), "corrupted XOR byte rejected");
+
+        // Verify CMD 0x01 Slot 0 camera alert extraction vs Slot 1 dummy 100m posted limit
+        auto checkCmd01Alert = [](const uint8_t *payload, size_t n, uint8_t prevLim,
+                                  uint8_t &outSign, uint16_t &outDist) -> bool {
+            vmhud::Frame f;
+            f.command = 1;
+            f.payload = payload;
+            f.size = n;
+            const vmhud::CameraParseResult cam = vmhud::parseCameraFrame(f, prevLim);
+            return vmhud::extractCmd01CameraAlert(f, cam, outSign, outDist);
+        };
+        uint8_t cSign = 0;
+        uint16_t cDist = 0;
+        // 1) Ordinary 60 km/h road, no camera in Slot 0, Slot 1 has dummy 100m
+        const uint8_t roadOnly[8] = {0, 0x00, 0x00, 0, 1, 0x00, 0x64, 60};
+        CHECK(!checkCmd01Alert(roadOnly, 8, 60, cSign, cDist),
+              "CMD 0x01 ordinary road (Slot 1 dummy 100m) does not false-trigger camera sign");
+        // 2) Same-limit speed camera at 350m on 60 km/h road
+        const uint8_t spdCam[8] = {1, 0x01, 0x5E, 60, 1, 0x00, 0x64, 60};
+        CHECK(checkCmd01Alert(spdCam, 8, 60, cSign, cDist) &&
+                  cSign == vmhud::kSignSpeedCamera && cDist == 350,
+              "CMD 0x01 same-limit speed camera -> kSignSpeedCamera 350m");
+        // 3) Red-light/traffic camera (type=2, lim=0) at 220m on 60 km/h road
+        const uint8_t trfCam[8] = {2, 0x00, 0xDC, 0, 1, 0x00, 0x64, 60};
+        CHECK(checkCmd01Alert(trfCam, 8, 60, cSign, cDist) &&
+                  cSign == vmhud::kSignTrafficCamera && cDist == 220,
+              "CMD 0x01 red-light camera -> kSignTrafficCamera 220m");
+        // 4) Upcoming 50 km/h zone at 300m on 60 km/h road -> owned by upcomingSpeedLimit, not camera sign
+        const uint8_t nextZone[8] = {1, 0x01, 0x2C, 50, 1, 0x00, 0x64, 60};
+        CHECK(!checkCmd01Alert(nextZone, 8, 60, cSign, cDist),
+              "CMD 0x01 upcoming 50 km/h zone yields to upcomingSpeedLimit");
     }
 
     if (g_fail) {

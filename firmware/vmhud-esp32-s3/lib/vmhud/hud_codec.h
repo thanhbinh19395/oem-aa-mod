@@ -173,4 +173,56 @@ inline bool navigation(const Frame &frame, Nav &v) {
     if (frame.command!=0) return false;
     return frame.legacy?fixed(frame.payload,frame.size,v):variable(frame.payload,frame.size,v);
 }
+
+static constexpr size_t kMaxOverlayTextBytes = 15;
+
+// Extract VietMap iOS CMD 0x06 (`sendTextWithPositionX:andPositionY:andFont:andColor:andText:`)
+// payload: [posX:u16be, posY:u16be, font:u8, 0x00, r:u8, g:u8, b:u8, utf8_str..., 0x00]
+// directly as a trimmed raw UTF-8 string (e.g. "250 m", "1.2 km", "0,8km") without converting to meters.
+inline bool extractOverlayText(const Frame &frame, char *outText, size_t cap) {
+    if (!outText || cap < 2) return false;
+    outText[0] = '\0';
+    if (frame.command != 0x06 || frame.size < 10 || !frame.payload) return false;
+
+    const uint8_t *s = frame.payload + 9;
+    const size_t maxLen = frame.size - 9;
+    size_t len = 0;
+    while (len < maxLen && s[len] != 0) ++len;
+    if (len == 0) return false;
+
+    // Trim leading whitespace/control chars
+    size_t start = 0;
+    while (start < len && (s[start] <= 0x20 || s[start] == 0x7F)) ++start;
+    while (len > start && (s[len - 1] <= 0x20 || s[len - 1] == 0x7F)) --len;
+    if (start >= len) return false;
+
+    size_t o = 0;
+    for (size_t i = start; i < len && o + 1 < cap; ++i) {
+        const uint8_t c = s[i];
+        if (c < 0x20 || c == 0x7F) {
+            if (o > 0 && outText[o - 1] != ' ') outText[o++] = ' ';
+        } else {
+            outText[o++] = static_cast<char>(c);
+        }
+    }
+
+    // Back off cleanly if truncated mid-UTF-8 multi-byte sequence
+    if (o > 0 && o + 1 == cap && (start + o) < len) {
+        size_t k = o;
+        while (k > 0 && (static_cast<uint8_t>(outText[k - 1]) & 0xC0u) == 0x80u) --k;
+        if (k > 0) {
+            const uint8_t lead = static_cast<uint8_t>(outText[k - 1]);
+            const size_t need = (lead < 0x80u) ? 1u : ((lead & 0xE0u) == 0xC0u) ? 2u :
+                                ((lead & 0xF0u) == 0xE0u) ? 3u : 4u;
+            if (o - (k - 1) < need) o = k - 1;
+        }
+    }
+    while (o > 0 && outText[o - 1] == ' ') --o;
+    outText[o] = '\0';
+    return o > 0;
+}
+
+inline bool isOverlayTextClear(const Frame &frame) {
+    return frame.command == 0x07 || frame.command == 0x47;
+}
 } // namespace vmhud

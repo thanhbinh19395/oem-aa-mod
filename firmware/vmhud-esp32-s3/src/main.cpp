@@ -10,7 +10,16 @@
 #include "hud_codec.h"
 #include "arrow_classifier.h"
 #include "speed_sign_classifier.h"
+#include "traffic_sign_classifier.h"
+#include "cph_telemetry.h"
 #include "display_ui.h"
+
+static constexpr uint8_t  kAdvInstHud      = 0;
+static constexpr uint8_t  kAdvInstWake     = 1;
+static constexpr uint32_t kVmUnsubGraceMs  = 1500;
+static constexpr uint32_t kCphKeepaliveMs  = 5000;
+static constexpr uint32_t kSignHoldStaleMs = 15000;
+static constexpr uint32_t kSignDistStaleMs = 8000;
 
 #ifdef VMHUD_BOARD_C3
 static constexpr size_t kRxBufCap = 6144;
@@ -37,8 +46,15 @@ static std::atomic<bool> g_hudInfoOk{false};
 static std::atomic<uint16_t> g_conn{BLE_HS_CONN_HANDLE_NONE};
 static NimBLECharacteristic *g_h1 = nullptr;
 static NimBLECharacteristic *g_h50 = nullptr;
+static NimBLECharacteristic *g_cph = nullptr;
 static std::atomic<bool> g_subH1{false};
 static std::atomic<bool> g_subH50{false};
+static std::atomic<bool> g_subCph{false};
+static std::atomic<uint16_t> g_cphConn{BLE_HS_CONN_HANDLE_NONE};
+static std::atomic<bool> g_cphForceNotify{false};
+static std::atomic<bool> g_vmUnsubWatchdogActive{false};
+static std::atomic<uint32_t> g_vmUnsubWatchdogMs{0};
+static bool g_wakeAdvRunning = false;
 static vmhud::Receiver<kRxBufCap> g_rxH1;
 static vmhud::Receiver<512> g_rxH50;  // H50 GATT stub (option 2 future work); saves ~7.5 KB SRAM
 
@@ -46,6 +62,9 @@ static std::atomic<uint8_t> g_postedLimit{0};
 static std::atomic<uint16_t> g_currentSpeed{0};
 static std::atomic<uint16_t> g_camDist{0};
 static std::atomic<uint8_t> g_camType{0};
+static std::atomic<uint8_t>  g_cmd01SignCode{0};
+static std::atomic<uint16_t> g_cmd01SignDist{0};
+static std::atomic<uint32_t> g_cmd01SignRxMs{0};
 
 // Upcoming ("next") speed limit detection from CMD 0x01 (2-slot), CMD 0x41, and CMD 0x08 (JPEG sign).
 static std::atomic<uint8_t>  g_camNextLimit{0};
@@ -54,21 +73,34 @@ static std::atomic<uint32_t> g_camNextRxMs{0};
 static std::atomic<uint8_t>  g_customNextLimit{0};
 static std::atomic<uint16_t> g_customNextDist{0};
 static std::atomic<uint32_t> g_customNextRxMs{0};
+static std::atomic<uint16_t> g_customSignDist{0};
+static std::atomic<uint32_t> g_customSignRxMs{0};
+static std::atomic<uint32_t> g_textSignRxMs{0};
 
-// CMD 0x08 (sendImage) alert JPEG handoff (BLE task -> loop() task).
+// CMD 0x08 / CMD 0x41 alert JPEG & CMD 0x06 raw text handoff (BLE task -> loop() task).
 struct PendingAlertImg {
   uint8_t jpeg[kMaxAlertImgBytes];
   size_t  len = 0;
 };
 static std::mutex g_alertImgMutex;
 static PendingAlertImg g_pendingAlertImg;
+static char g_overlaySignText[vmhud::kMaxOverlayTextBytes + 1] = {0};
 static std::atomic<bool> g_alertImgDirty{false};
 static std::atomic<bool> g_alertImgCancel{false};
 static std::atomic<bool> g_nextResetReq{false};
 
-// loop()-owned upcoming speed-limit edge-trigger latch (ensures each warning fires once for 10 s).
+// loop()-owned upcoming speed-limit edge-trigger latch & prohibition sign state.
 static uint8_t  g_imgNextLimit = 0;
 static uint32_t g_imgNextRxMs = 0;
+static uint8_t  g_imgSignCode = vmhud::kSignNone;
+static uint32_t g_imgSignRxMs = 0;
+static vmhud::CphTelemetryState g_lastCphBuiltState;
+static vmhud::CphTelemetryState g_lastCphNotified;
+static uint8_t  g_lastCphWire[vmhud::kCphMaxFrameBytes] = {0};
+static size_t   g_lastCphWireLen = 0;
+static bool     g_cphWireInit = false;
+static uint32_t g_lastCphNotifyMs = 0;
+static bool     g_cphOverspeed = false;
 static uint32_t g_lastAlertImgHash = 0;
 static size_t   g_lastAlertImgLen = 0;
 static uint32_t g_nextAlertId = 0;
@@ -425,6 +457,16 @@ static void onFrame(const vmhud::Frame &frame, void *user) {
       g_camNextLimit.store(0, std::memory_order_release);
       g_camNextDist.store(0, std::memory_order_relaxed);
     }
+    uint8_t c01Sign = vmhud::kSignNone;
+    uint16_t c01Dist = 0;
+    if (vmhud::extractCmd01CameraAlert(frame, cam, c01Sign, c01Dist)) {
+      g_cmd01SignDist.store(c01Dist, std::memory_order_relaxed);
+      g_cmd01SignRxMs.store(millis(), std::memory_order_relaxed);
+      g_cmd01SignCode.store(c01Sign, std::memory_order_release);
+    } else {
+      g_cmd01SignCode.store(vmhud::kSignNone, std::memory_order_release);
+      g_cmd01SignDist.store(0, std::memory_order_relaxed);
+    }
     g_displayDirty.store(true, std::memory_order_relaxed);
     debugLogf("[CAM] type=%u dist=%u cur=%u next=%u(d=%u)\n",
               (unsigned)cam.camType, (unsigned)cam.camDist,
@@ -432,15 +474,57 @@ static void onFrame(const vmhud::Frame &frame, void *user) {
     return;
   }
 
-  // Custom camera alert with embedded image (CMD 0x41: [type, dist_be16, limit, imgLen_be32, ...])
+  // Custom camera/sign alert with embedded image (CMD 0x41: [type, dist_be16, limit, imgLen_be32, ...])
   if (frame.command == 0x41 && frame.size >= 8) {
     const uint16_t dist = vmhud::be16(frame.payload + 1);
     const uint8_t lim = frame.payload[3];
+    const uint32_t imgLen = vmhud::be32(frame.payload + 4);
     if (lim >= 5 && lim <= 200) {
+      g_customSignDist.store(0, std::memory_order_relaxed);
       g_customNextDist.store(dist < 60000u ? dist : 0u, std::memory_order_relaxed);
       g_customNextRxMs.store(millis(), std::memory_order_relaxed);
       g_customNextLimit.store(lim, std::memory_order_release);
       debugLogf("[CAM41] dist=%u lim=%u\n", (unsigned)dist, (unsigned)lim);
+    } else if (imgLen >= 16 && frame.size >= 8u + size_t(imgLen) && imgLen <= kMaxAlertImgBytes) {
+      const uint8_t *jpg = frame.payload + 8;
+      if (jpg[0] == 0xFF && jpg[1] == 0xD8) {
+        g_customSignDist.store(dist < 60000u ? dist : 0u, std::memory_order_relaxed);
+        g_customSignRxMs.store(millis(), std::memory_order_release);
+        {
+          std::lock_guard<std::mutex> guard(g_alertImgMutex);
+          memcpy(g_pendingAlertImg.jpeg, jpg, imgLen);
+          g_pendingAlertImg.len = imgLen;
+        }
+        g_alertImgCancel.store(false, std::memory_order_relaxed);
+        g_alertImgDirty.store(true, std::memory_order_release);
+        debugLogf("[CAM41] sign jpeg=%lu dist=%u\n", (unsigned long)imgLen, (unsigned)dist);
+      }
+    } else if (dist == 0 && lim == 0 && imgLen == 0) {
+      g_customSignDist.store(0, std::memory_order_relaxed);
+    }
+    return;
+  }
+
+  // Overlay text (CMD 0x06: [posX_be16, posY_be16, font, 0x00, r, g, b, utf8..., 0x00]):
+  // forward raw UTF-8 string sent by VietMap directly without converting to meters.
+  if (frame.command == 0x06) {
+    char txtBuf[vmhud::kMaxOverlayTextBytes + 1];
+    if (vmhud::extractOverlayText(frame, txtBuf, sizeof(txtBuf))) {
+      {
+        std::lock_guard<std::mutex> guard(g_alertImgMutex);
+        memcpy(g_overlaySignText, txtBuf, sizeof(g_overlaySignText));
+      }
+      g_textSignRxMs.store(millis(), std::memory_order_release);
+      debugLogf("[TXT06] raw=\"%s\"\n", txtBuf);
+    }
+    return;
+  }
+
+  // Cancel/clear overlay text (CMD 0x07 / CMD 0x47)
+  if (vmhud::isOverlayTextClear(frame)) {
+    {
+      std::lock_guard<std::mutex> guard(g_alertImgMutex);
+      g_overlaySignText[0] = '\0';
     }
     return;
   }
@@ -467,8 +551,13 @@ static void onFrame(const vmhud::Frame &frame, void *user) {
     return;
   }
 
-  // Cancel overlay image (CMD 0x09)
+  // Cancel overlay image (CMD 0x09): also clear any overlay text from the cancelled sign.
   if (frame.command == 0x09) {
+    {
+      std::lock_guard<std::mutex> guard(g_alertImgMutex);
+      g_overlaySignText[0] = '\0';
+    }
+    g_customSignDist.store(0, std::memory_order_relaxed);
     g_alertImgDirty.store(false, std::memory_order_release);
     g_alertImgCancel.store(true, std::memory_order_release);
     return;
@@ -483,71 +572,139 @@ static void onFrame(const vmhud::Frame &frame, void *user) {
   }
 }
 
-static void startConnectable() { NimBLEDevice::startAdvertising(0); }
+static void startConnectable() {
+  NimBLEDevice::getAdvertising()->start(kAdvInstHud);
+}
+
+static void refreshWakeBeaconRandomAddr() {
+  ble_addr_t rnd{};
+  rnd.type = BLE_ADDR_RANDOM;
+  esp_fill_random(rnd.val, sizeof(rnd.val));
+  rnd.val[5] |= 0xC0u;                     // BLE Core Spec static random MSB bits (11)
+  rnd.val[0] = (rnd.val[0] & 0xFEu) | 0x02u;  // Guarantee lower 46 bits are neither all-0 nor all-1
+  ble_gap_ext_adv_set_addr(kAdvInstWake, &rnd);
+}
+
+static void resetVietMapSessionState() {
+  g_hudInfoOk.store(false, std::memory_order_release);
+  g_rxH1.reset();
+  g_rxH50.reset();
+  g_postedLimit.store(0, std::memory_order_release);
+  g_currentSpeed.store(0, std::memory_order_relaxed);
+  g_camDist.store(0, std::memory_order_relaxed);
+  g_camType.store(0, std::memory_order_relaxed);
+  g_cmd01SignCode.store(vmhud::kSignNone, std::memory_order_release);
+  g_cmd01SignDist.store(0, std::memory_order_relaxed);
+  g_camNextLimit.store(0, std::memory_order_release);
+  g_camNextDist.store(0, std::memory_order_relaxed);
+  g_customNextLimit.store(0, std::memory_order_release);
+  g_customNextDist.store(0, std::memory_order_relaxed);
+  g_customSignDist.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> guard(g_alertImgMutex);
+    g_overlaySignText[0] = '\0';
+  }
+  g_alertImgDirty.store(false, std::memory_order_release);
+  g_alertImgCancel.store(true, std::memory_order_release);
+  g_nextResetReq.store(true, std::memory_order_release);
+  g_lastEmittedLimit.store(0, std::memory_order_relaxed);
+  g_splimForceEmit.store(false, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> guard(g_navMutex);
+    g_pendingNav.active = false;
+    g_pendingNav.hasNewJpeg = false;
+    g_pendingNav.jpegLen = 0;
+    g_pendingNav.road[0] = '\0';
+  }
+  g_navDirty.store(false, std::memory_order_release);
+  g_navOffReq.store(true, std::memory_order_release);
+  g_cphForceNotify.store(true, std::memory_order_release);
+  g_displayDirty.store(true, std::memory_order_relaxed);
+}
 
 struct ServerCB : NimBLEServerCallbacks {
-  void onConnect(NimBLEServer *server, NimBLEConnInfo &conn) override {
-    if (g_connected.load(std::memory_order_relaxed)) {
-      server->disconnect(conn.getConnHandle());
-      return;
+  void onConnect(NimBLEServer *, NimBLEConnInfo &conn) override {
+    if (!g_connected.load(std::memory_order_acquire)) {
+      g_conn.store(conn.getConnHandle(), std::memory_order_release);
+      g_connected.store(true, std::memory_order_release);
+      g_hudInfoOk.store(false, std::memory_order_relaxed);
+      g_subH1.store(false, std::memory_order_relaxed);
+      g_subH50.store(false, std::memory_order_relaxed);
+      g_vmUnsubWatchdogActive.store(false, std::memory_order_relaxed);
+      g_vmUnsubWatchdogMs.store(0, std::memory_order_relaxed);
+      g_rxH1.reset();
+      g_rxH50.reset();
+      g_displayDirty.store(true, std::memory_order_relaxed);
     }
-    g_conn.store(conn.getConnHandle(), std::memory_order_release);
-    g_connected.store(true, std::memory_order_release);
-    g_hudInfoOk.store(false, std::memory_order_relaxed);
-    g_subH1.store(false, std::memory_order_relaxed);
-    g_subH50.store(false, std::memory_order_relaxed);
-    g_rxH1.reset();
-    g_rxH50.reset();
-    g_displayDirty.store(true, std::memory_order_relaxed);
-    debugLogf("[BLE] connected\n");
+    debugLogf("[BLE] connected handle=%u\n", (unsigned)conn.getConnHandle());
   }
   void onDisconnect(NimBLEServer *, NimBLEConnInfo &conn, int reason) override {
-    if (conn.getConnHandle() != g_conn.load(std::memory_order_acquire)) {
-      return;
+    const uint16_t h = conn.getConnHandle();
+    if (h == g_cphConn.load(std::memory_order_acquire)) {
+      g_subCph.store(false, std::memory_order_release);
+      g_cphConn.store(BLE_HS_CONN_HANDLE_NONE, std::memory_order_release);
     }
-    g_connected.store(false, std::memory_order_release);
-    g_hudInfoOk.store(false, std::memory_order_relaxed);
-    g_conn.store(BLE_HS_CONN_HANDLE_NONE, std::memory_order_release);
-    g_subH1.store(false, std::memory_order_relaxed);
-    g_subH50.store(false, std::memory_order_relaxed);
-    g_rxH1.reset();
-    g_rxH50.reset();
-    g_postedLimit.store(0, std::memory_order_release);
-    g_camDist.store(0, std::memory_order_relaxed);
-    g_camType.store(0, std::memory_order_relaxed);
-    g_camNextLimit.store(0, std::memory_order_release);
-    g_camNextDist.store(0, std::memory_order_relaxed);
-    g_customNextLimit.store(0, std::memory_order_release);
-    g_customNextDist.store(0, std::memory_order_relaxed);
-    g_alertImgDirty.store(false, std::memory_order_release);
-    g_alertImgCancel.store(true, std::memory_order_release);
-    g_nextResetReq.store(true, std::memory_order_release);
-    g_lastEmittedLimit.store(0, std::memory_order_relaxed);
-    g_splimForceEmit.store(false, std::memory_order_relaxed);
-    {
-      std::lock_guard<std::mutex> guard(g_navMutex);
-      g_pendingNav.active = false;
-      g_pendingNav.hasNewJpeg = false;
-      g_pendingNav.jpegLen = 0;
-      g_pendingNav.road[0] = '\0';
+    if (h == g_conn.load(std::memory_order_acquire)) {
+      g_connected.store(false, std::memory_order_release);
+      g_conn.store(BLE_HS_CONN_HANDLE_NONE, std::memory_order_release);
+      g_subH1.store(false, std::memory_order_relaxed);
+      g_subH50.store(false, std::memory_order_relaxed);
+      g_vmUnsubWatchdogActive.store(false, std::memory_order_release);
+      g_vmUnsubWatchdogMs.store(0, std::memory_order_relaxed);
+      resetVietMapSessionState();
+      debugLogf("[BLE] disconnected reason=%d\n", reason);
+      startConnectable();
+    } else {
+      debugLogf("[BLE] secondary disconnected handle=%u reason=%d\n", (unsigned)h, reason);
     }
-    g_navDirty.store(false, std::memory_order_release);
-    g_navOffReq.store(true, std::memory_order_release);
-    g_displayDirty.store(true, std::memory_order_relaxed);
-    debugLogf("[BLE] disconnected reason=%d\n", reason);
-    startConnectable();
   }
 };
 
 struct SubscribeCB : NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic *c, NimBLEConnInfo &conn, uint16_t sub) override {
-    if (conn.getConnHandle() != g_conn.load(std::memory_order_acquire)) {
+    const uint16_t h = conn.getConnHandle();
+    const bool enabled = (sub & 1) != 0;
+    if (c == g_cph) {
+      g_subCph.store(enabled, std::memory_order_release);
+      g_cphConn.store(enabled ? h : BLE_HS_CONN_HANDLE_NONE, std::memory_order_release);
+      if (enabled) {
+        g_cphForceNotify.store(true, std::memory_order_release);
+        // Bench-test support: if a standalone CPH device connected before VietMap Live,
+        // keep Instance 0 advertising so VietMap Live on a 2nd phone can still connect.
+        if (!g_subH1.load(std::memory_order_relaxed) &&
+            !g_subH50.load(std::memory_order_relaxed)) {
+          startConnectable();
+        }
+      }
+      debugLogf("[CPH] FFF9 sub=%u handle=%u\n", (unsigned)enabled, (unsigned)h);
       return;
     }
+
+    if (!g_connected.load(std::memory_order_acquire) ||
+        (!g_subH1.load(std::memory_order_relaxed) && !g_subH50.load(std::memory_order_relaxed))) {
+      g_conn.store(h, std::memory_order_release);
+      g_connected.store(true, std::memory_order_release);
+    }
+    if (h != g_conn.load(std::memory_order_acquire)) {
+      return;
+    }
+
+    const bool wasVmSub =
+        g_subH1.load(std::memory_order_relaxed) || g_subH50.load(std::memory_order_relaxed);
     if (c == g_h1) {
-      g_subH1.store((sub & 1) != 0, std::memory_order_relaxed);
-    } else {
-      g_subH50.store((sub & 1) != 0, std::memory_order_relaxed);
+      g_subH1.store(enabled, std::memory_order_relaxed);
+    } else if (c == g_h50) {
+      g_subH50.store(enabled, std::memory_order_relaxed);
+    }
+    const bool nowVmSub =
+        g_subH1.load(std::memory_order_relaxed) || g_subH50.load(std::memory_order_relaxed);
+    if (nowVmSub) {
+      g_vmUnsubWatchdogActive.store(false, std::memory_order_release);
+    } else if (wasVmSub && !nowVmSub) {
+      resetVietMapSessionState();
+      g_vmUnsubWatchdogMs.store(millis(), std::memory_order_relaxed);
+      g_vmUnsubWatchdogActive.store(true, std::memory_order_release);
+      debugLogf("[BLE] VietMap unsubscribed; armed 1.5s ACL release watchdog\n");
     }
     g_displayDirty.store(true, std::memory_order_relaxed);
     debugLogf("[BLE] notify sub=0x%04X\n", sub);
@@ -561,7 +718,12 @@ struct WriteCB : NimBLECharacteristicCallbacks {
   vmhud::Receiver<RxCap> *rx;
   WriteCB(NimBLECharacteristic *r, const char *l, vmhud::Receiver<RxCap> *b) : route(r), label(l), rx(b) {}
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &conn) override {
-    if (conn.getConnHandle() != g_conn.load(std::memory_order_acquire)) {
+    const uint16_t h = conn.getConnHandle();
+    if (!g_connected.load(std::memory_order_acquire)) {
+      g_conn.store(h, std::memory_order_release);
+      g_connected.store(true, std::memory_order_release);
+    }
+    if (h != g_conn.load(std::memory_order_acquire)) {
       return;
     }
     const std::string data = c->getValue();
@@ -584,19 +746,43 @@ static void applyAdvertising() {
   const std::string name(g_name.c_str());
   NimBLEDevice::setDeviceName(name);
 
-  NimBLEAdvertisementData primary;
-  primary.setFlags(0x06);
-  fillServiceUuids(primary);
+  NimBLEExtAdvertising *adv = NimBLEDevice::getAdvertising();
 
-  NimBLEAdvertisementData scanResp;
-  scanResp.setName(name);
+  // Instance 0: Connectable legacy VIETMAP-HUD advertisement (FFF0 / FFFF ONLY — never FFF8).
+  NimBLEExtAdvertisement primary0;
+  primary0.setLegacyAdvertising(true);
+  primary0.setConnectable(true);
+  primary0.setScannable(true);
+  primary0.setFlags(0x06);
+  fillServiceUuids(primary0);
 
-  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-  adv->setAdvertisementData(primary);
-  adv->setScanResponseData(scanResp);
-  adv->enableScanResponse(true);
+  NimBLEExtAdvertisement scanResp0;
+  scanResp0.setName(name);
+
+  adv->setInstanceData(kAdvInstHud, primary0);
+  adv->setScanResponseData(kAdvInstHud, scanResp0);
+
+  // Instance 1: Non-connectable FFF8 wakeup beacon (ADV_NONCONN_IND on static random MAC).
+  // Started strictly while VietMap Live is active and FFF9 is unsubscribed.
+  NimBLEExtAdvertisement wakeAdv;
+  wakeAdv.setLegacyAdvertising(true);
+  wakeAdv.setConnectable(false);
+  wakeAdv.setScannable(false);
+  wakeAdv.setMinInterval(320);  // 200 ms
+  wakeAdv.setMaxInterval(400);  // 250 ms
+  wakeAdv.setFlags(0x06);
+  wakeAdv.addServiceUUID("FFF8");
+  ble_addr_t rnd = *NimBLEDevice::getAddress().getBase();
+  rnd.type = BLE_ADDR_RANDOM;
+  rnd.val[5] |= 0xC0u;  // BLE Core Spec static random address MSB bits (11)
+  rnd.val[0] ^= 0x5Au;  // Distinct LSB from Instance 0 public address
+  wakeAdv.setAddress(NimBLEAddress(rnd));
+  adv->setInstanceData(kAdvInstWake, wakeAdv);
+  g_wakeAdvRunning = false;
+
   startConnectable();
-  Serial.printf("[ADV] name=%s (scan response) adv=%s\n", g_name.c_str(), g_adv.c_str());
+  Serial.printf("[ADV] name=%s (scan response) adv=%s + FFF8 wake beacon configured\n",
+                g_name.c_str(), g_adv.c_str());
 }
 
 void setup() {
@@ -645,6 +831,18 @@ void setup() {
   g_h50->setCallbacks(new SubscribeCB());
   h50->createCharacteristic("9ABC", writable)->setCallbacks(new WriteCB<512>(g_h50, "9ABC", &g_rxH50));
   h50->start();
+
+  // CarPlay Helper shared-ACL telemetry service (FFF8 / FFF9: compact 0xA7 frame).
+  NimBLEService *cphSvc = server->createService("FFF8");
+  g_cph = cphSvc->createCharacteristic("FFF9", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  g_cph->setCallbacks(new SubscribeCB());
+  {
+    vmhud::CphTelemetryState initSt{};
+    g_lastCphWireLen = vmhud::encodeCphFrame(initSt, g_lastCphWire);
+    g_cph->setValue(g_lastCphWire, g_lastCphWireLen);
+    g_cphWireInit = true;
+  }
+  cphSvc->start();
 
   applyAdvertising();
   // Seed alert ID from ESP32 hardware TRNG so a board reboot never collides with
@@ -807,9 +1005,10 @@ void loop() {
     }
   }
 
-  // Process upcoming ("next") speed limit alerts from CMD 0x01 / CMD 0x41 / CMD 0x08.
+  // Process upcoming ("next") speed limit & prohibition sign alerts from CMD 0x01 / CMD 0x41 / CMD 0x08.
   if (g_nextResetReq.exchange(false, std::memory_order_acquire)) {
     g_imgNextLimit = 0;
+    g_imgSignCode = vmhud::kSignNone;
     g_lastAlertImgHash = 0;
     g_lastAlertImgLen = 0;
     g_latchedNextLimit = 0;
@@ -817,6 +1016,7 @@ void loop() {
   }
   if (g_alertImgCancel.exchange(false, std::memory_order_acquire)) {
     g_imgNextLimit = 0;
+    g_imgSignCode = vmhud::kSignNone;
     g_lastAlertImgHash = 0;
     g_lastAlertImgLen = 0;
   }
@@ -836,17 +1036,26 @@ void loop() {
       if (h != g_lastAlertImgHash || alertLen != g_lastAlertImgLen) {
         g_lastAlertImgHash = h;
         g_lastAlertImgLen = alertLen;
-        const vmhud::SpeedSignMatch m = vmhud::classifySpeedSignJpeg(jpegScratch, alertLen);
-        g_imgNextLimit = m.limit;
-        if (m.limit != 0) {
+        const vmhud::AlertImageClassification cls = vmhud::classifyAlertJpeg(jpegScratch, alertLen);
+        g_imgNextLimit = cls.speedLimit;
+        g_imgSignCode = cls.signCode;
+        if (cls.speedLimit != 0) {
           g_imgNextRxMs = now;
           debugLogf("[SIGN] speed=%u score=%.3f margin=%.3f\n",
-                    (unsigned)m.limit, m.score, m.margin);
+                    (unsigned)cls.speedLimit, cls.score, cls.margin);
+        } else if (cls.signCode != vmhud::kSignNone) {
+          g_imgSignRxMs = now;
+          debugLogf("[SIGN] code=0x%02X score=%.3f margin=%.3f\n",
+                    (unsigned)cls.signCode, cls.score, cls.margin);
         } else {
-          debugLogf("[SIGN] non-speed score=%.3f margin=%.3f\n", m.score, m.margin);
+          // Non-sign image (e.g. weather icon): discard any accompanying overlay text.
+          std::lock_guard<std::mutex> guard(g_alertImgMutex);
+          g_overlaySignText[0] = '\0';
+          debugLogf("[SIGN] unrecognized score=%.3f margin=%.3f\n", cls.score, cls.margin);
         }
-      } else if (g_imgNextLimit != 0) {
-        g_imgNextRxMs = now;
+      } else {
+        if (g_imgNextLimit != 0) g_imgNextRxMs = now;
+        if (g_imgSignCode != vmhud::kSignNone) g_imgSignRxMs = now;
       }
     }
   }
@@ -902,6 +1111,139 @@ void loop() {
     } else if ((now - g_nextAbsentSinceMs) >= kNextClearDebounceMs) {
       g_latchedNextLimit = 0;
       g_nextAbsentSinceMs = 0;
+    }
+  }
+
+  // Manage Instance 1 non-connectable FFF8 wakeup beacon.
+  const bool vmActive = g_connected.load(std::memory_order_relaxed) &&
+                        g_hudInfoOk.load(std::memory_order_acquire) &&
+                        (g_subH1.load(std::memory_order_relaxed) ||
+                         g_subH50.load(std::memory_order_relaxed));
+  const bool shouldWakeAdv = vmActive && !g_subCph.load(std::memory_order_acquire);
+  if (shouldWakeAdv && !g_wakeAdvRunning) {
+    // Rotate random beacon MAC on every session start so iOS CoreBluetooth background
+    // scanning (AllowDuplicates=false) never suppresses a new drive's wakeup packet.
+    refreshWakeBeaconRandomAddr();
+    if (NimBLEDevice::getAdvertising()->start(kAdvInstWake)) {
+      g_wakeAdvRunning = true;
+      debugLogf("[WAKE] FFF8 beacon started\n");
+    }
+  } else if (!shouldWakeAdv && g_wakeAdvRunning) {
+    NimBLEDevice::getAdvertising()->stop(kAdvInstWake);
+    g_wakeAdvRunning = false;
+    debugLogf("[WAKE] FFF8 beacon stopped\n");
+  }
+
+  // Build and publish CarPlay Helper telemetry frame on FFF9 (READ | NOTIFY)
+  // BEFORE running the lingering-ACL disconnect watchdog so `vietmapConnected = false`
+  // is guaranteed to notify first.
+  if (g_cph != nullptr) {
+    vmhud::CphTelemetryState cphSt{};
+    cphSt.vietmapConnected = vmActive;
+    cphSt.cmuConnected = g_cmuConnected.load(std::memory_order_relaxed);
+
+    if (vmActive) {
+      const uint16_t rawSpd = g_currentSpeed.load(std::memory_order_relaxed);
+      g_cphOverspeed = vmhud::evaluateOverspeed(lim, rawSpd, g_cphOverspeed);
+      cphSt.overspeed = g_cphOverspeed;
+      cphSt.navActive = g_navGuiding;
+      cphSt.postedSpeedLimit = (lim >= 5 && lim <= 200) ? lim : 0;
+      cphSt.currentSpeed = rawSpd > 255u ? 255u : static_cast<uint8_t>(rawSpd);
+
+      char rawText[vmhud::kMaxOverlayTextBytes + 1] = {0};
+      {
+        std::lock_guard<std::mutex> guard(g_alertImgMutex);
+        memcpy(rawText, g_overlaySignText, sizeof(rawText));
+      }
+      const uint32_t txtRxMs = g_textSignRxMs.load(std::memory_order_acquire);
+      const bool txtFresh = (rawText[0] != '\0') && ((now - txtRxMs) <= kSignDistStaleMs);
+      const uint16_t c41Dist = g_customSignDist.load(std::memory_order_acquire);
+      const bool c41Fresh = c41Dist > 0 && (now - g_customSignRxMs.load(std::memory_order_relaxed)) <= kSignDistStaleMs;
+      const uint8_t c01Sign = g_cmd01SignCode.load(std::memory_order_acquire);
+      const uint16_t c01Dist = g_cmd01SignDist.load(std::memory_order_relaxed);
+      const bool c01Fresh = c01Sign != vmhud::kSignNone &&
+                            (now - g_cmd01SignRxMs.load(std::memory_order_relaxed)) <= kSignDistStaleMs;
+
+      // Upcoming speed limit + distance fusion.
+      uint8_t nextLim = (candNextLim >= 5 && candNextLim <= 200 && candNextLim != lim) ? candNextLim : 0;
+      uint16_t nextDist = (nextLim != 0) ? candNextDist : 0;
+      if (nextLim == 0 && g_imgNextLimit >= 5 && g_imgNextLimit <= 200 && g_imgNextLimit != lim) {
+        const uint32_t lastImgSpdMs = txtFresh ? txtRxMs : g_imgNextRxMs;
+        if ((now - lastImgSpdMs) <= kSignHoldStaleMs) {
+          nextLim = g_imgNextLimit;
+        }
+      }
+      cphSt.upcomingSpeedLimit = nextLim;
+      cphSt.upcomingSpeedDistM = nextDist;
+
+      // Prohibition / area / camera sign + distance fusion.
+      if (g_imgSignCode != vmhud::kSignNone) {
+        uint32_t lastSignMs = g_imgSignRxMs;
+        if (txtFresh) lastSignMs = txtRxMs;
+        if (c41Fresh) lastSignMs = g_customSignRxMs.load(std::memory_order_relaxed);
+        if ((now - lastSignMs) > kSignHoldStaleMs) {
+          g_imgSignCode = vmhud::kSignNone;
+        }
+      }
+      if (g_imgSignCode != vmhud::kSignNone) {
+        cphSt.activeSignCode = g_imgSignCode;
+        if (c41Fresh) {
+          cphSt.activeSignDistM = c41Dist;
+        } else if (c01Fresh && (g_imgSignCode == vmhud::kSignSpeedCamera ||
+                                g_imgSignCode == vmhud::kSignTrafficCamera)) {
+          cphSt.activeSignDistM = c01Dist;
+        }
+      } else if (c01Fresh) {
+        cphSt.activeSignCode = c01Sign;
+        cphSt.activeSignDistM = c01Dist;
+      }
+
+      // Forward raw CMD 0x06 string verbatim whenever an image sign or upcoming speed limit is active.
+      if (txtFresh && (cphSt.activeSignCode != vmhud::kSignNone || cphSt.upcomingSpeedLimit != 0)) {
+        memcpy(cphSt.activeSignText, rawText, sizeof(cphSt.activeSignText));
+      }
+    } else {
+      g_cphOverspeed = false;
+    }
+
+    // Fast path: skip XOR encode & NimBLE ATT mutex lock on the ~98% of 50Hz ticks with no state change.
+    if (!g_cphWireInit || cphSt != g_lastCphBuiltState) {
+      g_lastCphWireLen = vmhud::encodeCphFrame(cphSt, g_lastCphWire);
+      g_cph->setValue(g_lastCphWire, g_lastCphWireLen);
+      g_lastCphBuiltState = cphSt;
+      g_cphWireInit = true;
+    }
+
+    const bool forceCph = g_cphForceNotify.exchange(false, std::memory_order_acquire);
+    if (g_subCph.load(std::memory_order_acquire)) {
+      const uint16_t cphH = g_cphConn.load(std::memory_order_acquire);
+      if (cphH != BLE_HS_CONN_HANDLE_NONE &&
+          (forceCph || vmhud::isCphSemanticChange(g_lastCphNotified, cphSt) ||
+           (now - g_lastCphNotifyMs) >= kCphKeepaliveMs)) {
+        g_cph->notify(g_lastCphWire, g_lastCphWireLen, cphH);
+        g_lastCphNotified = cphSt;
+        g_lastCphNotifyMs = now;
+      }
+    }
+  }
+
+  // Enforce 1.5s lingering-ACL disconnect watchdog when VietMap Live unsubscribes FFF1.
+  if (g_vmUnsubWatchdogActive.load(std::memory_order_acquire)) {
+    const bool vmSub = g_subH1.load(std::memory_order_relaxed) ||
+                       g_subH50.load(std::memory_order_relaxed);
+    if (vmSub) {
+      g_vmUnsubWatchdogActive.store(false, std::memory_order_release);
+    } else {
+      const uint32_t unsubMs = g_vmUnsubWatchdogMs.load(std::memory_order_relaxed);
+      const uint32_t elapsed = millis() - unsubMs;
+      if (elapsed >= kVmUnsubGraceMs && elapsed < 0x80000000u) {
+        g_vmUnsubWatchdogActive.store(false, std::memory_order_release);
+        const uint16_t h = g_conn.load(std::memory_order_acquire);
+        if (h != BLE_HS_CONN_HANDLE_NONE) {
+          debugLogf("[BLE] Force-releasing lingering ACL handle=%u\n", (unsigned)h);
+          NimBLEDevice::getServer()->disconnect(h);
+        }
+      }
     }
   }
 
