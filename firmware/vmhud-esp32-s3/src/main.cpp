@@ -13,6 +13,7 @@
 #include "traffic_sign_classifier.h"
 #include "cph_telemetry.h"
 #include "display_ui.h"
+#include "rgb_led.h"
 
 static constexpr uint8_t  kAdvInstHud      = 0;
 static constexpr uint8_t  kAdvInstWake     = 1;
@@ -839,6 +840,7 @@ void setup() {
   Serial.println("\n[BOOT] vmhud-esp32-s3 — VietMap BLE HUD → USB SPLIM");
 
   displayInit();
+  rgbLedInit();
 
   if (g_store.begin("vmhud", false)) {
     g_name = g_store.getString("name", g_name);
@@ -889,6 +891,7 @@ void setup() {
   cphSvc->start();
 
   applyAdvertising();
+  rgbLedUpdate(vmhud::RgbConnState(false, false, false), millis());
   // Seed alert ID from ESP32 hardware TRNG so a board reboot never collides with
   // the CMU's last_seen_id_ on an ongoing CarPlay session.
   g_nextAlertId = (esp_random() & 0x0FFFFFFFu) | 1u;
@@ -1332,6 +1335,14 @@ void loop() {
       }
     }
   }
+
+  // Onboard RGB LED slow-blink status (ESP32-S3 Super Mini):
+  // cycles Red (VietMap waiting) -> Yellow (CMU waiting) -> Blue (CarPlay Helper waiting),
+  // and turns completely OFF once all 3 links are connected.
+  const bool cphActive = g_subCph.load(std::memory_order_acquire) &&
+                         (g_cphConn.load(std::memory_order_acquire) != BLE_HS_CONN_HANDLE_NONE);
+  rgbLedUpdate(vmhud::RgbConnState(vmActive, g_cmuConnected.load(std::memory_order_relaxed), cphActive),
+               now);
 
   // Display update (refresh every 500ms or when state changes)
 #if VMHUD_HAS_DISPLAY

@@ -16,6 +16,7 @@
 #include "speed_sign_classifier.h"
 #include "traffic_sign_classifier.h"
 #include "cph_telemetry.h"
+#include "rgb_status.h"
 #include "blmjcicarplay/hud/next_splim_policy.h"
 #include "common/translit.h"
 
@@ -544,6 +545,73 @@ int main()
         const uint8_t nextZone[8] = {1, 0x01, 0x2C, 50, 1, 0x00, 0x64, 60};
         CHECK(!checkCmd01Alert(nextZone, 8, 60, cSign, cDist),
               "CMD 0x01 upcoming 50 km/h zone yields to upcomingSpeedLimit");
+    }
+
+    // ------------------------------------------------------------------
+    // Section: Onboard RGB Status LED slow-blink state machine
+    // ------------------------------------------------------------------
+    printf("\n[RgbStatusBlinker]\n");
+    {
+        const uint8_t kB = 32;
+        const vmhud::RgbColor kOff(0, 0, 0);
+        const vmhud::RgbColor kRed    = vmhud::RgbStatusBlinker::slotColor(vmhud::RgbStatusBlinker::kSlotVietMap, kB);
+        const vmhud::RgbColor kYellow = vmhud::RgbStatusBlinker::slotColor(vmhud::RgbStatusBlinker::kSlotCmu, kB);
+        const vmhud::RgbColor kBlue   = vmhud::RgbStatusBlinker::slotColor(vmhud::RgbStatusBlinker::kSlotCph, kB);
+
+        CHECK(kRed.r == kB && kRed.g == 0 && kRed.b == 0, "VietMap pending color is pure Red");
+        CHECK(kYellow.r == kB && kYellow.g > 0 && kYellow.g < kB && kYellow.b == 0,
+              "CMU pending color is warm Yellow (R + scaled G, B=0)");
+        CHECK(kBlue.r == 0 && kBlue.g == 0 && kBlue.b == kB, "CarPlay Helper pending color is pure Blue");
+
+        // 1) All 3 links waiting -> sequential slow cycle: Red -> Yellow -> Blue -> Red
+        vmhud::RgbStatusBlinker b;
+        const vmhud::RgbConnState none(false, false, false);
+        CHECK(b.update(none, 0, kB) == kRed,       "t=0ms: starts with Red (VietMap waiting)");
+        CHECK(b.update(none, 399, kB) == kRed,     "t=399ms: Red stays ON through 400ms window");
+        CHECK(b.update(none, 400, kB) == kOff,     "t=400ms: Red turns OFF for 800ms dark gap");
+        CHECK(b.update(none, 1199, kB) == kOff,    "t=1199ms: still in dark gap before Yellow");
+        CHECK(b.update(none, 1200, kB) == kYellow, "t=1200ms: advances to Yellow (CMU waiting)");
+        CHECK(b.update(none, 1600, kB) == kOff,    "t=1600ms: Yellow turns OFF");
+        CHECK(b.update(none, 2400, kB) == kBlue,   "t=2400ms: advances to Blue (CPH waiting)");
+        CHECK(b.update(none, 2800, kB) == kOff,    "t=2800ms: Blue turns OFF");
+        CHECK(b.update(none, 3600, kB) == kRed,    "t=3600ms: wraps back to Red");
+
+        // 2) Early-boot mid-pulse connect (< 400ms) -> immediate extinguish + clean 800ms gap
+        b.reset();
+        CHECK(b.update(none, 50, kB) == kRed, "t=50ms: Red ON");
+        const vmhud::RgbConnState vmAndCmuOk(true, true, false);  // Only CPH waiting now
+        CHECK(b.update(vmAndCmuOk, 150, kB) == kOff,
+              "t=150ms: VietMap+CMU connect mid-pulse -> Red immediately OFF");
+        CHECK(b.update(vmAndCmuOk, 949, kB) == kOff,
+              "t=949ms: preserves full 800ms dark gap (modular uint32_t safe for t < 400ms)");
+        CHECK(b.update(vmAndCmuOk, 950, kB) == kBlue,
+              "t=950ms: skips connected CMU and blinks Blue (CPH waiting)");
+        CHECK(b.update(vmAndCmuOk, 1350, kB) == kOff, "t=1350ms: Blue OFF");
+        CHECK(b.update(vmAndCmuOk, 2150, kB) == kBlue, "t=2150ms: single pending link repeats Blue");
+
+        // 3) All 3 connected -> LED completely OFF; subsequent disconnect resumes immediately
+        const vmhud::RgbConnState allOk(true, true, true);
+        CHECK(b.update(allOk, 2200, kB) == kOff, "t=2200ms: all 3 connected -> LED immediately OFF");
+        CHECK(b.update(allOk, 50000, kB) == kOff, "t=50000ms: remains completely OFF while all 3 connected");
+
+        const vmhud::RgbConnState cmuDropped(true, false, true);
+        CHECK(b.update(cmuDropped, 60000, kB) == kYellow,
+              "t=60000ms: CMU timeout -> immediately blinks Yellow");
+
+        // 4) Two pending links (CMU ok, VietMap + CPH waiting) -> alternates Red <-> Blue only
+        b.reset();
+        const vmhud::RgbConnState cmuOnly(false, true, false);
+        CHECK(b.update(cmuOnly, 1000, kB) == kRed,  "CMU-only ok: slot 0 -> Red");
+        CHECK(b.update(cmuOnly, 2200, kB) == kBlue, "CMU-only ok: skips Yellow -> Blue");
+        CHECK(b.update(cmuOnly, 3400, kB) == kRed,  "CMU-only ok: Blue -> Red");
+
+        // 5) 32-bit millis() wraparound across 0xFFFFFFFF -> 0x00000000
+        b.reset();
+        const uint32_t tWrapStart = 0xFFFFFF00u;  // 256 ms before 32-bit rollover
+        CHECK(b.update(cmuDropped, tWrapStart, kB) == kYellow, "wraparound: Yellow ON at 0xFFFFFF00");
+        CHECK(b.update(cmuDropped, tWrapStart + 300u, kB) == kYellow, "wraparound: still ON across 0x0000002C");
+        CHECK(b.update(cmuDropped, tWrapStart + 400u, kB) == kOff, "wraparound: OFF at +400ms past rollover");
+        CHECK(b.update(cmuDropped, tWrapStart + 1200u, kB) == kYellow, "wraparound: next cycle ON at +1200ms");
     }
 
     if (g_fail) {

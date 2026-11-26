@@ -15,3 +15,16 @@
 #ifndef OLED_SCL
 #define OLED_SCL 9
 #endif
+
+// Onboard WS2812 RGB LED on ESP32-S3 Super Mini (GPIO 48; override to 21 for Waveshare S3-Zero)
+#ifndef VMHUD_RGB_PIN
+#define VMHUD_RGB_PIN 48
+#endif
+
+#ifndef VMHUD_RGB_BRIGHTNESS
+#define VMHUD_RGB_BRIGHTNESS 32
+#endif
+
+#ifndef VMHUD_RGB_SWAP_RG
+#define VMHUD_RGB_SWAP_RG 0
+#endif

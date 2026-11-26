@@ -34,12 +34,26 @@ Alongside the VietMap HUD service (`FFF0`), the firmware exposes GATT service **
 
 | PlatformIO env | Hardware | Screen |
 |----------------|----------|--------|
-| `esp32-s3-supermini` (default) | ESP32-S3 Super Mini, native USB CDC | None (Headless, zero screen overhead) |
+| `esp32-s3-supermini` (default) | ESP32-S3 Super Mini, native USB CDC + onboard RGB LED (`GPIO 48`) | None (Headless, zero screen overhead) |
 | `esp32-c3-supermini` | ESP32-C3 Super Mini, native USB CDC | None (Headless) |
 | `lilygo-t-display-s3` | LilyGO T-Display S3 | Built-in 1.9" ST7789 (170x320 8-bit parallel color TFT) |
-| `esp32-s3-oled` | ESP32-S3 Super Mini + I2C SSD1306 | 0.96" 128x64 OLED (Default: SDA=GPIO 8, SCL=GPIO 9) |
+| `esp32-s3-oled` | ESP32-S3 Super Mini + I2C SSD1306 + onboard RGB LED (`GPIO 48`) | 0.96" 128x64 OLED (Default: SDA=GPIO 8, SCL=GPIO 9) |
 
 Avoid CH340/CP210 USB-UART boards — CMU rootfs may lack matching drivers.
+
+## Onboard RGB Status LED (ESP32-S3 Super Mini)
+
+On `esp32-s3-supermini` and `esp32-s3-oled`, the onboard WS2812 RGB LED (`GPIO 48`) slowly blinks (`400 ms` ON / `800 ms` OFF per slot) through whichever links are still waiting to connect, and turns **completely OFF** once all 3 links are active:
+
+| Connection | Pending Color | Ready Condition |
+|------------|---------------|-----------------|
+| **VietMap Live** (`FFF0` / `FFF1`) | **Red** | BLE connected + `FFF1` subscribed + `HUDInfo` handshake (or `400 ms` grace) |
+| **Mazda CMU** (`splim_seriald`) | **Yellow** | `CMU:*` USB CDC heartbeat/ACK received within `4.5 s` |
+| **CarPlay Helper** (`FFF8` / `FFF9`) | **Blue** | BLE `FFF9` notify subscribed on active connection |
+| **All 3 connected** | **OFF** | All 3 conditions above satisfied simultaneously |
+
+- When multiple links are pending, the LED cycles sequentially across only the missing colors (`Red → Yellow → Blue`, skipping any link already connected).
+- Optional build-flag overrides in `platformio.ini`: `-DVMHUD_RGB_PIN=48` (use `21` for Waveshare ESP32-S3-Zero), `-DVMHUD_RGB_BRIGHTNESS=32`, and `-DVMHUD_RGB_SWAP_RG=1` (for board batches with `RGB` instead of `GRB` WS2812 channel order).
 
 ## Display Telemetry & Debug Info
 
