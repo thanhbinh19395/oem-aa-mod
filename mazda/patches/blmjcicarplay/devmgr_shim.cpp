@@ -29,6 +29,7 @@
 
 #include <atomic>
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -49,10 +50,10 @@ typedef int (*pfn4)(void *, void *, void *, void *);
 //   - `strtol("0x5555", NULL, 10)` stops at 'x' and returns 0 (>= 0), overwriting the 0x5555
 //     default at cfg+3712 with 0. Thus iAP2 IdentificationInformation advertises
 //     RouteGuidanceDisplayComponent Identifier = 0 (NOT 0x5555) to the iPhone.
-//   - Sending StartNavigationRouteGuidanceUpdate (0x5200) with compId=0x5555 returns rc=1
-//     from ipoddev IPC, but iOS silently drops it because component 0x5555 was never declared!
-constexpr uintptr_t kNaviCompId         = 0u;
-constexpr uintptr_t kNaviCompIdFallback = 0x5555u;
+//   - Never send undeclared compId=0x5555: every eDevMgriPod* call locks devNode->sem (@+0x28)
+//     and blocks on devNode->replyQueue (@+0x30) in libdevmgr_interface.so, so unnecessary
+//     synchronous IPC retries contend directly with blmjcicarplay's UI/mode-change thread.
+constexpr uintptr_t kNaviCompId = 0u;
 
 pfn4  g_real_register  = nullptr;
 pfn4  g_real_callstate = nullptr;
@@ -119,13 +120,12 @@ void resolve_all_once(void)
 
 // Retry worker:
 //  1) Retries StartNaviRouteGuidenceUpdates(compId=0) during CarPlay bring-up if the initial
-//     call returned rc != 1.
-//  2) Also acts as a bounded active-TBT recovery (at most 4 attempts per TBT activation): if
-//     CarPlay owns Turn-by-Turn (TurnByTurnEntity == 1, e.g. Google Maps / Apple Maps / VietMap)
-//     yet zero 0x8058/0x8059 frames have arrived (e.g. CallState fired slightly before iAP2
-//     Identification settled, or decimal NaviCompId=21845 was configured), re-sends compId=0
-//     (and fallback 0x5555 on odd retries). Stays 100% idle during non-navigating drives and
-//     as soon as 0x8058/0x8059 traffic is seen.
+//     call returned rc != 1 (bounded to 5 bring-up attempts).
+//  2) Acts as a single-shot active-TBT recovery (at most 1 attempt per TBT activation): if
+//     CarPlay owns Turn-by-Turn (TurnByTurnEntity == 1) yet zero 0x8058/0x8059 frames have
+//     arrived (e.g. CallState fired slightly before iAP2 Identification settled), re-sends
+//     compId=0 once and then stays completely idle so apps without iAP2 metadata (e.g. VietMap
+//     Live 3.4.3 over BLE HUD) never contend on libdevmgr_interface's synchronous semaphore.
 void *navi_retry_thread(void *)
 {
     void    *last_devH     = nullptr;
@@ -133,7 +133,7 @@ void *navi_retry_thread(void *)
     int      init_attempts = 0;
     int      tbt_attempts  = 0;
     for (;;) {
-        sleep(init_attempts >= 10 ? 15 : 2);
+        sleep(init_attempts >= 5 ? 15 : 3);
 
         const bool     rx_seen    = g_nav_rx_seen.load(std::memory_order_relaxed);
         const bool     tbt_active = g_cp_tbt_active.load(std::memory_order_relaxed);
@@ -149,8 +149,8 @@ void *navi_retry_thread(void *)
         bool  need_init  = false;
         pthread_mutex_lock(&g_mu);
         if (g_session_active && g_procH && g_devH && !rx_seen) {
-            need_init = (g_started_devH != g_devH);
-            if (need_init || (tbt_active && tbt_attempts < 4)) {
+            need_init = (g_started_devH != g_devH) && (init_attempts < 5);
+            if (need_init || (tbt_active && tbt_attempts < 1)) {
                 procH = g_procH;
                 devH  = g_devH;
                 fn    = g_real_startnavi;
@@ -159,7 +159,6 @@ void *navi_retry_thread(void *)
         pthread_mutex_unlock(&g_mu);
 
         if (!fn || !procH || !devH) {
-            init_attempts = 0;
             continue;
         }
         if (devH != last_devH) {
@@ -168,23 +167,20 @@ void *navi_retry_thread(void *)
             tbt_attempts  = 0;
         }
 
-        uintptr_t compId = kNaviCompId;
-        int attempt_no   = 0;
+        int attempt_no = 0;
         if (need_init) {
             init_attempts++;
             attempt_no = init_attempts;
         } else {
-            // Alternate 0, 0x5555, 0, 0x5555 across the 4 bounded TBT recovery tries.
-            compId = (tbt_attempts & 1) ? kNaviCompIdFallback : kNaviCompId;
             tbt_attempts++;
             attempt_no = tbt_attempts;
         }
 
-        int rc = fn(procH, devH, reinterpret_cast<void *>(compId), nullptr);
+        int rc = fn(procH, devH, reinterpret_cast<void *>(kNaviCompId), nullptr);
         LOGD("retry#%d (%s) StartNaviRouteGuidence(procH=%p devH=%p compId=0x%lx) rc=%d",
              attempt_no, need_init ? "init" : "tbt-active",
-             procH, devH, static_cast<unsigned long>(compId), rc);
-        if (rc == 1 && compId == kNaviCompId) {
+             procH, devH, static_cast<unsigned long>(kNaviCompId), rc);
+        if (rc == 1) {
             pthread_mutex_lock(&g_mu);
             if (g_session_active && g_devH == devH) {
                 g_started_devH = devH;
@@ -359,31 +355,12 @@ void arm_navi(const char *from, void *procH, void *devH)
 typedef ssize_t (*pfn_msgrcv)(int, void *, size_t, long, int);
 std::atomic<pfn_msgrcv> g_real_msgrcv{nullptr};
 
-// [DIAGNOSTIC] In debug builds (DEBUG / !NDEBUG), message types and raw nav
-// payloads are automatically logged to the system log (stderr / g_logf) with
-// namespaces [CP-MSG] and [CP-NAV] for easy filtering, avoiding flash wear.
+// [DIAGNOSTIC] Keep msgrcv tap strictly non-blocking on vDevMgrProcessRcvThread:
+// skip all small (< 0x300) touch/focus/audio IPC messages even in debug builds so
+// synchronous file flushes can never stall CarPlay UI input or mode transitions.
 void msg_tap(int msqid, const void *msgp, ssize_t n)
 {
     (void)msqid;
-
-#ifndef NDEBUG
-    // In DEBUG mode: log every received message's (type, size) + a payload peek for small messages
-    if (msgp && n >= 4) {
-        uint32_t mt_raw = 0;
-        memcpy(&mt_raw, msgp, sizeof(mt_raw));
-        uint32_t mt = mt_raw & 0xffffu;
-        char peek[128] = "";
-        if (mt != 0x8058 && mt != 0x8059) {          // peek the unknown / small messages
-            const unsigned char *b = (const unsigned char *)msgp;
-            ssize_t dn = (n < 20) ? n : 20;
-            char *p = peek;
-            for (ssize_t i = 0; i < dn; i++) {
-                p += snprintf(p, sizeof(peek) - (size_t)(p - peek), " %02x", b[i]);
-            }
-        }
-        LOGD("[CP-MSG] mt=0x%04x n=0x%lx%s", (unsigned)mt, (long)n, peek);
-    }
-#endif
 
     // Only big messages: maneuver=0x348, guidance=0x65c. Skips chatty small msgs.
     if (n < 0x300 || !msgp) return;
@@ -399,19 +376,8 @@ void msg_tap(int msqid, const void *msgp, ssize_t n)
     nav_on_devmgr_msg(msgp, (long)n);
 
 #ifndef NDEBUG
-    // In DEBUG mode: dump raw nav payload to system log
     if (mt == 0x8059 || mt == 0x8058) {
         LOGD("[CP-NAV] msgrcv n=0x%lx mtype=0x%x", (long)n, (unsigned)mt);
-        const unsigned char *b = (const unsigned char *)msgp;
-        char hex[100];
-        for (ssize_t i = 0; i < n; i += 16) {
-            ssize_t chunk = (n - i < 16) ? (n - i) : 16;
-            char *p = hex;
-            for (ssize_t j = 0; j < chunk; j++) {
-                p += snprintf(p, sizeof(hex) - (size_t)(p - hex), " %02x", b[i + j]);
-            }
-            LOGD("[CP-NAV] +%04lx:%s", (long)i, hex);
-        }
     }
 #endif
 }
@@ -429,15 +395,12 @@ ssize_t msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgflg)
         if (fn) g_real_msgrcv.store(fn, std::memory_order_release);
     }
     ssize_t n = fn ? fn(msqid, msgp, msgsz, msgtyp, msgflg) : -1;
-    // Only tap once nav is armed by a live CarPlay session. In release builds,
-    // fast-path skip small IPC messages without entering msg_tap.
-#ifdef NDEBUG
-    if (g_enabled && n >= 0x300 && g_armed.load(std::memory_order_relaxed))
+    // Fast-path skip all small IPC messages (< 0x300) and preserve errno across msg_tap.
+    if (g_enabled && n >= 0x300 && g_armed.load(std::memory_order_relaxed)) {
+        const int saved_errno = errno;
         msg_tap(msqid, msgp, n);
-#else
-    if (g_enabled && n > 0 && g_armed.load(std::memory_order_relaxed))
-        msg_tap(msqid, msgp, n);
-#endif
+        errno = saved_errno;
+    }
     return n;
 }
 

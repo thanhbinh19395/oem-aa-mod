@@ -24,8 +24,9 @@
 
 namespace hud_next_splim {
 
-static const int64_t  kHoldMs      = 10000LL;
-static const char     kAlertLabel[] = "T\xE1\xBB\x91" "c \xC4\x91\xE1\xBB\x99 ti\xE1\xBA\xBFp theo"; // "Tốc độ tiếp theo" UTF-8
+static const int64_t  kHoldMs         = 10000LL;
+static const char     kAlertLabel[]   = "T\xE1\xBB\x91" "c \xC4\x91\xE1\xBB\x99 ti\xE1\xBA\xBFp theo"; // "Tốc độ tiếp theo" UTF-8
+static const char     kOverspeedLabel[] = "QU\xC3\x81 T\xE1\xBB\x90" "C"; // "QUÁ TỐC" UTF-8
 
 struct IncomingAlert {
     uint32_t id     = 0;  // Monotonic event ID (>= 1)

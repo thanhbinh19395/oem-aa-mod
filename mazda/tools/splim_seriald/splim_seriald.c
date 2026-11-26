@@ -5,10 +5,11 @@
 //
 // Part of an AGPL-3.0 work — see NOTICE.md for full attribution.
 //
-// Reads line-oriented "SPLIM <km/h>", "NEXTSPLIM <id> <km/h> <dist_m>",
-// "NAV <icon> <dist_m> [road]", and "NAV OFF" from an ESP32 USB CDC port
-// (ttyACM*/ttyUSB*) and atomically writes "/tmp/splim", "/tmp/vmnextsplim",
-// and "/tmp/vmnav" on RAM tmpfs (zero eMMC flash wear) for libpatch-blmjcicarplay.
+// Reads line-oriented "SPLIM <km/h>", "OVER <0|1>",
+// "NEXTSPLIM <id> <km/h> <dist_m>", "NAV <icon> <dist_m> [road]", and "NAV OFF"
+// from an ESP32 USB CDC port (ttyACM*/ttyUSB*) and atomically writes
+// "/tmp/splim", "/tmp/splim_over", "/tmp/vmnextsplim", and "/tmp/vmnav"
+// on RAM tmpfs (zero eMMC flash wear) for libpatch-blmjcicarplay.
 //
 // EXCLUSIVITY: a lock file under /tmp keeps a second instance from opening the
 // same writer path. Prefer a single writer of splim (do not run OCR / a competing
@@ -41,6 +42,8 @@
 // periodic timestamp refresh incurs ZERO flash wear and auto-cleans on boot.
 #define SPLIM_PATH       "/tmp/splim"
 #define SPLIM_TMP        "/tmp/splim.tmp"
+#define SPLIM_OVER_PATH  "/tmp/splim_over"
+#define SPLIM_OVER_TMP   "/tmp/splim_over.tmp"
 #define VMNAV_PATH       "/tmp/vmnav"
 #define VMNAV_TMP        "/tmp/vmnav.tmp"
 #define VMNEXTSPLIM_PATH "/tmp/vmnextsplim"
@@ -129,6 +132,45 @@ static int write_splim(int limit)
     if (rename(SPLIM_TMP, SPLIM_PATH) != 0) {
         fprintf(stderr, LOG_TAG "rename: %s\n", strerror(errno));
         unlink(SPLIM_TMP);
+        return -1;
+    }
+    return 0;
+}
+
+static void clear_splim(void)
+{
+    unlink(SPLIM_PATH);
+    unlink(SPLIM_TMP);
+}
+
+static void clear_splim_over(void)
+{
+    unlink(SPLIM_OVER_PATH);
+    unlink(SPLIM_OVER_TMP);
+}
+
+static int write_splim_over(void)
+{
+    char buf[48];
+    int blen = snprintf(buf, sizeof(buf), "1 %ld\n", (long)time(NULL));
+    if (blen <= 0 || (size_t)blen >= sizeof(buf))
+        return -1;
+
+    int fd = open(SPLIM_OVER_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, LOG_TAG "open splim_over tmp: %s\n", strerror(errno));
+        return -1;
+    }
+    ssize_t wn = write(fd, buf, (size_t)blen);
+    int c_rc = close(fd);
+    if (wn != (ssize_t)blen || c_rc != 0) {
+        fprintf(stderr, LOG_TAG "write splim_over tmp: %s\n", strerror(errno));
+        unlink(SPLIM_OVER_TMP);
+        return -1;
+    }
+    if (rename(SPLIM_OVER_TMP, SPLIM_OVER_PATH) != 0) {
+        fprintf(stderr, LOG_TAG "rename splim_over: %s\n", strerror(errno));
+        unlink(SPLIM_OVER_TMP);
         return -1;
     }
     return 0;
@@ -447,10 +489,38 @@ static int parse_nav_line(const char *line, int *out_active, int *out_icon,
     return 0;
 }
 
+// Accept:
+//   "OVER 0"
+//   "OVER 1"
+static int parse_over_line(const char *line, int *out_over)
+{
+    const char *p = line;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (strncmp(p, "OVER", 4) != 0 || (p[4] != ' ' && p[4] != '\t'))
+        return -1;
+    p += 4;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p != '0' && *p != '1')
+        return -1;
+    int v = (*p == '1') ? 1 : 0;
+    p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p != '\0')
+        return -1;
+    *out_over = v;
+    return 0;
+}
+
 typedef struct {
     int           last_limit;
     long          last_splim_mono;
     time_t        last_splim_wall;
+    int           last_over;
+    long          last_over_mono;
+    time_t        last_over_wall;
     unsigned long last_next_id;
     int           last_next_limit;
     unsigned long last_next_dist;
@@ -463,6 +533,22 @@ typedef struct {
     long          last_nav_mono;
     time_t        last_nav_wall;
 } SerialState;
+
+static void reset_ephemeral_files(SerialState *st)
+{
+    clear_splim();
+    clear_splim_over();
+    clear_vmnav();
+    clear_vmnextsplim();
+    if (st) {
+        st->last_limit = -1;
+        st->last_splim_mono = -100;
+        st->last_over = 0;
+        st->last_over_mono = -100;
+        st->last_nav_active = 0;
+        st->last_next_id = 0;
+    }
+}
 
 static void feed_byte(int fd, char *buf, size_t *len, int *discard,
                       unsigned char c, SerialState *st)
@@ -478,6 +564,7 @@ static void feed_byte(int fd, char *buf, size_t *len, int *discard,
         buf[*len] = '\0';
         if (*len > 0) {
             int limit = 0;
+            int over_val = 0;
             unsigned long next_id = 0;
             int next_limit = 0;
             unsigned long next_dist = 0;
@@ -508,6 +595,34 @@ static void feed_byte(int fd, char *buf, size_t *len, int *discard,
                     char ack[32];
                     snprintf(ack, sizeof(ack), "CMU:ACK %d\n", limit);
                     serial_send(fd, ack);
+                }
+            } else if (parse_over_line(buf, &over_val) == 0) {
+                if (!over_val) {
+                    if (st->last_over) {
+                        clear_splim_over();
+                        st->last_over = 0;
+                        fprintf(stderr, LOG_TAG "over=0\n");
+                    }
+                    if (fd >= 0)
+                        serial_send(fd, "CMU:OVERACK 0\n");
+                } else {
+                    long   now_mono = monotonic_sec();
+                    time_t now_wall = time(NULL);
+                    if (!st->last_over ||
+                        now_mono - st->last_over_mono >= NAV_REFRESH_SEC ||
+                        now_wall < st->last_over_wall ||
+                        now_wall - st->last_over_wall >= NAV_REFRESH_SEC) {
+                        if (write_splim_over() == 0) {
+                            st->last_over_mono = now_mono;
+                            st->last_over_wall = now_wall;
+                            if (!st->last_over) {
+                                st->last_over = 1;
+                                fprintf(stderr, LOG_TAG "over=1\n");
+                            }
+                        }
+                    }
+                    if (fd >= 0)
+                        serial_send(fd, "CMU:OVERACK 1\n");
                 }
             } else if (parse_nextsplim_line(buf, &next_id, &next_limit, &next_dist) == 0) {
                 long   now_mono = monotonic_sec();
@@ -616,6 +731,7 @@ int main(int argc, char **argv)
     if (acquire_lock() != 0)
         return 1;
 
+    clear_splim_over();
     clear_vmnav();
     clear_vmnextsplim();
 
@@ -631,6 +747,7 @@ int main(int argc, char **argv)
     memset(&st, 0, sizeof(st));
     st.last_limit = -1;
     st.last_splim_mono = -100;
+    st.last_over_mono = -100;
     st.last_next_mono = -100;
     st.last_nav_mono = -100;
     long last_hb_mono = 0;
@@ -671,14 +788,7 @@ int main(int argc, char **argv)
             fprintf(stderr, LOG_TAG "poll: %s — reopening\n", strerror(errno));
             close(fd);
             fd = -1;
-            if (st.last_nav_active) {
-                clear_vmnav();
-                st.last_nav_active = 0;
-            }
-            if (st.last_next_id != 0) {
-                clear_vmnextsplim();
-                st.last_next_id = 0;
-            }
+            reset_ephemeral_files(&st);
             sleep(1);
             continue;
         }
@@ -703,14 +813,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, LOG_TAG "read error (%s) — reopening\n", strerror(errno));
                 close(fd);
                 fd = -1;
-                if (st.last_nav_active) {
-                    clear_vmnav();
-                    st.last_nav_active = 0;
-                }
-                if (st.last_next_id != 0) {
-                    clear_vmnextsplim();
-                    st.last_next_id = 0;
-                }
+                reset_ephemeral_files(&st);
                 sleep(1);
                 continue;
             }
@@ -718,14 +821,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, LOG_TAG "port lost (hangup) — reopening\n");
                 close(fd);
                 fd = -1;
-                if (st.last_nav_active) {
-                    clear_vmnav();
-                    st.last_nav_active = 0;
-                }
-                if (st.last_next_id != 0) {
-                    clear_vmnextsplim();
-                    st.last_next_id = 0;
-                }
+                reset_ephemeral_files(&st);
                 sleep(1);
                 continue;
             }
@@ -738,21 +834,13 @@ int main(int argc, char **argv)
                     (unsigned)pfd.revents);
             close(fd);
             fd = -1;
-            if (st.last_nav_active) {
-                clear_vmnav();
-                st.last_nav_active = 0;
-            }
-            if (st.last_next_id != 0) {
-                clear_vmnextsplim();
-                st.last_next_id = 0;
-            }
+            reset_ephemeral_files(&st);
             sleep(1);
             continue;
         }
     }
 
-    clear_vmnav();
-    clear_vmnextsplim();
+    reset_ephemeral_files(&st);
     if (fd >= 0)
         close(fd);
     release_lock();

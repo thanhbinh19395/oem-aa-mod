@@ -99,8 +99,9 @@ inline uint8_t cameraTypeToSignCode(uint8_t camType, uint16_t camDist) {
 }
 
 // Extract a genuine approaching camera alert from VietMap CMD 0x01 Slot 0 while
-// ignoring Slot 1's hardcoded 100m posted-limit dummy record and avoiding
-// masking an upcoming speed-limit transition (`cam.nextLimit != 0`).
+// ignoring steady-state posted-limit records (both 4-byte single-slot frames and
+// 8-byte 2-slot frames where Slot 1 is empty or carries synthetic 100m distance)
+// and avoiding masking an upcoming speed-limit transition (`cam.nextLimit != 0`).
 inline bool extractCmd01CameraAlert(const Frame &frame,
                                     const CameraParseResult &cam,
                                     uint8_t &outSignCode,
@@ -119,9 +120,22 @@ inline bool extractCmd01CameraAlert(const Frame &frame,
   if (type0 == 0 || dist0 == 0 || dist0 >= 60000u) {
     return false;
   }
-  // Single-slot 4-byte frames with type==1 and dist==100 can also be steady-state posted limits.
-  if (frame.size == 4 && type0 == 1 && dist0 == 100u) {
-    return false;
+  // In VietMap DJBT CMD 0x01, type == 1 is used for the road's posted speed limit whenever
+  // only a single active entry is sent (either a 4-byte frame or an 8-byte frame with an
+  // empty second slot {0,0,0,0}) or when both slots carry the synthetic 100m placeholder.
+  if (type0 == 1) {
+    if (frame.size < 8) {
+      return false;
+    }
+    const uint8_t  type1 = frame.payload[4];
+    const uint16_t dist1 = be16(frame.payload + 5);
+    const uint8_t  lim1  = frame.payload[7];
+    if (type1 == 0 && lim1 == 0) {
+      return false;
+    }
+    if (dist0 == 100u && dist1 == 100u) {
+      return false;
+    }
   }
   const uint8_t code = cameraTypeToSignCode(type0, dist0);
   if (code == kSignNone) {
@@ -198,16 +212,46 @@ inline bool decodeCphFrame(const uint8_t *buf, size_t len, CphTelemetryState &ou
   return true;
 }
 
+// Parse CMD 0x06 meter strings (e.g. "295 m", "80m") into quantized buckets so
+// 1Hz meter countdowns do not spam BLE notifications and exhaust iOS ActivityKit budget.
+inline bool quantizeOverlayMeterText(const char *txt, uint16_t &outBucket) {
+  if (!txt || txt[0] == '\0') return false;
+  size_t i = 0;
+  while (txt[i] == ' ') ++i;
+  if (txt[i] < '0' || txt[i] > '9') return false;
+  uint32_t val = 0;
+  while (txt[i] >= '0' && txt[i] <= '9') {
+    val = val * 10u + uint32_t(txt[i] - '0');
+    if (val > 60000u) return false;
+    ++i;
+  }
+  while (txt[i] == ' ') ++i;
+  if ((txt[i] != 'm' && txt[i] != 'M') || txt[i + 1] != '\0') {
+    return false;
+  }
+  outBucket = quantizeApproachBucket(static_cast<uint16_t>(val));
+  return true;
+}
+
 // Returns true when two states differ in any CarPlay-visible semantic property
-// (ignoring raw 1 km/h GPS speed drift and sub-bucket numeric meter ticks).
+// (ignoring raw 1 km/h GPS speed drift, overspeed, and sub-bucket numeric/text meter ticks;
+// overspeed is handled directly on the Mazda HUD instead of CarPlay Live Activity).
 inline bool isCphSemanticChange(const CphTelemetryState &prev,
                                 const CphTelemetryState &curr) {
   if (prev.vietmapConnected   != curr.vietmapConnected)   return true;
-  if (prev.overspeed          != curr.overspeed)          return true;
   if (prev.postedSpeedLimit   != curr.postedSpeedLimit)   return true;
   if (prev.upcomingSpeedLimit != curr.upcomingSpeedLimit) return true;
   if (prev.activeSignCode     != curr.activeSignCode)     return true;
-  if (strcmp(prev.activeSignText, curr.activeSignText) != 0) return true;
+  if (strcmp(prev.activeSignText, curr.activeSignText) != 0) {
+    uint16_t prevTxtBucket = 0;
+    uint16_t currTxtBucket = 0;
+    if (quantizeOverlayMeterText(prev.activeSignText, prevTxtBucket) &&
+        quantizeOverlayMeterText(curr.activeSignText, currTxtBucket)) {
+      if (prevTxtBucket != currTxtBucket) return true;
+    } else {
+      return true;
+    }
+  }
   if (curr.activeSignText[0] == '\0' && curr.upcomingSpeedLimit != 0 &&
       quantizeApproachBucket(prev.upcomingSpeedDistM) !=
           quantizeApproachBucket(curr.upcomingSpeedDistM)) {

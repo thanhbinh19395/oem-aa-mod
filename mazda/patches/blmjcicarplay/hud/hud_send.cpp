@@ -283,17 +283,15 @@ static ssize_t read_tiny_file(const char *path, char *buf, size_t cap)
     return n;
 }
 
-// [VN-PATCH] Speed limit written by splim_seriald ("<limit> <unixtime>").
-// Prefers RAM tmpfs (/tmp/splim, zero eMMC flash wear) and falls back to the
-// legacy /data_persist/splim path for compatibility. Returns km/h, or 0 if
-// missing / stale / clock-skewed / implausible.
+// [VN-PATCH] Speed limit written by splim_seriald ("<limit> <unixtime>") on
+// RAM tmpfs (/tmp/splim — zero eMMC flash VFS lookups or wear). Returns km/h,
+// or 0 if missing / stale / clock-skewed / implausible.
 static uint16_t read_splim()
 {
     if (!libpatch_config::carplay_speed_limit()) return 0;
 
     char buf[64];
-    if (read_tiny_file("/tmp/splim", buf, sizeof(buf)) <= 0 &&
-        read_tiny_file("/data_persist/splim", buf, sizeof(buf)) <= 0) {
+    if (read_tiny_file("/tmp/splim", buf, sizeof(buf)) <= 0) {
         return 0;
     }
     int limit = 0; long ts = 0;
@@ -305,18 +303,26 @@ static uint16_t read_splim()
     return static_cast<uint16_t>(limit);
 }
 
-// [OVERSPEED] Read the over-speed flag written by carspeed_d (1 = over -> blink).
+// [OVERSPEED] Read the over-speed flag written by splim_seriald ("1 <unix_ts>")
+// on RAM tmpfs (/tmp/splim_over — zero eMMC flash VFS lookups when absent).
+// Rejects stale (>6s) or future-skewed (>2s) records.
 static bool read_over()
 {
     if (!libpatch_config::carplay_speed_limit()) return false;
 
-    char buf[16];
-    if (read_tiny_file("/tmp/splim_over", buf, sizeof(buf)) <= 0 &&
-        read_tiny_file("/data_persist/splim_over", buf, sizeof(buf)) <= 0) {
+    char buf[32];
+    if (read_tiny_file("/tmp/splim_over", buf, sizeof(buf)) <= 0) {
         return false;
     }
     int v = 0;
-    return std::sscanf(buf, "%d", &v) == 1 && v == 1;
+    long ts = 0;
+    int n = std::sscanf(buf, "%d %ld", &v, &ts);
+    if (n < 1 || v != 1) return false;
+    if (n >= 2) {
+        long now = static_cast<long>(std::time(nullptr));
+        if (now - ts > 6 || ts - now > 2) return false;
+    }
+    return true;
 }
 
 // [VIETMAP-BLE] Read VietMap Live iPhone turn-by-turn navigation written by
@@ -442,6 +448,25 @@ static void make_next_splim_snap(uint32_t dist_m, NaviSnapshot &out)
     }
     std::strncpy(out.road_name, hud_next_splim::kAlertLabel, sizeof(out.road_name) - 1);
     out.road_name[sizeof(out.road_name) - 1] = '\0';
+}
+
+// Override the street-name strip with "QUÁ TỐC" while overspeeding, preserving any active
+// turn arrow + distance, or asserting HUD_STRAIGHT (0 m) when idle so Mazda's HUD ECU
+// displays guidancePointName (nextManeuverInfo == 0 hides guidancePointName on Mazda HUD).
+static void apply_overspeed_snap(NaviSnapshot &s)
+{
+    const bool has_maneuver =
+        (s.direct_icon != 0) ||
+        (s.turn_event != 0 && s.turn_event < 20 &&
+         (s.turn_event == 13 || kTurnIcons[s.turn_event][0] != 0 ||
+          kTurnIcons[s.turn_event][1] != 0 || kTurnIcons[s.turn_event][2] != 0));
+    if (!has_maneuver) {
+        s.direct_icon   = MazdaIcon::HUD_STRAIGHT;
+        s.distance_dec  = 0;
+        s.distance_unit = 1;  // METERS (never emit unit=0 with live icon)
+    }
+    std::strncpy(s.road_name, hud_next_splim::kOverspeedLabel, sizeof(s.road_name) - 1);
+    s.road_name[sizeof(s.road_name) - 1] = '\0';
 }
 
 // Wake the sender thread without a lost-wakeup race against g_cv.wait().
@@ -741,6 +766,7 @@ void *sender_main(void *)
     uint8_t      sync_bit = 0;
     uint32_t     last_processed = 0;
     uint16_t     prev_splim = 0;
+    bool         prev_over = false;
     bool         prev_vmnav = false;
     bool         pending_restore = false;
     uint32_t     last_tick = 0;
@@ -772,15 +798,11 @@ void *sender_main(void *)
 
         uint16_t splim = read_splim();
         bool splim_changed = (splim != prev_splim);
-        // [OVERSPEED] When carspeed_d flags over-speed, BLINK the limit glyph by
-        // painting 0 on alternate 2Hz-ticker phases (~1Hz blink, steady regardless
-        // of AA wake rate). Modulate ONLY the painted value: the TRUE splim still
-        // drives splim_changed + prev_splim below, so the blink never triggers a
-        // spurious Msg2/re-page, and turn/distance/street are untouched.
-        uint16_t painted = splim;
-        if (splim != 0 && read_over() &&
-            (g_splim_tick.load(std::memory_order_relaxed) & 1u))
-            painted = 0;
+        // [OVERSPEED] Keep the posted speed limit steady on the HUD and display
+        // "QUÁ TỐC" on the street-name strip while overspeeding.
+        const bool over = (splim != 0 && read_over());
+        const bool over_changed = (over != prev_over);
+        const uint16_t painted = splim;
 
         static const NaviSnapshot kBlankSnap = {};
 
@@ -796,6 +818,7 @@ void *sender_main(void *)
                 g_have_guidance.store(false, std::memory_order_relaxed);
                 prev           = {};
                 prev_splim     = 0;
+                prev_over      = false;
                 prev_vmnav     = false;
                 last_processed = g_seq.load(std::memory_order_acquire);
                 nav_request_reset();
@@ -839,20 +862,25 @@ void *sender_main(void *)
                 }
                 const uint32_t cur_tick = g_splim_tick.load(std::memory_order_relaxed);
                 const bool tick_woke = (cur_tick != last_tick);
-                if (ns.changed || tick_woke) {
+                if (ns.changed || over_changed || (over && splim_changed) || tick_woke) {
                     NaviSnapshot alert_snap;
                     make_next_splim_snap(next_ctrl.dist_m(), alert_snap);
+                    const uint16_t eff_splim = over ? splim : next_ctrl.limit();
+                    if (over) {
+                        apply_overspeed_snap(alert_snap);
+                    }
                     if (ns.changed) {
                         LOGD("hud: next-speed-limit alert -> %u km/h dist=%u m (10s hold)",
                              static_cast<unsigned>(next_ctrl.limit()),
                              static_cast<unsigned>(next_ctrl.dist_m()));
                     }
                     if (send_one(alert_snap, prev, sync_bit,
-                                 /*splim=*/next_ctrl.limit(),
-                                 /*splim_changed=*/ns.changed || (next_ctrl.limit() != prev_splim),
+                                 /*splim=*/eff_splim,
+                                 /*splim_changed=*/ns.changed || over_changed || (eff_splim != prev_splim),
                                  /*force=*/true)) {
                         prev            = alert_snap;
-                        prev_splim      = next_ctrl.limit();
+                        prev_splim      = eff_splim;
+                        prev_over       = over;
                         prev_vmnav      = false;
                         pending_restore = false;
                     }
@@ -862,27 +890,37 @@ void *sender_main(void *)
                 // BLE nav is active, hand the HUD straight over to VietMap without wiping.
                 NaviSnapshot vmnav_snap;
                 if (read_vmnav(vmnav_snap)) {
+                    if (over) {
+                        apply_overspeed_snap(vmnav_snap);
+                    }
                     LOGD("hud: CarPlay iAP2 TBT off -> keeping VietMap BLE nav");
                     if (send_one(vmnav_snap, prev, sync_bit, painted,
-                                 splim_changed || pending_restore, /*force=*/true)) {
+                                 splim_changed || over_changed || pending_restore, /*force=*/true)) {
                         prev            = vmnav_snap;
                         prev_splim      = splim;
+                        prev_over       = over;
                         prev_vmnav      = true;
                         pending_restore = false;
                     }
                 } else {
                     LOGD("hud: CarPlay TBT off (still connected) -> maneuver off, keep sign");
                     if (libpatch_config::carplay_speed_limit() && splim > 0) {
-                        if (send_one(kBlankSnap, prev, sync_bit, painted,
+                        NaviSnapshot idle_snap = kBlankSnap;
+                        if (over) {
+                            apply_overspeed_snap(idle_snap);
+                        }
+                        if (send_one(idle_snap, prev, sync_bit, painted,
                                      /*splim_changed=*/true, /*force=*/true)) {
-                            prev            = kBlankSnap;
+                            prev            = idle_snap;
                             prev_splim      = splim;
+                            prev_over       = over;
                             prev_vmnav      = false;
                             pending_restore = false;
                         }
                     } else if (send_clear(sync_bit)) {
                         prev            = {};
                         prev_splim      = 0;
+                        prev_over       = false;
                         prev_vmnav      = false;
                         pending_restore = false;
                     }
@@ -892,26 +930,30 @@ void *sender_main(void *)
                 // during Apple Maps / Google Maps turns).
                 NaviSnapshot vmnav_snap;
                 const bool using_vmnav = (!cp_guiding && read_vmnav(vmnav_snap));
-                const NaviSnapshot &curSnap =
+                NaviSnapshot curSnap =
                     cp_guiding  ? snap :
                     using_vmnav ? vmnav_snap : kBlankSnap;
+                if (over) {
+                    apply_overspeed_snap(curSnap);
+                }
 
                 const bool vmnav_ended = (prev_vmnav && !using_vmnav && !cp_guiding);
                 const bool vmnav_changed =
                     (!cp_guiding) &&
                     (using_vmnav != prev_vmnav ||
                      (using_vmnav &&
-                      (vmnav_snap.direct_icon   != prev.direct_icon   ||
-                       vmnav_snap.distance_dec  != prev.distance_dec  ||
-                       vmnav_snap.distance_unit != prev.distance_unit ||
-                       std::strncmp(vmnav_snap.road_name, prev.road_name, sizeof(prev.road_name)) != 0)));
+                      (curSnap.direct_icon   != prev.direct_icon   ||
+                       curSnap.distance_dec  != prev.distance_dec  ||
+                       curSnap.distance_unit != prev.distance_unit ||
+                       std::strncmp(curSnap.road_name, prev.road_name, sizeof(prev.road_name)) != 0)));
 
                 if (pending_restore && !cp_guiding && !using_vmnav) {
                     if (libpatch_config::carplay_speed_limit() && splim > 0) {
-                        if (send_one(kBlankSnap, prev, sync_bit, painted,
+                        if (send_one(curSnap, prev, sync_bit, painted,
                                      /*splim_changed=*/true, /*force=*/true)) {
-                            prev            = kBlankSnap;
+                            prev            = curSnap;
                             prev_splim      = splim;
+                            prev_over       = over;
                             prev_vmnav      = false;
                             last_processed  = s2;
                             pending_restore = false;
@@ -919,6 +961,7 @@ void *sender_main(void *)
                     } else if (send_clear(sync_bit)) {
                         prev            = {};
                         prev_splim      = 0;
+                        prev_over       = false;
                         prev_vmnav      = false;
                         last_processed  = s2;
                         pending_restore = false;
@@ -927,10 +970,11 @@ void *sender_main(void *)
                     LOGD("hud: VietMap BLE nav ended -> maneuver off (splim=%u)",
                          static_cast<unsigned>(splim));
                     if (libpatch_config::carplay_speed_limit() && splim > 0) {
-                        if (send_one(kBlankSnap, prev, sync_bit, painted,
+                        if (send_one(curSnap, prev, sync_bit, painted,
                                      /*splim_changed=*/true, /*force=*/true)) {
-                            prev            = kBlankSnap;
+                            prev            = curSnap;
                             prev_splim      = splim;
+                            prev_over       = over;
                             prev_vmnav      = false;
                             last_processed  = s2;
                             pending_restore = false;
@@ -938,16 +982,27 @@ void *sender_main(void *)
                     } else if (send_clear(sync_bit)) {
                         prev            = {};
                         prev_splim      = 0;
+                        prev_over       = false;
                         prev_vmnav      = false;
                         last_processed  = s2;
                         pending_restore = false;
                     }
-                } else if (pending_restore || s2 != last_processed || splim_changed || vmnav_changed) {
-                    if (send_one(curSnap, prev, sync_bit, painted,
-                                 splim_changed || pending_restore,
-                                 /*force=*/pending_restore)) {
+                } else if (pending_restore || over_changed || s2 != last_processed || splim_changed || vmnav_changed) {
+                    if (!cp_guiding && !using_vmnav && splim == 0) {
+                        if (send_clear(sync_bit)) {
+                            prev            = {};
+                            prev_splim      = 0;
+                            prev_over       = false;
+                            prev_vmnav      = false;
+                            last_processed  = s2;
+                            pending_restore = false;
+                        }
+                    } else if (send_one(curSnap, prev, sync_bit, painted,
+                                        splim_changed || over_changed || pending_restore,
+                                        /*force=*/pending_restore || over_changed)) {
                         prev            = curSnap;
                         prev_splim      = splim;
+                        prev_over       = over;
                         prev_vmnav      = using_vmnav;
                         last_processed  = s2;
                         pending_restore = false;

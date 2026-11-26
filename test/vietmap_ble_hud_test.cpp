@@ -380,6 +380,19 @@ int main()
             if (ch == '?' || ch >= 0xE0u) { all_hud_safe = false; break; }
         }
         CHECK(all_hud_safe, "folded label contains zero unrenderable >=U+0800 code points");
+
+        char over_label[64];
+        strncpy(over_label, hud_next_splim::kOverspeedLabel, sizeof(over_label) - 1);
+        over_label[sizeof(over_label) - 1] = '\0';
+        hud_translit::fold(over_label, '?');
+        CHECK(strcmp(over_label, "QU\xC3\x81 T\xC3\x94" "C") == 0,
+              "\"QUÁ TỐC\" folds cleanly to 1-/2-byte HUD glyphs (\"QUÁ TÔC\")");
+        bool over_hud_safe = true;
+        for (size_t i = 0; over_label[i]; ++i) {
+            unsigned char ch = static_cast<unsigned char>(over_label[i]);
+            if (ch == '?' || ch >= 0xE0u) { over_hud_safe = false; break; }
+        }
+        CHECK(over_hud_safe, "folded overspeed label contains zero unrenderable >=U+0800 code points");
     }
 
     printf("\n=== Test 11: Traffic/prohibition sign classifier across all %zu templates ===\n",
@@ -500,22 +513,31 @@ int main()
         CHECK_EQ_U(dec.activeSignCode, vmhud::kSignNoLeftTurn, "activeSignCode=noLeftTurn");
         CHECK(strcmp(dec.activeSignText, "1.2 km") == 0, "activeSignText='1.2 km' round-tripped");
 
-        // Identical raw text + 1 km/h GPS drift suppressed
+        // Identical raw text + 1 km/h GPS drift + overspeed flag change suppressed on CPH FFF9
+        // (overspeed warning is displayed on Mazda HUD instead of CarPlay Live Activity)
         vmhud::CphTelemetryState nextTick = st;
         nextTick.currentSpeed = 59;
+        nextTick.overspeed = true;
         CHECK(!vmhud::isCphSemanticChange(st, nextTick),
-              "identical raw text & 1 km/h GPS drift suppressed");
+              "identical raw text, 1 km/h GPS drift & overspeed transition suppressed on CPH FFF9");
 
-        // Changing raw CMD 0x06 text triggers notification
-        strcpy(nextTick.activeSignText, "250 m");
+        // Changing raw CMD 0x06 text across buckets triggers notification, while sub-bucket meter ticks are suppressed
+        strcpy(nextTick.activeSignText, "295 m");
         CHECK(vmhud::isCphSemanticChange(st, nextTick),
-              "changed raw CMD 0x06 text triggers semantic change");
+              "changed raw CMD 0x06 text ('1.2 km' -> '295 m') triggers semantic change");
+        vmhud::CphTelemetryState subBucketTick = nextTick;
+        strcpy(subBucketTick.activeSignText, "265 m");
+        CHECK(!vmhud::isCphSemanticChange(nextTick, subBucketTick),
+              "CMD 0x06 sub-bucket meter drift ('295 m' -> '265 m', both 300m) suppressed");
+        strcpy(subBucketTick.activeSignText, "245 m");
+        CHECK(vmhud::isCphSemanticChange(nextTick, subBucketTick),
+              "CMD 0x06 bucket crossing ('295 m' -> '245 m', 300m -> 250m) triggers semantic change");
 
         // Corrupt XOR checksum byte -> rejected
         wire[wireLen - 1] ^= 0xFF;
         CHECK(!vmhud::decodeCphFrame(wire, wireLen, dec), "corrupted XOR byte rejected");
 
-        // Verify CMD 0x01 Slot 0 camera alert extraction vs Slot 1 dummy 100m posted limit
+        // Verify CMD 0x01 Slot 0 camera alert extraction vs steady posted-limit records
         auto checkCmd01Alert = [](const uint8_t *payload, size_t n, uint8_t prevLim,
                                   uint8_t &outSign, uint16_t &outDist) -> bool {
             vmhud::Frame f;
@@ -527,10 +549,22 @@ int main()
         };
         uint8_t cSign = 0;
         uint16_t cDist = 0;
-        // 1) Ordinary 60 km/h road, no camera in Slot 0, Slot 1 has dummy 100m
+        // 1a) Ordinary 60 km/h road, no camera in Slot 0, Slot 1 has dummy 100m
         const uint8_t roadOnly[8] = {0, 0x00, 0x00, 0, 1, 0x00, 0x64, 60};
         CHECK(!checkCmd01Alert(roadOnly, 8, 60, cSign, cDist),
               "CMD 0x01 ordinary road (Slot 1 dummy 100m) does not false-trigger camera sign");
+        // 1b) VietMap iOS 1-item sendCameraInformation on 60 km/h road (Slot 0 = {1, 100m, 60}, Slot 1 = {0,0,0,0})
+        const uint8_t roadSlot0Only[8] = {1, 0x00, 0x64, 60, 0, 0x00, 0x00, 0};
+        CHECK(!checkCmd01Alert(roadSlot0Only, 8, 60, cSign, cDist),
+              "CMD 0x01 8-byte single-entry road limit in Slot 0 does not false-trigger Cam toc do");
+        // 1c) 4-byte single-slot road speed limit with non-100m distance
+        const uint8_t road4BNon100[4] = {1, 0x00, 0xFA, 60};
+        CHECK(!checkCmd01Alert(road4BNon100, 4, 60, cSign, cDist),
+              "CMD 0x01 4-byte single-slot road limit never false-triggers Cam toc do");
+        // 1d) Duplicate dummy 100m in both slots
+        const uint8_t dupDummy100[8] = {1, 0x00, 0x64, 60, 1, 0x00, 0x64, 60};
+        CHECK(!checkCmd01Alert(dupDummy100, 8, 60, cSign, cDist),
+              "CMD 0x01 duplicate 100m placeholder in both slots ignored");
         // 2) Same-limit speed camera at 350m on 60 km/h road
         const uint8_t spdCam[8] = {1, 0x01, 0x5E, 60, 1, 0x00, 0x64, 60};
         CHECK(checkCmd01Alert(spdCam, 8, 60, cSign, cDist) &&
